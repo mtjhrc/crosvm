@@ -45,7 +45,6 @@ class TestOption(enum.Enum):
 # This is just too big to keep in main list for now
 WIN64_DISABLED_CRATES = [
     "aarch64",
-    "arch",
     "cros_asyncv2",
     "cros-fuzz",
     "crosvm_plugin",
@@ -85,6 +84,7 @@ CRATE_OPTIONS: Dict[str, List[TestOption]] = {
     "crosvm-fuzz": [TestOption.DO_NOT_BUILD],  # b/194499769
     "devices": [
         TestOption.SINGLE_THREADED,
+        TestOption.RUN_EXCLUSIVE,
         TestOption.LARGE,
         TestOption.DO_NOT_RUN_ON_FOREIGN_KERNEL,
         TestOption.DO_NOT_RUN_ARMHF,
