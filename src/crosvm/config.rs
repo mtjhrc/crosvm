@@ -16,7 +16,7 @@ use base::{debug, pagesize};
 use devices::serial_device::{SerialHardware, SerialParameters};
 use devices::virtio::block::block::DiskOption;
 #[cfg(feature = "audio_cras")]
-use devices::virtio::cras_backend::Parameters as CrasSndParameters;
+use devices::virtio::common_backend::Parameters as SndParameters;
 #[cfg(feature = "gpu")]
 use devices::virtio::gpu::GpuParameters;
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
@@ -560,21 +560,33 @@ pub struct HostPcieRootPortParameters {
     pub hp_gpe: Option<u32>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, serde_keyvalue::FromKeyValues)]
-#[serde(deny_unknown_fields)]
+fn jail_config_default_pivot_root() -> PathBuf {
+    PathBuf::from(option_env!("DEFAULT_PIVOT_ROOT").unwrap_or("/var/empty"))
+}
+
+#[cfg(unix)]
+fn jail_config_default_seccomp_policy_dir() -> Option<PathBuf> {
+    Some(PathBuf::from(SECCOMP_POLICY_DIR))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, serde_keyvalue::FromKeyValues)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct JailConfig {
+    #[serde(default = "jail_config_default_pivot_root")]
     pub pivot_root: PathBuf,
     #[cfg(unix)]
+    #[serde(default = "jail_config_default_seccomp_policy_dir")]
     pub seccomp_policy_dir: Option<PathBuf>,
+    #[serde(default)]
     pub seccomp_log_failures: bool,
 }
 
 impl Default for JailConfig {
     fn default() -> Self {
         JailConfig {
-            pivot_root: PathBuf::from(option_env!("DEFAULT_PIVOT_ROOT").unwrap_or("/var/empty")),
+            pivot_root: jail_config_default_pivot_root(),
             #[cfg(unix)]
-            seccomp_policy_dir: Some(PathBuf::from(SECCOMP_POLICY_DIR)),
+            seccomp_policy_dir: jail_config_default_seccomp_policy_dir(),
             seccomp_log_failures: false,
         }
     }
@@ -1280,9 +1292,6 @@ pub struct Config {
     pub coiommu_param: Option<devices::CoIommuParameters>,
     pub cpu_capacity: BTreeMap<usize, u32>, // CPU index -> capacity
     pub cpu_clusters: Vec<Vec<usize>>,
-    #[cfg(feature = "audio_cras")]
-    #[serde(skip)]
-    pub cras_snds: Vec<CrasSndParameters>,
     pub delay_rt: bool,
     #[cfg(feature = "direct")]
     pub direct_edge_irq: Vec<u32>,
@@ -1400,6 +1409,9 @@ pub struct Config {
     pub virtio_mice: Vec<PathBuf>,
     pub virtio_multi_touch: Vec<TouchDeviceOption>,
     pub virtio_single_touch: Vec<TouchDeviceOption>,
+    #[cfg(feature = "audio_cras")]
+    #[serde(skip)]
+    pub virtio_snds: Vec<SndParameters>,
     pub virtio_switches: Vec<PathBuf>,
     pub virtio_trackpad: Vec<TouchDeviceOption>,
     #[cfg(all(feature = "tpm", feature = "chromeos", target_arch = "x86_64"))]
@@ -1423,8 +1435,6 @@ impl Default for Config {
             cid: None,
             #[cfg(unix)]
             coiommu_param: None,
-            #[cfg(feature = "audio_cras")]
-            cras_snds: Vec::new(),
             cpu_capacity: BTreeMap::new(),
             cpu_clusters: Vec::new(),
             delay_rt: false,
@@ -1545,6 +1555,8 @@ impl Default for Config {
             virtio_mice: Vec::new(),
             virtio_multi_touch: Vec::new(),
             virtio_single_touch: Vec::new(),
+            #[cfg(feature = "audio_cras")]
+            virtio_snds: Vec::new(),
             virtio_switches: Vec::new(),
             virtio_trackpad: Vec::new(),
             #[cfg(all(feature = "tpm", feature = "chromeos", target_arch = "x86_64"))]
@@ -2169,5 +2181,74 @@ mod tests {
         assert!(parse_userspace_msr_options("0x10,type=w,action=pass,from=f").is_err());
         assert!(parse_userspace_msr_options("0x10").is_err());
         assert!(parse_userspace_msr_options("hoge").is_err());
+    }
+
+    #[test]
+    fn parse_jailconfig() {
+        let config: JailConfig = Default::default();
+        assert_eq!(
+            config,
+            JailConfig {
+                pivot_root: jail_config_default_pivot_root(),
+                #[cfg(unix)]
+                seccomp_policy_dir: jail_config_default_seccomp_policy_dir(),
+                seccomp_log_failures: false,
+            }
+        );
+
+        let config: JailConfig = from_key_values("").unwrap();
+        assert_eq!(config, Default::default());
+
+        let config: JailConfig = from_key_values("pivot-root=/path/to/pivot/root").unwrap();
+        assert_eq!(
+            config,
+            JailConfig {
+                pivot_root: "/path/to/pivot/root".into(),
+                ..Default::default()
+            }
+        );
+
+        cfg_if::cfg_if! {
+            if #[cfg(unix)] {
+                let config: JailConfig = from_key_values("seccomp-policy-dir=/path/to/seccomp/dir").unwrap();
+                assert_eq!(config, JailConfig {
+                    seccomp_policy_dir: Some("/path/to/seccomp/dir".into()),
+                    ..Default::default()
+                });
+            }
+        }
+
+        let config: JailConfig = from_key_values("seccomp-log-failures").unwrap();
+        assert_eq!(
+            config,
+            JailConfig {
+                seccomp_log_failures: true,
+                ..Default::default()
+            }
+        );
+
+        let config: JailConfig = from_key_values("seccomp-log-failures=false").unwrap();
+        assert_eq!(
+            config,
+            JailConfig {
+                seccomp_log_failures: false,
+                ..Default::default()
+            }
+        );
+
+        let config: JailConfig =
+            from_key_values("pivot-root=/path/to/pivot/root,seccomp-log-failures=true").unwrap();
+        assert_eq!(
+            config,
+            JailConfig {
+                pivot_root: "/path/to/pivot/root".into(),
+                seccomp_log_failures: true,
+                ..Default::default()
+            }
+        );
+
+        let config: Result<JailConfig, String> =
+            from_key_values("seccomp-log-failures,invalid-arg=value");
+        assert!(config.is_err());
     }
 }
