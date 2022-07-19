@@ -10,22 +10,18 @@ use std::{
     slice::{from_raw_parts, from_raw_parts_mut},
 };
 
-use libc::{
-    c_uint, c_void, {self},
-};
+use libc::{self, c_int, c_uint, c_void};
 
 use win_util::{allocation_granularity, get_high_order, get_low_order};
 use winapi::um::memoryapi::{
     FlushViewOfFile, MapViewOfFile, MapViewOfFileEx, UnmapViewOfFile, FILE_MAP_READ, FILE_MAP_WRITE,
 };
 
-use super::{mmap::Error, mmap::Result, MappedRegion, MemoryMapping, Protection, RawDescriptor};
-use crate::descriptor::AsRawDescriptor;
-use crate::warn;
+use super::mmap::{Error, MemoryMapping, Result};
+use crate::{descriptor::AsRawDescriptor, warn, MappedRegion, Protection, RawDescriptor};
 
-pub(super) const PROT_NONE: c_uint = 0;
-pub(super) const PROT_READ: c_uint = FILE_MAP_READ;
-pub(super) const PROT_WRITE: c_uint = FILE_MAP_WRITE;
+pub(crate) const PROT_READ: c_int = FILE_MAP_READ as c_int;
+pub(crate) const PROT_WRITE: c_int = FILE_MAP_WRITE as c_int;
 
 impl MemoryMapping {
     /// Creates an anonymous shared mapping of `size` bytes with `prot` protection.
@@ -302,18 +298,25 @@ pub struct MemoryMappingArena();
 mod tests {
     use super::{
         super::{pagesize, SharedMemory},
-        *,
+        Error,
     };
     use crate::descriptor::FromRawDescriptor;
+    use crate::{MappedRegion, MemoryMappingBuilder};
     use std::{ffi::CString, ptr};
     use winapi::shared::winerror;
 
     #[test]
     fn map_invalid_fd() {
         let descriptor = unsafe { std::fs::File::from_raw_descriptor(ptr::null_mut()) };
-        let res = MemoryMapping::from_descriptor(&descriptor, 1024).unwrap_err();
-        if let Error::SystemCallFailed(e) = res {
-            assert_eq!(e.errno(), winerror::ERROR_INVALID_HANDLE as i32);
+        let res = MemoryMappingBuilder::new(1024)
+            .from_file(&descriptor)
+            .build()
+            .unwrap_err();
+        if let Error::StdSyscallFailed(e) = res {
+            assert_eq!(
+                e.raw_os_error(),
+                Some(winerror::ERROR_INVALID_HANDLE as i32)
+            );
         } else {
             panic!("unexpected error: {}", res);
         }
@@ -322,7 +325,11 @@ mod tests {
     #[test]
     fn from_descriptor_offset_invalid() {
         let shm = SharedMemory::new(&CString::new("test").unwrap(), 1028).unwrap();
-        let res = MemoryMapping::from_descriptor_offset(&shm, 4096, (i64::max_value() as u64) + 1)
+        let shm = crate::SharedMemory(shm);
+        let res = MemoryMappingBuilder::new(4096)
+            .from_shared_memory(&shm)
+            .offset((i64::max_value() as u64) + 1)
+            .build()
             .unwrap_err();
         match res {
             Error::InvalidOffset => {}
@@ -334,7 +341,11 @@ mod tests {
     fn arena_msync() {
         let size: usize = 0x40000;
         let shm = SharedMemory::new(&CString::new("test").unwrap(), size as u64).unwrap();
-        let m = MemoryMapping::from_descriptor(&shm, size).unwrap();
+        let shm = crate::SharedMemory(shm);
+        let m = MemoryMappingBuilder::new(size)
+            .from_shared_memory(&shm)
+            .build()
+            .unwrap();
         let ps = pagesize();
         <dyn MappedRegion>::msync(&m, 0, ps).unwrap();
         <dyn MappedRegion>::msync(&m, 0, size).unwrap();
