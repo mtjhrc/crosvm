@@ -174,6 +174,29 @@ class CrosvmApi(recipe_api.RecipeApi):
             ensure_file.add_package("crosvm/protoc/${platform}", "latest")
             self.m.cipd.ensure(self.local_bin, ensure_file)
 
+    def __sync_submodules(self):
+        with self.m.step.nest("Sync submodules") as sync_step:
+            with self.m.context(cwd=self.source_dir):
+                try:
+                    self.m.step(
+                        "Init / Update submodules",
+                        ["git", "submodule", "update", "--force", "--init"],
+                    )
+                except:
+                    # Since the repository is cached between builds, the submodules could be left in
+                    # a bad state (e.g. after a previous build is cancelled while syncing).
+                    # Repair this by re-initializing the submodules.
+                    self.m.step(
+                        "De-init submodules",
+                        ["git", "submodule", "deinit", "--force", "--all"],
+                    )
+                    self.m.step(
+                        "Re-init / Update submodules",
+                        ["git", "submodule", "update", "--force", "--init"],
+                    )
+                    sync_step.step_text = "Repaired submodules."
+                    sync_step.status = self.m.step.WARNING
+
     def __prepare_source(self):
         """
         Prepares the local crosvm source for testing in `self.source_dir`
@@ -197,13 +220,13 @@ class CrosvmApi(recipe_api.RecipeApi):
                     gclient_config=gclient_config, gerrit_no_reset=True
                 )
 
-            with self.m.context(cwd=self.source_dir):
-                self.m.step("Sync Submodules", ["git", "submodule", "update", "--init"])
+                self.__sync_submodules()
 
                 # gclient will use a reference to a cache directory, which won't be available inside
                 # the dev container. Repack will make sure all objects are copied into the current
                 # repo.
-                self.m.step("Repack repository", ["git", "repack", "-a"])
+                with self.m.context(cwd=self.source_dir):
+                    self.m.step("Repack repository", ["git", "repack", "-a"])
 
     def __prepare_container(self):
         with self.m.step.nest("Prepare dev_container"):

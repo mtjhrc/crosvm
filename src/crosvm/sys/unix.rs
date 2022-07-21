@@ -71,7 +71,9 @@ use vm_memory::{GuestAddress, GuestMemory, MemoryPolicy};
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
 use crate::crosvm::gdb::{gdb_thread, GdbStub};
 use crate::crosvm::{
-    config::{Config, Executable, FileBackedMappingParameters, SharedDir, SharedDirKind},
+    config::{
+        Config, Executable, FileBackedMappingParameters, HypervisorKind, SharedDir, SharedDirKind,
+    },
     sys::config::VfioType,
 };
 use arch::{
@@ -1126,7 +1128,12 @@ fn punch_holes_in_guest_mem_layout_for_mappings(
 }
 
 fn run_kvm(cfg: Config, components: VmComponents, guest_mem: GuestMemory) -> Result<ExitState> {
-    let kvm = Kvm::new_with_path(&cfg.kvm_device_path).context("failed to create kvm")?;
+    let kvm = Kvm::new_with_path(&cfg.kvm_device_path).with_context(|| {
+        format!(
+            "failed to open KVM device {}",
+            cfg.kvm_device_path.display(),
+        )
+    })?;
     let vm = KvmVm::new(&kvm, guest_mem, components.protected_vm).context("failed to create vm")?;
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1201,6 +1208,10 @@ fn run_kvm(cfg: Config, components: VmComponents, guest_mem: GuestMemory) -> Res
     run_vm::<KvmVcpu, KvmVm>(cfg, components, vm, irq_chip.as_mut(), ioapic_host_tube)
 }
 
+fn get_default_hypervisor() -> Result<HypervisorKind> {
+    Ok(HypervisorKind::Kvm)
+}
+
 pub fn run_config(cfg: Config) -> Result<ExitState> {
     let components = setup_vm_components(&cfg)?;
 
@@ -1221,11 +1232,14 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
     }
     guest_mem.set_memory_policy(mem_policy);
 
-    if cfg.kvm_device_path.exists() {
-        return run_kvm(cfg, components, guest_mem);
-    };
+    let default_hypervisor = get_default_hypervisor().context("no enabled hypervisor")?;
+    let hypervisor = cfg.hypervisor.unwrap_or(default_hypervisor);
 
-    Err(anyhow!("No hypervsior available to run VM."))
+    debug!("creating {:?} hypervisor", hypervisor);
+
+    match hypervisor {
+        HypervisorKind::Kvm => run_kvm(cfg, components, guest_mem),
+    }
 }
 
 fn run_vm<Vcpu, V>(

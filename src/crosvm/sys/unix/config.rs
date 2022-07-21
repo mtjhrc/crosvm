@@ -16,13 +16,27 @@ use crate::crosvm::config::{invalid_value_err, Config};
 #[cfg(feature = "gpu")]
 use crate::crosvm::{argument, argument::parse_hex_or_decimal};
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum HypervisorKind {
+    Kvm,
+}
+
+impl FromStr for HypervisorKind {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "kvm" => Ok(HypervisorKind::Kvm),
+            _ => Err("invalid hypervisor backend"),
+        }
+    }
+}
+
 #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
 pub fn parse_gpu_render_server_options(
     s: &str,
 ) -> Result<crate::crosvm::sys::GpuRenderServerParameters, String> {
-    use std::{path::PathBuf, str::FromStr};
-
-    use crate::crosvm::{config::invalid_value_err, sys::GpuRenderServerParameters};
+    use crate::crosvm::sys::GpuRenderServerParameters;
 
     let mut path: Option<PathBuf> = None;
     let mut cache_path = None;
@@ -65,8 +79,6 @@ pub fn parse_ac97_options(
     key: &str,
     #[allow(unused_variables)] value: &str,
 ) -> Result<(), String> {
-    use std::{path::PathBuf, str::FromStr};
-
     match key {
         #[cfg(feature = "audio_cras")]
         "client_type" => {
@@ -260,12 +272,8 @@ pub fn parse_gpu_options(s: &str) -> Result<GpuParameters, String> {
     use devices::virtio::GpuMode;
     use rutabaga_gfx::RutabagaWsi;
 
-    use crate::crosvm::sys::config::is_gpu_backend_deprecated;
-
     #[cfg(feature = "gfxstream")]
     let mut vulkan_specified = false;
-    #[cfg(feature = "gfxstream")]
-    let mut syncfd_specified = false;
     #[cfg(feature = "gfxstream")]
     let mut angle_specified = false;
 
@@ -383,24 +391,6 @@ pub fn parse_gpu_options(s: &str) -> Result<GpuParameters, String> {
                 }
             },
             #[cfg(feature = "gfxstream")]
-            "syncfd" => {
-                syncfd_specified = true;
-                match v {
-                    "true" | "" => {
-                        gpu_params.gfxstream_use_syncfd = true;
-                    }
-                    "false" => {
-                        gpu_params.gfxstream_use_syncfd = false;
-                    }
-                    _ => {
-                        return Err(invalid_value_err(
-                            v,
-                            "gpu parameter 'syncfd' should be a boolean",
-                        ));
-                    }
-                }
-            }
-            #[cfg(feature = "gfxstream")]
             "angle" => {
                 angle_specified = true;
                 match v {
@@ -501,13 +491,12 @@ pub fn parse_gpu_options(s: &str) -> Result<GpuParameters, String> {
             gpu_params.use_vulkan = use_vulkan();
         }
 
-        if syncfd_specified || angle_specified {
+        if angle_specified {
             match gpu_params.mode {
                 GpuMode::ModeGfxstream => {}
                 _ => {
                     return Err(
-                        "gpu parameter syncfd and angle are only supported for gfxstream backend"
-                            .to_string(),
+                        "gpu parameter angle is only supported for gfxstream backend".to_string(),
                     );
                 }
             }
@@ -750,50 +739,6 @@ mod tests {
         }
         {
             assert!(parse_gpu_options("vulkan=invalid_value,backend=virglrenderer").is_err());
-        }
-    }
-
-    #[cfg(all(feature = "gpu", feature = "gfxstream"))]
-    #[test]
-    fn parse_gpu_options_gfxstream_with_syncfd_specified() {
-        {
-            let gpu_params: GpuParameters =
-                parse_gpu_options("backend=gfxstream,syncfd=true").unwrap();
-
-            assert!(gpu_params.gfxstream_use_syncfd);
-        }
-        {
-            let gpu_params: GpuParameters =
-                parse_gpu_options("syncfd=true,backend=gfxstream").unwrap();
-            assert!(gpu_params.gfxstream_use_syncfd);
-        }
-        {
-            let gpu_params: GpuParameters =
-                parse_gpu_options("backend=gfxstream,syncfd=false").unwrap();
-
-            assert!(!gpu_params.gfxstream_use_syncfd);
-        }
-        {
-            let gpu_params: GpuParameters =
-                parse_gpu_options("syncfd=false,backend=gfxstream").unwrap();
-            assert!(!gpu_params.gfxstream_use_syncfd);
-        }
-        {
-            assert!(parse_gpu_options("backend=gfxstream,syncfd=invalid_value").is_err());
-        }
-        {
-            assert!(parse_gpu_options("syncfd=invalid_value,backend=gfxstream").is_err());
-        }
-    }
-
-    #[cfg(all(feature = "gpu", feature = "gfxstream"))]
-    #[test]
-    fn parse_gpu_options_not_gfxstream_with_syncfd_specified() {
-        {
-            assert!(parse_gpu_options("backend=virglrenderer,syncfd=true").is_err());
-        }
-        {
-            assert!(parse_gpu_options("syncfd=true,backend=virglrenderer").is_err());
         }
     }
 
