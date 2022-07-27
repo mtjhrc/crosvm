@@ -1906,15 +1906,6 @@ impl Wl {
         wayland_paths: Map<String, PathBuf>,
         resource_bridge: Option<Tube>,
     ) -> Result<Wl> {
-        #[cfg(feature = "minigbm")]
-        let gralloc = match RutabagaGralloc::new() {
-            Ok(g) => g,
-            Err(e) => {
-                error!("failed to initialize gralloc {:?}", e);
-                return Err(Error::new(libc::EIO));
-            }
-        };
-
         Ok(Wl {
             kill_evt: None,
             worker_thread: None,
@@ -1926,7 +1917,7 @@ impl Wl {
             use_shmem: false,
             base_features,
             #[cfg(feature = "minigbm")]
-            gralloc: Some(gralloc),
+            gralloc: None,
             address_offset: None,
         })
     }
@@ -1957,15 +1948,19 @@ impl VirtioDevice for Wl {
         if let Some(resource_bridge) = &self.resource_bridge {
             keep_rds.push(resource_bridge.as_raw_descriptor());
         }
-        #[cfg(feature = "minigbm")]
-        if let Some(gralloc) = &self.gralloc {
-            match gralloc.try_as_raw_descriptors() {
-                Ok(mut rds) => keep_rds.append(&mut rds),
-                Err(e) => error!("failed to get gralloc fds {:?}", e),
-            }
-        }
-
         keep_rds
+    }
+
+    #[cfg(feature = "minigbm")]
+    fn on_device_sandboxed(&mut self) {
+        // Gralloc initialization can cause some GPU drivers to create their own threads
+        // and that must be done after sandboxing.
+        match RutabagaGralloc::new() {
+            Ok(g) => self.gralloc = Some(g),
+            Err(e) => {
+                error!("failed to initialize gralloc {:?}", e);
+            }
+        };
     }
 
     fn device_type(&self) -> DeviceType {
@@ -1977,10 +1972,9 @@ impl VirtioDevice for Wl {
     }
 
     fn features(&self) -> u64 {
-        self.base_features
-            | 1 << VIRTIO_WL_F_TRANS_FLAGS
-            | 1 << VIRTIO_WL_F_SEND_FENCES
-            | 1 << VIRTIO_WL_F_USE_SHMEM
+        self.base_features | 1 << VIRTIO_WL_F_TRANS_FLAGS | 1 << VIRTIO_WL_F_SEND_FENCES
+        // TODO(stevensd): re-add flag once driver is fixed
+        // | 1 << VIRTIO_WL_F_USE_SHMEM
     }
 
     fn ack_features(&mut self, value: u64) {

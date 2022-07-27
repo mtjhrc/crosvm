@@ -8,7 +8,6 @@
 
 use std::{ffi::CStr, fmt::Display, marker::PhantomData, ops::Deref};
 
-use base::MappedRegion;
 use libc::{c_char, c_int};
 use thiserror::Error as ThisError;
 
@@ -63,12 +62,11 @@ impl AvCodec {
     }
 
     /// Returns the name of the codec.
-    pub fn name(&self) -> Option<&'static str> {
+    pub fn name(&self) -> &'static str {
+        const INVALID_CODEC_STR: &str = "invalid codec";
+
         // Safe because `CStr::from_ptr` is called on a valid zero-terminated C string.
-        match unsafe { CStr::from_ptr(self.0.name).to_str() } {
-            Ok(name) => Some(name),
-            Err(_) => None,
-        }
+        unsafe { CStr::from_ptr(self.0.name).to_str() }.unwrap_or(INVALID_CODEC_STR)
     }
 
     /// Returns the capabilities of the codec, as a mask of AV_CODEC_CAP_* bits.
@@ -196,10 +194,7 @@ impl AvCodecContext {
     ///
     /// Error codes are the same as those returned by `avcodec_send_packet` with the exception of
     /// EAGAIN which is converted into `Ok(false)` as it is not actually an error.
-    pub fn try_send_packet<'a, T: MappedRegion>(
-        &mut self,
-        packet: &AvPacket<'a, T>,
-    ) -> Result<bool, AvError> {
+    pub fn try_send_packet<'a>(&mut self, packet: &AvPacket<'a>) -> Result<bool, AvError> {
         // Safe because the context is valid through the life of this object, and `packet`'s
         // lifetime properties ensures its memory area is readable.
         match unsafe { ffi::avcodec_send_packet(self.0, &packet.packet) } {
@@ -251,25 +246,38 @@ impl AvCodecContext {
     }
 }
 
-/// An encoded input packet that can be submitted to `AvCodecContext::try_send_packet`.
-pub struct AvPacket<'a, T: MappedRegion> {
-    packet: ffi::AVPacket,
-    _phantom: PhantomData<&'a T>,
+/// Trait for types that can be used as data provider for a `AVBuffer`.
+///
+/// `AVBuffer` is an owned buffer type, so all the type needs to do is being able to provide a
+/// stable pointer to its own data as well as its length. Implementors need to be sendable across
+/// threads because avcodec is allowed to use threads in its codec implementations.
+pub trait AvBufferSource: Send {
+    fn as_ptr(&self) -> *const u8;
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.as_ptr() as *mut u8
+    }
+    fn len(&self) -> usize;
 }
 
-impl<'a, T: MappedRegion> AvPacket<'a, T> {
-    /// Create a new AvPacket.
+/// An encoded input packet that can be submitted to `AvCodecContext::try_send_packet`.
+pub struct AvPacket<'a> {
+    packet: ffi::AVPacket,
+    _phantom: PhantomData<&'a ()>,
+}
+
+impl<'a> AvPacket<'a> {
+    /// Create a new AvPacket that borrows the `input_data`.
     ///
-    /// `input_data` is the encoded data we want to send to the codec for decoding. The data is not
-    /// copied by the AvPacket itself, however a copy may happen when the packet is submitted.
-    pub fn new(pts: i64, input_data: &'a T) -> Self {
+    /// The returned `AvPacket` will hold a reference to `input_data`, meaning that libavcodec might
+    /// perform a copy from/to it.
+    pub fn new<T: AvBufferSource>(pts: i64, input_data: &'a mut T) -> Self {
         Self {
             packet: ffi::AVPacket {
                 buf: std::ptr::null_mut(),
                 pts,
                 dts: AV_NOPTS_VALUE as i64,
-                data: input_data.as_ptr(),
-                size: input_data.size() as c_int,
+                data: input_data.as_mut_ptr(),
+                size: input_data.len() as c_int,
                 side_data: std::ptr::null_mut(),
                 pos: -1,
                 // Safe because all the other elements of this struct can be zeroed.

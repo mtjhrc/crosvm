@@ -273,7 +273,7 @@ impl arch::LinuxArch for AArch64 {
             VmImage::Kernel(ref mut kernel_image) => {
                 let kernel_end: u64;
                 let kernel_size: usize;
-                let elf_result = kernel_loader::load_kernel(&mem, get_kernel_addr(), kernel_image);
+                let elf_result = kernel_loader::load_elf64(&mem, get_kernel_addr(), kernel_image);
                 if elf_result == Err(kernel_loader::Error::InvalidElfMagicNumber) {
                     kernel_size =
                         arch::load_image(&mem, kernel_image, get_kernel_addr(), u64::max_value())
@@ -489,9 +489,10 @@ impl arch::LinuxArch for AArch64 {
             })
             .collect();
 
-        let bat_irq = system_allocator.allocate_irq().ok_or(Error::AllocateIrq)?;
-        let (bat_control, bat_mmio_base) = match bat_type {
+        let (bat_control, bat_mmio_base_and_irq) = match bat_type {
             Some(BatteryType::Goldfish) => {
+                let bat_irq = system_allocator.allocate_irq().ok_or(Error::AllocateIrq)?;
+
                 // a dummy AML buffer. Aarch64 crosvm doesn't use ACPI.
                 let mut amls = Vec::new();
                 let (control_tube, mmio_base) = arch::sys::unix::add_goldfish_battery(
@@ -508,10 +509,10 @@ impl arch::LinuxArch for AArch64 {
                         type_: BatteryType::Goldfish,
                         control_tube,
                     }),
-                    mmio_base,
+                    Some((mmio_base, bat_irq)),
                 )
             }
-            None => (None, 0),
+            None => (None, None),
         };
 
         let vmwdt_cfg = fdt::VmWdtConfig {
@@ -538,8 +539,7 @@ impl arch::LinuxArch for AArch64 {
             use_pmu,
             psci_version,
             components.swiotlb,
-            bat_mmio_base,
-            bat_irq,
+            bat_mmio_base_and_irq,
             vmwdt_cfg,
         )
         .map_err(Error::CreateFdt)?;

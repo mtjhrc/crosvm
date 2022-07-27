@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use anyhow::{anyhow, Context};
-use base::{error, info, warn, MmapError};
+use base::{error, info, warn, MappedRegion, MemoryMappingArena, MmapError};
 use thiserror::Error as ThisError;
 
 use crate::virtio::video::{
@@ -31,6 +31,23 @@ use crate::virtio::video::{
 };
 
 use ::ffmpeg::{avcodec::*, swscale::*, *};
+
+/// Structure maintaining a mapping for an encoded input buffer that can be used as a libavcodec
+/// buffer source.
+struct InputBuffer {
+    /// Memory mapping to the encoded input data.
+    mapping: MemoryMappingArena,
+}
+
+impl AvBufferSource for InputBuffer {
+    fn as_ptr(&self) -> *const u8 {
+        self.mapping.as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.mapping.size()
+    }
+}
 
 /// All the parameters needed to queue an input packet passed to the codec.
 struct InputPacket {
@@ -189,10 +206,12 @@ impl FfmpegDecoderSession {
             bytes_used,
         } = input_packet;
 
-        let mapping = resource.get_mapping(*offset as usize, *bytes_used as usize)?;
+        let mut input_buffer = InputBuffer {
+            mapping: resource.get_mapping(*offset as usize, *bytes_used as usize)?,
+        };
 
         // Prepare our AVPacket and ask the codec to process it.
-        let avpacket = AvPacket::new(*bitstream_id as i64, &mapping);
+        let avpacket = AvPacket::new(*bitstream_id as i64, &mut input_buffer);
         match self.context.try_send_packet(&avpacket) {
             Ok(true) => Ok(true),
             // The codec cannot take more input at the moment, we'll try again after we receive some
@@ -488,7 +507,7 @@ impl DecoderSession for FfmpegDecoderSession {
     }
 
     fn event_pipe(&self) -> &dyn AsRawDescriptor {
-        self.event_queue.event_pipe()
+        &self.event_queue
     }
 
     fn use_output_buffer(
@@ -559,7 +578,7 @@ impl FfmpegDecoder {
                     return None;
                 }
 
-                let codec_name = codec.name()?;
+                let codec_name = codec.name();
 
                 // Only keep processing the decoders we are interested in. These are all software
                 // decoders, but nothing prevents us from supporting hardware-accelerated ones
@@ -572,6 +591,8 @@ impl FfmpegDecoder {
                     _ => return None,
                 };
 
+                // We require custom buffer allocators, so ignore codecs that are not capable of
+                // using them.
                 if codec.capabilities() & AV_CODEC_CAP_DR1 == 0 {
                     warn!(
                         "Skipping codec {} due to lack of DR1 capability.",
