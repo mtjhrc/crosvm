@@ -26,7 +26,7 @@ use devices::virtio::console::asynchronous::AsyncConsole;
 use devices::virtio::ipc_memory_mapper::{create_ipc_mapper, CreateIpcMapperRet};
 use devices::virtio::memory_mapper::{BasicMemoryMapper, MemoryMapperTrait};
 #[cfg(feature = "audio")]
-use devices::virtio::snd::common_backend::Parameters as SndParameters;
+use devices::virtio::snd::parameters::Parameters as SndParameters;
 use devices::virtio::vfio_wrapper::VfioWrapper;
 use devices::virtio::vhost::user::proxy::VirtioVhostUser;
 #[cfg(feature = "audio")]
@@ -353,10 +353,13 @@ pub fn create_virtio_snd_device(
     )
     .context("failed to create cras sound device")?;
 
+    use virtio::snd::parameters::StreamSourceBackend as Backend;
+
     let policy = match backend {
+        Backend::NULL => "snd_null_device",
         #[cfg(feature = "audio_cras")]
-        virtio::common_backend::StreamSourceBackend::CRAS => "snd_cras_device",
-        virtio::common_backend::StreamSourceBackend::NULL => "snd_null_device",
+        Backend::Sys(virtio::snd::sys::StreamSourceBackend::CRAS) => "snd_cras_device",
+        _ => unreachable!(),
     };
 
     let jail = match simple_jail(jail_config, policy)? {
@@ -364,7 +367,7 @@ pub fn create_virtio_snd_device(
             // Create a tmpfs in the device's root directory for cras_snd_device.
             // The size is 20*1024, or 20 KB.
             #[cfg(feature = "audio_cras")]
-            if let virtio::common_backend::StreamSourceBackend::CRAS = backend {
+            if backend == Backend::Sys(virtio::snd::sys::StreamSourceBackend::CRAS) {
                 jail.mount_with_data(
                     Path::new("none"),
                     Path::new("/"),
@@ -830,7 +833,6 @@ pub fn create_wayland_device(
     protected_vm: ProtectionType,
     jail_config: &Option<JailConfig>,
     wayland_socket_paths: &BTreeMap<String, PathBuf>,
-    control_tube: Tube,
     resource_bridge: Option<Tube>,
 ) -> DeviceResult {
     let wayland_socket_dirs = wayland_socket_paths
@@ -840,13 +842,8 @@ pub fn create_wayland_device(
         .ok_or_else(|| anyhow!("wayland socket path has no parent or file name"))?;
 
     let features = virtio::base_features(protected_vm);
-    let dev = virtio::Wl::new(
-        features,
-        wayland_socket_paths.clone(),
-        control_tube,
-        resource_bridge,
-    )
-    .context("failed to create wayland device")?;
+    let dev = virtio::Wl::new(features, wayland_socket_paths.clone(), resource_bridge)
+        .context("failed to create wayland device")?;
 
     let jail = match simple_jail(jail_config, "wl_device")? {
         Some(mut jail) => {

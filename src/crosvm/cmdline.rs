@@ -41,7 +41,7 @@ use argh::FromArgs;
 use base::getpid;
 use devices::virtio::block::block::DiskOption;
 #[cfg(feature = "audio")]
-use devices::virtio::common_backend::Parameters as SndParameters;
+use devices::virtio::snd::parameters::Parameters as SndParameters;
 use devices::virtio::vhost::user::device;
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
 use devices::virtio::VideoBackendType;
@@ -1176,9 +1176,9 @@ pub struct RunCommand {
     #[argh(option, arg_name = "SOCKET_PATH")]
     /// path to a socket for vhost-user vsock
     pub vhost_user_vsock: Vec<VhostUserOption>,
-    #[argh(option, arg_name = "SOCKET_PATH:TUBE_PATH")]
-    /// paths to a vhost-user socket for wayland and a Tube socket for additional wayland-specific messages
-    pub vhost_user_wl: Vec<VhostUserWlOption>,
+    #[argh(option, arg_name = "SOCKET_PATH")]
+    /// path to a vhost-user socket for wayland
+    pub vhost_user_wl: Option<VhostUserWlOption>,
     #[cfg(unix)]
     #[argh(option, arg_name = "SOCKET_PATH")]
     /// path to a socket for vhost-user vsock
@@ -1639,7 +1639,9 @@ impl TryFrom<RunCommand> for super::config::Config {
             // cmd.cras_snds is the old parameter for virtio snd with cras backend.
             cfg.virtio_snds
                 .extend(cmd.cras_snds.into_iter().map(|s| SndParameters {
-                    backend: devices::virtio::snd::common_backend::StreamSourceBackend::CRAS,
+                    backend: devices::virtio::parameters::StreamSourceBackend::Sys(
+                        devices::virtio::snd::sys::StreamSourceBackend::CRAS,
+                    ),
                     ..s
                 }));
         }

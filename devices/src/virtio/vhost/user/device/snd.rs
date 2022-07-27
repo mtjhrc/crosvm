@@ -20,11 +20,12 @@ use vmm_vhost::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 
 use crate::virtio::snd::common_backend::{
     async_funcs::{handle_ctrl_queue, handle_pcm_queue, send_pcm_response_worker},
-    hardcoded_snd_data, hardcoded_virtio_snd_config, Parameters, PcmResponse, SndData, StreamInfo,
+    hardcoded_snd_data, hardcoded_virtio_snd_config, PcmResponse, SndData, StreamInfo,
     MAX_QUEUE_NUM, MAX_VRING_LEN,
 };
-use crate::virtio::snd::cras_backend::create_cras_stream_source_generators;
 use crate::virtio::snd::layout::virtio_snd_config;
+use crate::virtio::snd::parameters::Parameters;
+use crate::virtio::snd::sys::create_cras_stream_source_generators;
 use crate::virtio::vhost::user::device::{
     handler::{sys::Doorbell, VhostUserBackend},
     listener::{sys::VhostUserListener, VhostUserListenerTrait},
@@ -39,7 +40,7 @@ static SND_EXECUTOR: OnceCell<Executor> = OnceCell::new();
 // 2 - tx
 // 3 - rx
 const PCM_RESPONSE_WORKER_IDX_OFFSET: usize = 2;
-struct CrasSndBackend {
+struct SndBackend {
     cfg: virtio_snd_config,
     avail_features: u64,
     acked_features: u64,
@@ -54,7 +55,7 @@ struct CrasSndBackend {
     rx_recv: Option<mpsc::UnboundedReceiver<PcmResponse>>,
 }
 
-impl CrasSndBackend {
+impl SndBackend {
     pub fn new(params: Parameters) -> anyhow::Result<Self> {
         let cfg = hardcoded_virtio_snd_config(&params);
         let avail_features = virtio::base_features(ProtectionType::Unprotected)
@@ -80,7 +81,7 @@ impl CrasSndBackend {
         let (tx_send, tx_recv) = mpsc::unbounded();
         let (rx_send, rx_recv) = mpsc::unbounded();
 
-        Ok(CrasSndBackend {
+        Ok(SndBackend {
             cfg,
             avail_features,
             acked_features: 0,
@@ -97,7 +98,7 @@ impl CrasSndBackend {
     }
 }
 
-impl VhostUserBackend for CrasSndBackend {
+impl VhostUserBackend for SndBackend {
     fn max_queue_num(&self) -> usize {
         return MAX_QUEUE_NUM;
     }
@@ -269,13 +270,13 @@ pub struct Options {
 
 /// Starts a vhost-user snd device with the cras backend.
 /// Returns an error if the given `args` is invalid or the device fails to run.
-pub fn run_cras_snd_device(opts: Options) -> anyhow::Result<()> {
+pub fn run_snd_device(opts: Options) -> anyhow::Result<()> {
     let params = opts
         .config
         .unwrap_or("".to_string())
         .parse::<Parameters>()?;
 
-    let snd_device = Box::new(CrasSndBackend::new(params)?);
+    let snd_device = Box::new(SndBackend::new(params)?);
 
     // Child, we can continue by spawning the executor and set up the device
     let ex = Executor::new().context("Failed to create executor")?;
