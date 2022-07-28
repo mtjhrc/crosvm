@@ -8,36 +8,11 @@ use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
 
-use devices::virtio::vhost::user::vmm::Gpu as VhostUserGpu;
-use serde::{Deserialize, Serialize};
-
-use crate::crosvm::config::{Config, VhostUserOption};
+use serde::Deserialize;
+use serde::Serialize;
 
 use super::*;
-
-pub fn create_vhost_user_gpu_device(
-    cfg: &Config,
-    opt: &VhostUserOption,
-    gpu_tubes: (Tube, Tube),
-    device_control_tube: Tube,
-) -> DeviceResult {
-    // The crosvm gpu device expects us to connect the tube before it will accept a vhost-user
-    // connection.
-    let dev = VhostUserGpu::new(
-        virtio::base_features(cfg.protected_vm),
-        &opt.socket,
-        gpu_tubes,
-        device_control_tube,
-        cfg.gpu_parameters.as_ref().unwrap().pci_bar_size,
-    )
-    .context("failed to set up vhost-user gpu device")?;
-
-    Ok(VirtioDeviceStub {
-        dev: Box::new(dev),
-        // no sandbox here because virtqueue handling is exported to a different process.
-        jail: None,
-    })
-}
+use crate::crosvm::config::Config;
 
 pub struct GpuCacheInfo<'a> {
     directory: Option<&'a str>,
@@ -79,7 +54,6 @@ pub fn get_gpu_cache_info<'a>(
 pub fn create_gpu_device(
     cfg: &Config,
     exit_evt_wrtube: &SendTube,
-    gpu_device_tube: Tube,
     resource_bridges: Vec<Tube>,
     wayland_socket_path: Option<&PathBuf>,
     x_display: Option<String>,
@@ -110,7 +84,6 @@ pub fn create_gpu_device(
         exit_evt_wrtube
             .try_clone()
             .context("failed to clone tube")?,
-        Some(gpu_device_tube),
         resource_bridges,
         display_backends,
         cfg.gpu_parameters.as_ref().unwrap(),
