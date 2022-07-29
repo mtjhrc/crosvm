@@ -237,9 +237,9 @@ fn create_virtio_devices(
         if let Some(gpu_parameters) = &cfg.gpu_parameters {
             let mut gpu_display_w = virtio::DEFAULT_DISPLAY_WIDTH;
             let mut gpu_display_h = virtio::DEFAULT_DISPLAY_HEIGHT;
-            if !gpu_parameters.displays.is_empty() {
-                gpu_display_w = gpu_parameters.displays[0].width;
-                gpu_display_h = gpu_parameters.displays[0].height;
+            if !gpu_parameters.display_params.is_empty() {
+                gpu_display_w = gpu_parameters.display_params[0].width;
+                gpu_display_h = gpu_parameters.display_params[0].height;
             }
 
             let mut event_devices = Vec::new();
@@ -555,7 +555,6 @@ fn create_virtio_devices(
         )?);
     }
 
-    #[cfg(feature = "audio")]
     for vhost_user_snd in &cfg.vhost_user_snd {
         devs.push(create_vhost_user_snd_device(
             cfg.protected_vm,
