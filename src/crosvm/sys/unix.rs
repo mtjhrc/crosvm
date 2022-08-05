@@ -61,6 +61,7 @@ use devices::vfio::VfioCommonSetup;
 use devices::vfio::VfioCommonTrait;
 #[cfg(feature = "gpu")]
 use devices::virtio;
+use devices::virtio::device_constants::video::VideoDeviceType;
 use devices::virtio::memory_mapper::MemoryMapper;
 use devices::virtio::memory_mapper::MemoryMapperTrait;
 use devices::virtio::vhost::vsock::VhostVsockConfig;
@@ -454,7 +455,7 @@ fn create_virtio_devices(
         (cfg.host_ip, cfg.netmask, cfg.mac_address)
     {
         if !cfg.vhost_user_net.is_empty() {
-            bail!("vhost-user-net cannot be used with any of --host_ip, --netmask or --mac");
+            bail!("vhost-user-net cannot be used with any of --host-ip, --netmask or --mac");
         }
         devs.push(create_net_device_from_config(
             cfg.protected_vm,
@@ -514,9 +515,16 @@ fn create_virtio_devices(
                 video_dec_tube,
                 cfg.protected_vm,
                 &cfg.jail_config,
-                devices::virtio::VideoDeviceType::Decoder,
+                VideoDeviceType::Decoder,
             )?;
         }
+    }
+    if let Some(socket_path) = &cfg.vhost_user_video_dec {
+        devs.push(create_vhost_user_video_device(
+            cfg.protected_vm,
+            socket_path,
+            VideoDeviceType::Decoder,
+        )?);
     }
 
     #[cfg(feature = "video-encoder")]
@@ -528,7 +536,7 @@ fn create_virtio_devices(
                 video_enc_tube,
                 cfg.protected_vm,
                 &cfg.jail_config,
-                devices::virtio::VideoDeviceType::Encoder,
+                VideoDeviceType::Encoder,
             )?;
         }
     }
@@ -1615,7 +1623,8 @@ where
         &mut devices,
     )?;
 
-    let iommu_host_tube = if !iommu_attached_endpoints.is_empty() || !hp_endpoints_ranges.is_empty()
+    let iommu_host_tube = if !iommu_attached_endpoints.is_empty()
+        || (cfg.vfio_isolate_hotplug && !hp_endpoints_ranges.is_empty())
     {
         let (iommu_host_tube, iommu_device_tube) = Tube::pair().context("failed to create tube")?;
         let iommu_dev = create_iommu_device(
@@ -1878,6 +1887,11 @@ fn handle_vfio_command<V: VmArch, Vcpu: VcpuArch>(
     add: bool,
     hp_interrupt: bool,
 ) -> VmResponse {
+    let iommu_host_tube = if cfg.vfio_isolate_hotplug {
+        iommu_host_tube
+    } else {
+        &None
+    };
     let ret = if add {
         add_vfio_device(
             linux,

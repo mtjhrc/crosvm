@@ -10,7 +10,7 @@ use base::AsRawDescriptors;
 use base::RawDescriptor;
 use base::Tube;
 use resources::Alloc;
-use resources::MmioType;
+use resources::AllocOptions;
 use resources::SystemAllocator;
 use sync::Mutex;
 
@@ -185,8 +185,8 @@ impl PciBridge {
 
 fn finalize_window(
     resources: &mut SystemAllocator,
-    window_type: MmioType,
-    address: PciAddress,
+    prefetchable: bool,
+    alloc: Alloc,
     mut base: u64,
     mut size: u64,
 ) -> std::result::Result<(u64, u64), PciDeviceError> {
@@ -200,15 +200,13 @@ fn finalize_window(
         if size & (BR_WINDOW_ALIGNMENT - 1) != 0 {
             size = (size + BR_WINDOW_ALIGNMENT - 1) & BR_WINDOW_MASK;
         }
-        match resources.mmio_allocator(window_type).allocate_with_align(
+        match resources.allocate_mmio(
             size,
-            Alloc::PciBridgeWindow {
-                bus: address.bus,
-                dev: address.dev,
-                func: address.func,
-            },
+            alloc,
             "pci_bridge_window".to_string(),
-            BR_WINDOW_ALIGNMENT,
+            AllocOptions::new()
+                .prefetchable(prefetchable)
+                .align(BR_WINDOW_ALIGNMENT),
         ) {
             Ok(addr) => return Ok((addr, size)),
             Err(e) => {
@@ -435,19 +433,39 @@ impl PciDevice for PciBridge {
         if !hotplugged {
             // Only static bridge needs to locate their window's position. Hotplugged bridge's
             // window will be handled by guest kernel.
-            let window =
-                finalize_window(resources, MmioType::Low, address, window_base, window_size)?;
+            let window = finalize_window(
+                resources,
+                false, // prefetchable
+                Alloc::PciBridgeWindow {
+                    bus: address.bus,
+                    dev: address.dev,
+                    func: address.func,
+                },
+                window_base,
+                window_size,
+            )?;
             window_base = window.0;
             window_size = window.1;
-            let pref_window = finalize_window(
+
+            match finalize_window(
                 resources,
-                MmioType::High,
-                address,
+                true, // prefetchable
+                Alloc::PciBridgePrefetchWindow {
+                    bus: address.bus,
+                    dev: address.dev,
+                    func: address.func,
+                },
                 pref_window_base,
                 pref_window_size,
-            )?;
-            pref_window_base = pref_window.0;
-            pref_window_size = pref_window.1;
+            ) {
+                Ok(pref_window) => {
+                    pref_window_base = pref_window.0;
+                    pref_window_size = pref_window.1;
+                }
+                Err(e) => {
+                    warn!("failed to allocate PCI bridge prefetchable window: {}", e);
+                }
+            }
         } else {
             // 0 is Ok here because guest will relocate the bridge window
             if window_size > 0 {
@@ -493,5 +511,9 @@ impl PciDevice for PciBridge {
             BR_BUS_SUBORDINATE_OFFSET as u64,
             &[subordinate_bus],
         );
+    }
+
+    fn destroy_device(&mut self) {
+        self.msi_config.lock().destroy()
     }
 }
