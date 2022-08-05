@@ -11,8 +11,6 @@ cfg_if::cfg_if! {
         use devices::virtio::GpuDisplayParameters;
         use devices::virtio::vhost::user::device::parse_wayland_sock;
 
-        #[cfg(feature = "gpu")]
-        use super::sys::config::parse_gpu_display_options;
         use super::sys::config::{
             parse_coiommu_params, VfioCommand, parse_vfio, parse_vfio_platform,
         };
@@ -34,7 +32,7 @@ use argh::FromArgs;
 use base::getpid;
 use devices::virtio::block::block::DiskOption;
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
-use devices::virtio::device_constants::video::VideoBackendType;
+use devices::virtio::device_constants::video::VideoDeviceConfig;
 #[cfg(feature = "audio")]
 use devices::virtio::snd::parameters::Parameters as SndParameters;
 use devices::virtio::vhost::user::device;
@@ -46,10 +44,7 @@ use devices::SerialParameters;
 use devices::StubPciParameters;
 use hypervisor::ProtectionType;
 use resources::AddressRange;
-use vm_control::BatteryType;
 
-#[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
-use super::config::parse_video_options;
 #[cfg(feature = "gpu")]
 use super::sys::config::parse_gpu_options;
 #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
@@ -59,7 +54,6 @@ use super::sys::GpuRenderServerParameters;
 use crate::crosvm::config::numbered_disk_option;
 #[cfg(feature = "audio")]
 use crate::crosvm::config::parse_ac97_options;
-use crate::crosvm::config::parse_battery_options;
 use crate::crosvm::config::parse_bus_id_addr;
 use crate::crosvm::config::parse_cpu_affinity;
 use crate::crosvm::config::parse_cpu_capacity;
@@ -80,6 +74,7 @@ use crate::crosvm::config::parse_serial_options;
 use crate::crosvm::config::parse_stub_pci_parameters;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::crosvm::config::parse_userspace_msr_options;
+use crate::crosvm::config::BatteryConfig;
 #[cfg(feature = "plugin")]
 use crate::crosvm::config::BindMount;
 #[cfg(feature = "direct")]
@@ -475,13 +470,13 @@ pub struct RunCommand {
     #[argh(option, arg_name = "PATH")]
     /// path for balloon controller socket.
     pub balloon_control: Option<PathBuf>,
-    #[argh(option, from_str_fn(parse_battery_options))]
+    #[argh(option)]
     /// comma separated key=value pairs for setting up battery
     /// device
     /// Possible key values:
     ///     type=goldfish - type of battery emulation, defaults to
     ///     goldfish
-    pub battery: Option<BatteryType>,
+    pub battery: Option<BatteryConfig>,
     #[argh(option)]
     /// path to BIOS/firmware ROM
     pub bios: Option<PathBuf>,
@@ -651,11 +646,7 @@ pub struct RunCommand {
     /// (EXPERIMENTAL) gdb on the given port
     pub gdb: Option<u32>,
     #[cfg(feature = "gpu")]
-    #[argh(
-        option,
-        arg_name = "[width=INT,height=INT]",
-        from_str_fn(parse_gpu_display_options)
-    )]
+    #[argh(option, arg_name = "[width=INT,height=INT]")]
     /// (EXPERIMENTAL) Comma separated key=value pairs for setting
     /// up a display on the virtio-gpu device
     /// Possible key values:
@@ -1220,25 +1211,15 @@ pub struct RunCommand {
     /// open FD to the vhost-vsock device, mutually exclusive with vhost-vsock-device
     pub vhost_vsock_fd: Option<RawDescriptor>,
     #[cfg(feature = "video-decoder")]
-    #[argh(
-        option,
-        long = "video-decoder",
-        arg_name = "[backend]",
-        from_str_fn(parse_video_options)
-    )]
+    #[argh(option, long = "video-decoder", arg_name = "[backend]")]
     /// (EXPERIMENTAL) enable virtio-video decoder device
     /// Possible backend values: libvda, ffmpeg, vaapi
-    pub video_dec: Option<VideoBackendType>,
+    pub video_dec: Option<VideoDeviceConfig>,
     #[cfg(feature = "video-encoder")]
-    #[argh(
-        option,
-        long = "video-encoder",
-        arg_name = "[backend]",
-        from_str_fn(parse_video_options)
-    )]
+    #[argh(option, long = "video-encoder", arg_name = "[backend]")]
     /// (EXPERIMENTAL) enable virtio-video encoder device
     /// Possible backend values: libvda
-    pub video_enc: Option<VideoBackendType>,
+    pub video_enc: Option<VideoDeviceConfig>,
     #[argh(option, long = "evdev", arg_name = "PATH")]
     /// path to an event device node. The device will be grabbed (unusable from the host) and made available to the guest with the same configuration it shows on the host
     pub virtio_input_evdevs: Vec<PathBuf>,
@@ -1779,7 +1760,7 @@ impl TryFrom<RunCommand> for super::config::Config {
             cfg.pvm_fw = Some(p);
         }
 
-        cfg.battery_type = cmd.battery;
+        cfg.battery_config = cmd.battery;
 
         #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
         {

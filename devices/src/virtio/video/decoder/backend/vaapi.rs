@@ -861,22 +861,22 @@ impl DecoderSession for VaapiDecoderSession {
 
         match frames {
             Ok(frames) => {
+                self.event_queue
+                    .queue_event(DecoderEvent::NotifyEndOfBitstreamBuffer(bitstream_id))
+                    .map_err(|e| {
+                        VideoError::BackendFailure(anyhow!(
+                            "Can't queue the NotifyEndOfBitstream event {}",
+                            e
+                        ))
+                    })?;
+
+                if let Some(params) = self.codec.drc() {
+                    self.change_resolution(params)
+                        .map_err(VideoError::BackendFailure)?;
+                }
+
                 for decoded_frame in frames {
-                    if let Some(params) = self.codec.drc() {
-                        self.change_resolution(params)
-                            .map_err(VideoError::BackendFailure)?;
-                    }
-
                     self.ready_queue.push_back(decoded_frame);
-
-                    self.event_queue
-                        .queue_event(DecoderEvent::NotifyEndOfBitstreamBuffer(bitstream_id))
-                        .map_err(|e| {
-                            VideoError::BackendFailure(anyhow!(
-                                "Can't queue the NotifyEndOfBitstream event {}",
-                                e
-                            ))
-                        })?;
                 }
 
                 self.drain_ready_queue()
@@ -997,6 +997,9 @@ impl DecoderSession for VaapiDecoderSession {
         output_queue
             .import_buffer(picture_buffer_id as u32, resource)
             .map_err(|e| VideoError::BackendFailure(anyhow!(e)))?;
+
+        self.drain_ready_queue()
+            .map_err(VideoError::BackendFailure)?;
 
         Ok(())
     }

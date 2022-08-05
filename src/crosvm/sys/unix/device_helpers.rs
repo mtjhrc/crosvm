@@ -4,13 +4,11 @@
 
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
-use std::fs::File;
 use std::fs::OpenOptions;
 use std::net::Ipv4Addr;
 use std::ops::RangeInclusive;
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
-use std::os::unix::prelude::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str;
@@ -50,6 +48,7 @@ use devices::virtio::vhost::user::vmm::Snd as VhostUserSnd;
 use devices::virtio::vhost::user::vmm::Video as VhostUserVideo;
 use devices::virtio::vhost::user::vmm::Vsock as VhostUserVsock;
 use devices::virtio::vhost::user::vmm::Wl as VhostUserWl;
+use devices::virtio::vhost::user::VhostUserDevice;
 use devices::virtio::vhost::vsock::VhostVsockConfig;
 #[cfg(feature = "balloon")]
 use devices::virtio::BalloonMode;
@@ -142,6 +141,10 @@ pub type DeviceResult<T = VirtioDeviceStub> = Result<T>;
 pub enum VirtioDeviceType {
     /// A regular (in-VMM) virtio device.
     Regular,
+    /// Socket-backed vhost-user device.
+    VhostUser,
+    /// VFIO-backed vhost-user device, aka virtio-vhost-user.
+    Vvu,
 }
 
 impl VirtioDeviceType {
@@ -150,6 +153,8 @@ impl VirtioDeviceType {
     fn seccomp_policy_file(&self, base: &str) -> String {
         match self {
             VirtioDeviceType::Regular => format!("{base}_device"),
+            VirtioDeviceType::VhostUser => format!("{base}_device_vhost_user"),
+            VirtioDeviceType::Vvu => format!("{base}_device_vvu"),
         }
     }
 }
@@ -160,18 +165,37 @@ impl VirtioDeviceType {
 /// This trait also provides a few convenience methods for e.g. creating a virtio device and jail
 /// at once.
 pub trait VirtioDeviceBuilder {
+    /// Base name of the device, as it will appear in logs.
+    const NAME: &'static str;
+
     /// Create a regular virtio device from the configuration and `protected_vm` setting.
     fn create_virtio_device(
         &self,
         protected_vm: ProtectionType,
     ) -> anyhow::Result<Box<dyn VirtioDevice>>;
 
-    /// Create a jail that is suitable to run a device
+    /// Create a device suitable for being run as a vhost-user instance.
+    ///
+    /// It is ok to leave this method unimplemented if the device is not intended to be used with
+    /// vhost-user.
+    fn create_vhost_user_device(
+        &self,
+        _keep_rds: &mut Vec<RawDescriptor>,
+    ) -> anyhow::Result<Box<dyn VhostUserDevice>> {
+        unimplemented!()
+    }
+
+    /// Create a jail that is suitable to run a device.
+    ///
+    /// The default implementation creates a simple jail with a seccomp policy derived from the
+    /// base name of the device.
     fn create_jail(
         &self,
         jail_config: &Option<JailConfig>,
         jail_type: VirtioDeviceType,
-    ) -> anyhow::Result<Option<Minijail>>;
+    ) -> anyhow::Result<Option<Minijail>> {
+        simple_jail(jail_config, &jail_type.seccomp_policy_file(Self::NAME))
+    }
 
     /// Helper method to return a `VirtioDeviceStub` filled using `create_virtio_device` and
     /// `create_jail`.
@@ -195,23 +219,7 @@ pub fn create_block_device(
     disk: &DiskOption,
     disk_device_tube: Tube,
 ) -> DeviceResult {
-    let mut options = OpenOptions::new();
-    options.read(true).write(!disk.read_only);
-
-    #[cfg(unix)]
-    if disk.o_direct {
-        options.custom_flags(libc::O_DIRECT);
-    }
-
-    let raw_image: File = open_file(&disk.path, &options)
-        .with_context(|| format!("failed to load disk image {}", disk.path.display()))?;
-    // Lock the disk image to prevent other crosvm instances from using it.
-    let lock_op = if disk.read_only {
-        FlockOperation::LockShared
-    } else {
-        FlockOperation::LockExclusive
-    };
-    flock(&raw_image, lock_op, true).context("failed to lock disk image")?;
+    let raw_image = disk.open_as_raw_image()?;
 
     info!("Trying to attach block device: {}", disk.path.display());
     let dev = if disk::async_ok(&raw_image).context("failed to check disk async_ok")? {
@@ -1292,6 +1300,8 @@ fn add_bind_mounts(param: &SerialParameters, jail: &mut Minijail) -> Result<(), 
 
 /// For creating console virtio devices.
 impl VirtioDeviceBuilder for SerialParameters {
+    const NAME: &'static str = "serial";
+
     fn create_virtio_device(
         &self,
         protected_vm: ProtectionType,
@@ -1303,6 +1313,15 @@ impl VirtioDeviceBuilder for SerialParameters {
             self.create_serial_device::<AsyncConsole>(protected_vm, &evt, &mut keep_rds)
                 .context("failed to create console device")?,
         ))
+    }
+
+    fn create_vhost_user_device(
+        &self,
+        keep_rds: &mut Vec<RawDescriptor>,
+    ) -> anyhow::Result<Box<dyn VhostUserDevice>> {
+        Ok(Box::new(virtio::vhost::user::create_vu_console_device(
+            self, keep_rds,
+        )?))
     }
 
     fn create_jail(
