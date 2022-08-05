@@ -11,10 +11,6 @@ use std::time::Duration;
 use devices::virtio::GpuDisplayParameters;
 #[cfg(feature = "gpu")]
 use devices::virtio::GpuParameters;
-#[cfg(feature = "gpu")]
-use devices::virtio::DEFAULT_DISPLAY_HEIGHT;
-#[cfg(feature = "gpu")]
-use devices::virtio::DEFAULT_DISPLAY_WIDTH;
 use devices::IommuDevType;
 use devices::PciAddress;
 use devices::SerialParameters;
@@ -102,30 +98,6 @@ pub fn parse_ac97_options(
             return Err(format!("unknown ac97 parameter {}", key));
         }
     };
-    Ok(())
-}
-
-#[cfg(feature = "audio")]
-pub fn check_ac97_backend(
-    #[allow(unused_variables)] ac97_params: &devices::Ac97Parameters,
-) -> Result<(), String> {
-    // server is required for and exclusive to vios backend
-    #[cfg(target_os = "android")]
-    match ac97_params.backend {
-        devices::Ac97Backend::VIOS => {
-            if ac97_params.vios_server_path.is_none() {
-                return Err(String::from("server argument is required for VIOS backend"));
-            }
-        }
-        _ => {
-            if ac97_params.vios_server_path.is_some() {
-                return Err(String::from(
-                    "server argument is exclusive to the VIOS backend",
-                ));
-            }
-        }
-    }
-
     Ok(())
 }
 
@@ -248,10 +220,7 @@ pub(crate) fn validate_gpu_config(cfg: &mut Config) -> Result<(), String> {
             ));
         }
         if gpu_parameters.display_params.is_empty() {
-            gpu_parameters.display_params.push(GpuDisplayParameters {
-                width: DEFAULT_DISPLAY_WIDTH,
-                height: DEFAULT_DISPLAY_HEIGHT,
-            });
+            gpu_parameters.display_params.push(Default::default());
         }
 
         let width = gpu_parameters.display_params[0].width;

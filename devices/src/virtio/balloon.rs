@@ -31,6 +31,7 @@ use data_model::Le32;
 use data_model::Le64;
 use futures::channel::mpsc;
 use futures::pin_mut;
+use futures::FutureExt;
 use futures::StreamExt;
 use remain::sorted;
 use thiserror::Error as ThisError;
@@ -303,19 +304,13 @@ fn parse_balloon_stats(reader: &mut Reader) -> BalloonStats {
 // signaled from the command socket that stats should be collected again.
 async fn handle_stats_queue(
     mem: &GuestMemory,
-    queue: Option<Queue>,
-    queue_event: Option<EventAsync>,
+    mut queue: Queue,
+    mut queue_event: EventAsync,
     mut stats_rx: mpsc::Receiver<u64>,
     command_tube: &AsyncTube,
     state: Arc<AsyncMutex<BalloonState>>,
     interrupt: Rc<RefCell<Interrupt>>,
 ) {
-    let mut queue = match queue {
-        None => std::future::pending().await,
-        Some(queue) => queue,
-    };
-    let mut queue_event = queue_event.expect("missing event");
-
     // Consume the first stats buffer sent from the guest at startup. It was not
     // requested by anyone, and the stats are stale.
     let mut index = match queue.next_async(mem, &mut queue_event).await {
@@ -404,17 +399,12 @@ async fn handle_event(
 // Async task that handles the events queue.
 async fn handle_events_queue(
     mem: &GuestMemory,
-    queue: Option<Queue>,
-    queue_event: Option<EventAsync>,
+    mut queue: Queue,
+    mut queue_event: EventAsync,
     state: Arc<AsyncMutex<BalloonState>>,
     interrupt: Rc<RefCell<Interrupt>>,
     command_tube: &AsyncTube,
 ) -> Result<()> {
-    let mut queue = match queue {
-        None => std::future::pending().await,
-        Some(queue) => queue,
-    };
-    let mut queue_event = queue_event.expect("missing event");
     loop {
         let avail_desc = queue
             .next_async(mem, &mut queue_event)
@@ -488,6 +478,7 @@ fn run_worker(
     kill_evt: Event,
     mem: GuestMemory,
     state: Arc<AsyncMutex<BalloonState>>,
+    acked_features: u64,
 ) -> Option<Tube> {
     // Wrap the interrupt in a `RefCell` so it can be shared between async functions.
     let interrupt = Rc::new(RefCell::new(interrupt));
@@ -541,19 +532,24 @@ fn run_worker(
         );
         pin_mut!(deflate);
 
-        // The next queue if present is used for stats messages. The message type is
-        // the id of the stats request, so we can detect if there are any stale stats
-        // results that were queued during an error condition.
+        // The next queue is used for stats messages if VIRTIO_BALLOON_F_STATS_VQ is negotiated.
+        // The message type is the id of the stats request, so we can detect if there are any stale
+        // stats results that were queued during an error condition.
         let (stats_tx, stats_rx) = mpsc::channel::<u64>(1);
-        let stats = handle_stats_queue(
-            &mem,
-            queues.pop_front(),
-            queue_evts.pop_front(),
-            stats_rx,
-            &command_tube,
-            state.clone(),
-            interrupt.clone(),
-        );
+        let stats = if (acked_features & (1 << VIRTIO_BALLOON_F_STATS_VQ)) != 0 {
+            handle_stats_queue(
+                &mem,
+                queues.pop_front().unwrap(),
+                queue_evts.pop_front().unwrap(),
+                stats_rx,
+                &command_tube,
+                state.clone(),
+                interrupt.clone(),
+            )
+            .left_future()
+        } else {
+            std::future::pending().right_future()
+        };
         pin_mut!(stats);
 
         // Future to handle command messages that resize the balloon.
@@ -569,15 +565,20 @@ fn run_worker(
         let kill = async_utils::await_and_exit(&ex, kill_evt);
         pin_mut!(kill);
 
-        // The next queue if present is used for events.
-        let events = handle_events_queue(
-            &mem,
-            queues.pop_front(),
-            queue_evts.pop_front(),
-            state,
-            interrupt,
-            &command_tube,
-        );
+        // The next queue is used for events if VIRTIO_BALLOON_F_EVENTS_VQ is negotiated.
+        let events = if (acked_features & (1 << VIRTIO_BALLOON_F_EVENTS_VQ)) != 0 {
+            handle_events_queue(
+                &mem,
+                queues.pop_front().unwrap(),
+                queue_evts.pop_front().unwrap(),
+                state,
+                interrupt,
+                &command_tube,
+            )
+            .left_future()
+        } else {
+            std::future::pending().right_future()
+        };
         pin_mut!(events);
 
         if let Err(e) = ex
@@ -765,6 +766,7 @@ impl VirtioDevice for Balloon {
         #[cfg(windows)]
         let mapping_tube = self.dynamic_mapping_tube.take().unwrap();
         let inflate_tube = self.inflate_tube.take();
+        let acked_features = self.acked_features;
         let worker_result = thread::Builder::new()
             .name("virtio_balloon".to_string())
             .spawn(move || {
@@ -779,6 +781,7 @@ impl VirtioDevice for Balloon {
                     kill_evt,
                     mem,
                     state,
+                    acked_features,
                 )
             });
 
