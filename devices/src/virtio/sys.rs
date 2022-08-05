@@ -7,12 +7,10 @@ cfg_if::cfg_if! {
         mod unix;
         use unix as platform;
     } else if #[cfg(windows)] {
-        mod windows;
+        pub mod windows;
         use windows as platform;
     }
 }
 
-pub(crate) use platform::create_stream_source_generators;
-pub(crate) use platform::parse_args;
-pub(crate) use platform::set_audio_thread_priority;
-pub use platform::StreamSourceBackend;
+pub(crate) use platform::net::process_rx;
+pub(crate) use platform::net::process_tx;
