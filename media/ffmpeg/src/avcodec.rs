@@ -7,6 +7,7 @@
 //! low-level access as the libavcodec functions do.
 
 use std::ffi::CStr;
+use std::fmt::Debug;
 use std::fmt::Display;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -60,10 +61,16 @@ pub enum AvCodecOpenError {
 }
 
 impl AvCodec {
-    /// Returns whether the codec is a decoder codec.
+    /// Returns whether the codec is a decoder.
     pub fn is_decoder(&self) -> bool {
         // Safe because `av_codec_is_decoder` is called on a valid static `AVCodec` reference.
         (unsafe { ffi::av_codec_is_decoder(self.0) } != 0)
+    }
+
+    /// Returns whether the codec is an encoder.
+    pub fn is_encoder(&self) -> bool {
+        // Safe because `av_codec_is_decoder` is called on a valid static `AVCodec` reference.
+        (unsafe { ffi::av_codec_is_encoder(self.0) } != 0)
     }
 
     /// Returns the name of the codec.
@@ -139,11 +146,41 @@ impl Iterator for AvCodecIterator {
     }
 }
 
+/// Simple wrapper over `AVProfile` that provides helpful methods.
+pub struct AvProfile(&'static ffi::AVProfile);
+
+impl AvProfile {
+    /// Return the profile id, which can be matched against FF_PROFILE_*.
+    pub fn profile(&self) -> u32 {
+        self.0.profile as u32
+    }
+
+    /// Return the name of this profile.
+    pub fn name(&self) -> &'static str {
+        const INVALID_PROFILE_STR: &str = "invalid profile";
+
+        // Safe because `CStr::from_ptr` is called on a valid zero-terminated C string.
+        unsafe { CStr::from_ptr(self.0.name).to_str() }.unwrap_or(INVALID_PROFILE_STR)
+    }
+}
+
+impl Display for AvProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl Debug for AvProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(self, f)
+    }
+}
+
 /// Lightweight abstraction over the array of supported profiles for a given codec.
 pub struct AvProfileIterator(*const ffi::AVProfile);
 
 impl Iterator for AvProfileIterator {
-    type Item = &'static ffi::AVProfile;
+    type Item = AvProfile;
 
     fn next(&mut self) -> Option<Self::Item> {
         // Safe because the contract of `new` stipulates we have received a valid `AVCodec`
@@ -158,7 +195,7 @@ impl Iterator for AvProfileIterator {
                         // Safe because we have been initialized to a static, valid profiles array
                         // which is terminated by FF_PROFILE_UNKNOWN.
                         self.0 = unsafe { self.0.offset(1) };
-                        Some(profile)
+                        Some(AvProfile(profile))
                     }
                 }
             }
@@ -330,8 +367,7 @@ pub struct AvPacket<'a> {
     packet: ffi::AVPacket,
     /// This is just used to drop the `AvBuffer` if needed upon destruction and is not referenced
     /// otherwise.
-    #[allow(dead_code)]
-    ownership: AvPacketOwnership<'a>,
+    _ownership: AvPacketOwnership<'a>,
 }
 
 #[derive(Debug, ThisError)]
@@ -358,7 +394,7 @@ impl<'a> AvPacket<'a> {
                 // Safe because all the other elements of this struct can be zeroed.
                 ..unsafe { std::mem::zeroed() }
             },
-            ownership: AvPacketOwnership::Borrowed(PhantomData),
+            _ownership: AvPacketOwnership::Borrowed(PhantomData),
         }
     }
 
@@ -385,7 +421,7 @@ impl<'a> AvPacket<'a> {
                 // Safe because all the other elements of this struct can be zeroed.
                 ..unsafe { std::mem::zeroed() }
             },
-            ownership: AvPacketOwnership::Owned(av_buffer),
+            _ownership: AvPacketOwnership::Owned(av_buffer),
         };
 
         Ok(ret)

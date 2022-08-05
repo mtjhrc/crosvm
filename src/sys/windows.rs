@@ -84,6 +84,7 @@ use devices::virtio::BalloonMode;
 use devices::virtio::Console;
 #[cfg(feature = "slirp")]
 use devices::virtio::NetExt;
+#[cfg(feature = "pvclock")]
 use devices::virtio::PvClock;
 #[cfg(feature = "audio")]
 use devices::Ac97Dev;
@@ -427,6 +428,7 @@ fn create_balloon_device(
         } else {
             BalloonMode::Relaxed
         },
+        0,
     )
     .exit_context(Exit::BalloonDeviceNew, "failed to create balloon")?;
 
@@ -497,6 +499,7 @@ fn create_virtio_devices(
     }
 
     if let Some(tube) = pvclock_device_tube {
+        #[cfg(feature = "pvclock")]
         devs.push(VirtioDeviceStub {
             dev: Box::new(PvClock::new(tsc_frequency, tube)),
             jail: None,
@@ -597,6 +600,7 @@ fn create_devices(
     mem: &GuestMemory,
     exit_evt_wrtube: &SendTube,
     irq_control_tubes: &mut Vec<Tube>,
+    control_tubes: &mut Vec<TaggedControlTube>,
     gpu_device_tube: Tube,
     disk_device_tubes: &mut Vec<Tube>,
     balloon_device_tube: Option<Tube>,
@@ -632,13 +636,22 @@ fn create_devices(
             Tube::pair().exit_context(Exit::CreateTube, "failed to create tube")?;
         irq_control_tubes.push(msi_host_tube);
 
+        let shared_memory_tube = if stub.dev.get_shared_memory_region().is_some() {
+            let (host_tube, device_tube) =
+                Tube::pair().context("failed to create VVU proxy tube")?;
+            control_tubes.push(TaggedControlTube::VmMemory(host_tube));
+            Some(device_tube)
+        } else {
+            None
+        };
+
         let dev = Box::new(
             VirtioPciDevice::new(
                 mem.clone(),
                 stub.dev,
                 msi_device_tube,
                 cfg.disable_virtio_intx,
-                None,
+                shared_memory_tube,
             )
             .exit_context(Exit::VirtioPciDev, "failed to create virtio pci dev")?,
         ) as Box<dyn BusDeviceObj>;
@@ -700,7 +713,7 @@ struct PvClockError(String);
 /// setup yet (or never will be, because the guest doesn't support it). In that case, we want to
 /// timeout on recv-ing a response, and to do that we need to do a wait_timeout on the Tube's
 /// read_notifier.
-#[cfg(feature = "kiwi")]
+#[cfg(feature = "pvclock")]
 fn handle_pvclock_request(tube: &Option<Tube>, command: PvClockCommand) -> Result<()> {
     if let Some(ref tube) = tube {
         tube.send(&command)
@@ -904,6 +917,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     #[cfg(all(feature = "kiwi", feature = "anti-tamper",))]
     spawn_dedicated_anti_tamper_thread(anti_tamper_dedicated_thread_tube);
 
+    #[cfg(feature = "sandbox")]
     if sandbox::is_sandbox_target() {
         sandbox::TargetServices::get()
             .exit_context(Exit::SandboxError, "failed to create sandbox")?
@@ -1146,6 +1160,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                             }
                             guest_os.irq_chip.kick_halted_vcpus();
 
+                            #[cfg(feature = "pvclock")]
                             handle_pvclock_request(&pvclock_host_tube, PvClockCommand::Suspend)
                                 .unwrap_or_else(|e| {
                                     error!("Error handling pvclock suspend: {:?}", e)
@@ -1153,6 +1168,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                         }
                         MessageFromService::Resume => {
                             info!("Received resume request from the service");
+                            #[cfg(feature = "pvclock")]
                             handle_pvclock_request(&pvclock_host_tube, PvClockCommand::Resume)
                                 .unwrap_or_else(|e| {
                                     error!("Error handling pvclock resume: {:?}", e)
@@ -2090,6 +2106,7 @@ where
         vm.get_memory(),
         &vm_evt_wrtube,
         &mut irq_control_tubes,
+        &mut control_tubes,
         gpu_device_tube,
         &mut disk_device_tubes,
         balloon_device_tube,
@@ -2112,7 +2129,7 @@ where
         &mut sys_allocator,
         &cfg.serial_parameters,
         None,
-        (&cfg.battery_type, None),
+        (cfg.battery_config.as_ref().map(|t| t.type_), None),
         vm,
         ramoops_region,
         pci_devices,
