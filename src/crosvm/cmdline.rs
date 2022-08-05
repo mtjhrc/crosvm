@@ -880,7 +880,7 @@ pub struct RunCommand {
     #[argh(option, long = "product-channel")]
     /// product channel
     pub product_channel: Option<String>,
-    #[cfg(feature = "crash-report")]
+    #[cfg(windows)]
     #[argh(option, long = "product-name")]
     /// the product name for file paths.
     pub product_name: Option<String>,
@@ -1494,10 +1494,9 @@ impl TryFrom<RunCommand> for super::config::Config {
         {
             #[cfg(feature = "crash-report")]
             {
-                cfg.product_name = cmd.product_name;
-
                 cfg.crash_pipe_name = cmd.crash_pipe_name;
             }
+            cfg.product_name = cmd.product_name;
             cfg.exit_stats = cmd.exit_stats;
             cfg.host_guid = cmd.host_guid;
             cfg.irq_chip = cmd.irq_chip;
@@ -1511,7 +1510,10 @@ impl TryFrom<RunCommand> for super::config::Config {
                 cfg.process_invariants_data_size = cmd.process_invariants_data_size;
             }
             cfg.pvclock = cmd.pvclock;
-            cfg.service_pipe_name = cmd.service_pipe_name;
+            #[cfg(feature = "kiwi")]
+            {
+                cfg.service_pipe_name = cmd.service_pipe_name;
+            }
             #[cfg(feature = "slirp-ring-capture")]
             {
                 cfg.slirp_capture_file = cmd.slirp_capture_file;
@@ -1758,7 +1760,7 @@ impl TryFrom<RunCommand> for super::config::Config {
                     "unprotected-vm-with-firmware path should be an existing file".to_string(),
                 );
             }
-            cfg.protected_vm = ProtectionType::Unprotected;
+            cfg.protected_vm = ProtectionType::UnprotectedWithFirmware;
             // Balloon and USB devices only work for unprotected VMs.
             cfg.balloon = false;
             cfg.usb = false;

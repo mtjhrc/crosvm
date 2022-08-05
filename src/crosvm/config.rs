@@ -323,6 +323,7 @@ impl TouchDeviceOption {
     }
 
     /// If the user specifies the size, use it. Otherwise, use the default values.
+    #[cfg(any(unix, feature = "gpu"))]
     pub fn get_size(&self) -> (u32, u32) {
         (
             self.width.unwrap_or(self.default_width),
@@ -919,6 +920,7 @@ pub fn parse_ac97_options(s: &str) -> Result<Ac97Parameters, String> {
                     .map_err(|e| format!("invalid capture option: {}", e))?;
             }
             _ => {
+                #[cfg(feature = "audio_cras")]
                 super::sys::config::parse_ac97_options(&mut ac97_params, k, v)?;
             }
         }
