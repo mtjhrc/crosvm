@@ -14,10 +14,10 @@ pub mod sys;
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::fs::File;
+use std::io;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
-use std::io::{self};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -591,6 +591,36 @@ pub fn generate_pci_topology(
         }
     }
     Ok((bar_ranges, subordinate_bus))
+}
+
+/// Ensure all PCI devices have an assigned PCI address.
+pub fn assign_pci_addresses(
+    devices: &mut [(Box<dyn BusDeviceObj>, Option<Minijail>)],
+    resources: &mut SystemAllocator,
+) -> Result<(), DeviceRegistrationError> {
+    // First allocate devices with a preferred address.
+    for pci_device in devices
+        .iter_mut()
+        .filter_map(|(device, _jail)| device.as_pci_device_mut())
+        .filter(|pci_device| pci_device.preferred_address().is_some())
+    {
+        let _ = pci_device
+            .allocate_address(resources)
+            .map_err(DeviceRegistrationError::AllocateDeviceAddrs)?;
+    }
+
+    // Then allocate addresses for the remaining devices.
+    for pci_device in devices
+        .iter_mut()
+        .filter_map(|(device, _jail)| device.as_pci_device_mut())
+        .filter(|pci_device| pci_device.preferred_address().is_none())
+    {
+        let _ = pci_device
+            .allocate_address(resources)
+            .map_err(DeviceRegistrationError::AllocateDeviceAddrs)?;
+    }
+
+    Ok(())
 }
 
 /// Creates a root PCI device for use by this Vm.

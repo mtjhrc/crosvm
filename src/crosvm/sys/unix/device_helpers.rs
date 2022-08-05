@@ -21,12 +21,12 @@ use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use arch::VirtioDeviceStub;
-use arch::{self};
 use base::*;
 use devices::serial_device::SerialParameters;
 use devices::serial_device::SerialType;
 use devices::vfio::VfioCommonSetup;
 use devices::vfio::VfioCommonTrait;
+use devices::virtio;
 use devices::virtio::block::block::DiskOption;
 use devices::virtio::console::asynchronous::AsyncConsole;
 use devices::virtio::ipc_memory_mapper::create_ipc_mapper;
@@ -52,7 +52,6 @@ use devices::virtio::BalloonMode;
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
 use devices::virtio::VideoBackendType;
 use devices::virtio::VirtioDevice;
-use devices::virtio::{self};
 use devices::BusDeviceObj;
 use devices::IommuDevType;
 use devices::PciAddress;
@@ -64,11 +63,9 @@ use devices::VfioPciDevice;
 use devices::VfioPlatformDevice;
 #[cfg(all(feature = "tpm", feature = "chromeos", target_arch = "x86_64"))]
 use devices::VtpmProxy;
-use devices::{self};
 use hypervisor::ProtectionType;
 use hypervisor::Vm;
 use minijail::Minijail;
-use minijail::{self};
 use net_util::sys::unix::Tap;
 use net_util::MacAddress;
 use resources::Alloc;
@@ -1369,17 +1366,20 @@ pub fn create_vfio_device(
         iommu_dev != IommuDevType::NoIommu,
     )
     .context("failed to create vfio device")?;
-    let mut vfio_pci_device = Box::new(VfioPciDevice::new(
-        #[cfg(feature = "direct")]
-        vfio_path,
-        vfio_device,
-        bus_num,
-        guest_address,
-        vfio_device_tube_msi,
-        vfio_device_tube_msix,
-        vfio_device_tube_mem,
-        vfio_device_tube_vm,
-    ));
+    let mut vfio_pci_device = Box::new(
+        VfioPciDevice::new(
+            #[cfg(feature = "direct")]
+            vfio_path,
+            vfio_device,
+            bus_num,
+            guest_address,
+            vfio_device_tube_msi,
+            vfio_device_tube_msix,
+            vfio_device_tube_mem,
+            vfio_device_tube_vm,
+        )
+        .context("failed to create VfioPciDevice")?,
+    );
     // early reservation for pass-through PCI devices.
     let endpoint_addr = vfio_pci_device
         .allocate_address(resources)

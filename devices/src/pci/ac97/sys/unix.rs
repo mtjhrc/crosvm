@@ -5,6 +5,8 @@
 use audio_streams::shm_streams::NullShmStreamSource;
 use audio_streams::shm_streams::ShmStreamSource;
 #[cfg(feature = "audio_cras")]
+use base::error;
+#[cfg(feature = "audio_cras")]
 use libcras::CrasClient;
 #[cfg(feature = "audio_cras")]
 use libcras::CrasClientType;
@@ -98,9 +100,9 @@ pub(in crate::pci::ac97) fn create_null_server() -> AudioStreamSource {
 
 #[cfg(test)]
 pub(in crate::pci::ac97) mod tests {
-    use super::*;
-
     use audio_streams::shm_streams::MockShmStreamSource;
+
+    use super::*;
 
     pub(in crate::pci::ac97) fn create_ac97_device(
         mem: GuestMemory,
