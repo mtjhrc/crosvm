@@ -286,8 +286,6 @@ const GB: u64 = 1 << 30;
 const BOOT_STACK_POINTER: u64 = 0x8000;
 const START_OF_RAM_32BITS: u64 = if cfg!(feature = "direct") { 0x1000 } else { 0 };
 const FIRST_ADDR_PAST_32BITS: u64 = 1 << 32;
-// Reserve memory region for pcie virtual configuration
-const PCIE_VCFG_MMIO_SIZE: u64 = 0x400_0000;
 // Linux (with 4-level paging) has a physical memory limit of 46 bits (64 TiB).
 const HIGH_MMIO_MAX_END: u64 = (1u64 << 46) - 1;
 const KERNEL_64BIT_ENTRY_OFFSET: u64 = 0x200;
@@ -449,11 +447,12 @@ fn configure_system(
         add_e820_entry(&mut params, ram_above_4g, E820Type::Ram)?
     }
 
-    add_e820_entry(&mut params, read_pcie_cfg_mmio(), E820Type::Reserved)?;
+    let pcie_cfg_mmio_range = read_pcie_cfg_mmio();
+    add_e820_entry(&mut params, pcie_cfg_mmio_range, E820Type::Reserved)?;
 
     add_e820_entry(
         &mut params,
-        X8664arch::get_pcie_vcfg_mmio_range(guest_mem),
+        X8664arch::get_pcie_vcfg_mmio_range(guest_mem, &pcie_cfg_mmio_range),
         E820Type::Reserved,
     )?;
 
@@ -627,7 +626,7 @@ impl arch::LinuxArch for X8664arch {
         .map_err(Error::CreatePciRoot)?;
 
         let pci = Arc::new(Mutex::new(pci));
-        pci.lock().enable_pcie_cfg_mmio(read_pcie_cfg_mmio().start);
+        pci.lock().enable_pcie_cfg_mmio(pcie_cfg_mmio_range.start);
         let pci_cfg = PciConfigIo::new(
             pci.clone(),
             vm_evt_wrtube.try_clone().map_err(Error::CloneTube)?,
@@ -636,18 +635,18 @@ impl arch::LinuxArch for X8664arch {
         io_bus.insert(pci_bus, 0xcf8, 0x8).unwrap();
 
         let pcie_cfg_mmio = Arc::new(Mutex::new(PciConfigMmio::new(pci.clone(), 12)));
-        let pcie_cfg_mmio_range = read_pcie_cfg_mmio();
         let pcie_cfg_mmio_len = pcie_cfg_mmio_range.len().unwrap();
         mmio_bus
             .insert(pcie_cfg_mmio, pcie_cfg_mmio_range.start, pcie_cfg_mmio_len)
             .unwrap();
 
-        let pcie_vcfg_mmio = Arc::new(Mutex::new(PciVirtualConfigMmio::new(pci.clone(), 12)));
+        let pcie_vcfg_mmio = Arc::new(Mutex::new(PciVirtualConfigMmio::new(pci.clone(), 13)));
+        let pcie_vcfg_range = Self::get_pcie_vcfg_mmio_range(&mem, &pcie_cfg_mmio_range);
         mmio_bus
             .insert(
                 pcie_vcfg_mmio,
-                Self::get_pcie_vcfg_mmio_range(&mem).start,
-                PCIE_VCFG_MMIO_SIZE,
+                pcie_vcfg_range.start,
+                pcie_vcfg_range.len().unwrap(),
             )
             .unwrap();
 
@@ -700,7 +699,7 @@ impl arch::LinuxArch for X8664arch {
         let mut resume_notify_devices = Vec::new();
 
         // each bus occupy 1MB mmio for pcie enhanced configuration
-        let max_bus = ((read_pcie_cfg_mmio().len().unwrap() / 0x100000) - 1) as u8;
+        let max_bus = (pcie_cfg_mmio_len / 0x100000 - 1) as u8;
         let (acpi_dev_resource, bat_control) = Self::setup_acpi_devices(
             &mem,
             &io_bus,
@@ -756,7 +755,7 @@ impl arch::LinuxArch for X8664arch {
             host_cpus,
             vcpu_ids,
             &pci_irqs,
-            read_pcie_cfg_mmio().start,
+            pcie_cfg_mmio_range.start,
             max_bus,
             components.force_s2idle,
         )
@@ -853,7 +852,7 @@ impl arch::LinuxArch for X8664arch {
             gdb: components.gdb,
             pm: Some(acpi_dev_resource.pm),
             root_config: pci,
-            hotplug_bus: Vec::new(),
+            hotplug_bus: BTreeMap::new(),
         })
     }
 
@@ -1464,18 +1463,19 @@ impl X8664arch {
         Ok(())
     }
 
-    fn get_pcie_vcfg_mmio_range(mem: &GuestMemory) -> AddressRange {
+    fn get_pcie_vcfg_mmio_range(mem: &GuestMemory, pcie_cfg_mmio: &AddressRange) -> AddressRange {
         // Put PCIe VCFG region at a 2MB boundary after physical memory or 4gb, whichever is greater.
         let ram_end_round_2mb = (mem.end_addr().offset() + 2 * MB - 1) / (2 * MB) * (2 * MB);
         let start = std::cmp::max(ram_end_round_2mb, 4 * GB);
-        let end = start + PCIE_VCFG_MMIO_SIZE - 1;
+        // Each pci device's ECAM size is 4kb and its vcfg size is 8kb
+        let end = start + pcie_cfg_mmio.len().unwrap() * 2 - 1;
         AddressRange { start, end }
     }
 
     /// Returns the high mmio range
     fn get_high_mmio_range<V: Vm>(vm: &V) -> AddressRange {
         let mem = vm.get_memory();
-        let start = Self::get_pcie_vcfg_mmio_range(mem).end + 1;
+        let start = Self::get_pcie_vcfg_mmio_range(mem, &read_pcie_cfg_mmio()).end + 1;
 
         let phys_mem_end = (1u64 << vm.get_guest_phys_addr_bits()) - 1;
         let high_mmio_end = std::cmp::min(phys_mem_end, HIGH_MMIO_MAX_END);
@@ -1619,7 +1619,10 @@ impl X8664arch {
             None => 0x600,
         };
 
-        let pcie_vcfg = aml::Name::new("VCFG".into(), &Self::get_pcie_vcfg_mmio_range(mem).start);
+        let pcie_vcfg = aml::Name::new(
+            "VCFG".into(),
+            &Self::get_pcie_vcfg_mmio_range(mem, &read_pcie_cfg_mmio()).start,
+        );
         pcie_vcfg.to_aml_bytes(&mut amls);
 
         #[cfg(feature = "direct")]
