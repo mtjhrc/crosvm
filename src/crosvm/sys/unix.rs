@@ -1389,7 +1389,12 @@ where
             (
                 None,
                 Some(Tube::new_from_unix_seqpacket(
-                    UnixSeqpacket::connect(path).context("failed to create balloon control")?,
+                    UnixSeqpacket::connect(path).with_context(|| {
+                        format!(
+                            "failed to connect to balloon control socket {}",
+                            path.display(),
+                        )
+                    })?,
                 )),
             )
         } else {
@@ -2274,7 +2279,12 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         None => None,
         Some(cgroup_path) => {
             // Move main process to cgroup_path
-            let mut f = File::create(&cgroup_path.join("tasks"))?;
+            let mut f = File::create(&cgroup_path.join("tasks")).with_context(|| {
+                format!(
+                    "failed to create vcpu-cgroup-path {}",
+                    cgroup_path.display(),
+                )
+            })?;
             f.write_all(process::id().to_string().as_bytes())?;
             Some(f)
         }
