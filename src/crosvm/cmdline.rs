@@ -1,4 +1,4 @@
-// Copyright 2022 The Chromium OS Authors. All rights reserved.
+// Copyright 2022 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -570,7 +570,7 @@ pub struct RunCommand {
         option,
         short = 'd',
         long = "disk",
-        arg_name = "PATH[,key=value[,key=value[,...]]",
+        arg_name = "PATH[,key=value[,key=value[,...]]]",
         from_str_fn(numbered_disk_option)
     )]
     /// path to a disk image followed by optional comma-separated
@@ -753,6 +753,10 @@ pub struct RunCommand {
     )]
     /// MMIO address ranges
     pub mmio_address_ranges: Option<Vec<AddressRange>>,
+    #[cfg(target_arch = "aarch64")]
+    #[argh(switch)]
+    /// enable the Memory Tagging Extension in the guest
+    pub mte: bool,
     #[cfg(unix)]
     #[argh(option, arg_name = "N")]
     /// virtio net virtual queue pairs. (default: 1)
@@ -893,7 +897,7 @@ pub struct RunCommand {
     pub pvclock: bool,
     #[argh(
         option,
-        arg_name = "PATH[,key=value[,key=value[,...]]",
+        arg_name = "PATH[,key=value[,key=value[,...]]]",
         short = 'r',
         from_str_fn(numbered_disk_option)
     )]
@@ -917,7 +921,7 @@ pub struct RunCommand {
     #[argh(
         option,
         long = "rwdisk",
-        arg_name = "PATH[,key=value[,key=value[,...]]",
+        arg_name = "PATH[,key=value[,key=value[,...]]]",
         from_str_fn(numbered_disk_option)
     )]
     /// path to a read-write disk image followed by optional
@@ -933,7 +937,7 @@ pub struct RunCommand {
     rwdisks: Vec<(usize, DiskOption)>,
     #[argh(
         option,
-        arg_name = "PATH[,key=value[,key=value[,...]]",
+        arg_name = "PATH[,key=value[,key=value[,...]]]",
         from_str_fn(numbered_disk_option)
     )]
     /// path to a read-write root disk image followed by optional
@@ -1351,6 +1355,13 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         #[cfg(target_arch = "aarch64")]
         {
+            if cmd.mte && !(cmd.pmem_devices.is_empty() && cmd.rw_pmem_devices.is_empty()) {
+                return Err(
+                    "--mte cannot be specified together with --pmem-device or --rw-pmem-device"
+                        .to_string(),
+                );
+            }
+            cfg.mte = cmd.mte;
             cfg.swiotlb = cmd.swiotlb;
         }
 
