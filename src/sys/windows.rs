@@ -57,7 +57,6 @@ use base::warn;
 use base::BlockingMode;
 use base::Event;
 use base::EventToken;
-use base::ExternalMapping;
 #[cfg(feature = "gpu")]
 use base::FramingMode;
 use base::FromRawDescriptor;
@@ -292,34 +291,40 @@ fn create_gpu_device(
     gpu_device_tube: Tube,
     resource_bridges: Vec<Tube>,
     event_devices: Vec<EventDevice>,
-    map_request: Arc<Mutex<Option<ExternalMapping>>>,
     #[cfg(feature = "kiwi")] gpu_device_service_tube: Tube,
 ) -> DeviceResult {
     let gpu_parameters = cfg
         .gpu_parameters
         .as_ref()
         .expect("No GPU parameters provided in config!");
-    let display_backends = vec![virtio::DisplayBackend::WinAPI(
-        (&gpu_parameters.display_params).into(),
+    let display_backends = vec![virtio::DisplayBackend::WinApi(
+        (&gpu_parameters.display_params[0]).into(),
     )];
+    let wndproc_thread = virtio::gpu::start_wndproc_thread(
+        #[cfg(feature = "kiwi")]
+        gpu_parameters.display_params[0]
+            .gpu_main_display_tube
+            .clone(),
+        #[cfg(not(feature = "kiwi"))]
+        None,
+    )
+    .expect("Failed to start wndproc_thread!");
 
     let features = virtio::base_features(cfg.protection_type);
     let dev = virtio::Gpu::new(
         vm_evt_wrtube
             .try_clone()
             .exit_context(Exit::CloneTube, "failed to clone tube")?,
-        Some(gpu_device_tube),
-        NonZeroU8::new(1).unwrap(), // number of scanouts
         resource_bridges,
         display_backends,
         gpu_parameters,
         event_devices,
-        map_request,
         /* external_blob= */ false,
         features,
         BTreeMap::new(),
         #[cfg(feature = "kiwi")]
         Some(gpu_device_service_tube),
+        wndproc_thread,
     );
 
     Ok(VirtioDeviceStub {
@@ -473,7 +478,6 @@ fn create_virtio_devices(
     _dynamic_mapping_device_tube: Option<Tube>,
     _inflate_tube: Option<Tube>,
     _init_balloon_size: u64,
-    map_request: Arc<Mutex<Option<ExternalMapping>>>,
     #[cfg(feature = "kiwi")] gpu_device_service_tube: Tube,
     tsc_frequency: u64,
 ) -> DeviceResult<Vec<VirtioDeviceStub>> {
@@ -591,7 +595,6 @@ fn create_virtio_devices(
             gpu_device_tube,
             resource_bridges,
             event_devices,
-            map_request,
             #[cfg(feature = "kiwi")]
             gpu_device_service_tube,
         )?);
@@ -613,7 +616,6 @@ fn create_devices(
     dynamic_mapping_device_tube: Option<Tube>,
     inflate_tube: Option<Tube>,
     init_balloon_size: u64,
-    map_request: Arc<Mutex<Option<ExternalMapping>>>,
     #[allow(unused)] ac97_device_tubes: Vec<Tube>,
     #[cfg(feature = "kiwi")] gpu_device_service_tube: Tube,
     tsc_frequency: u64,
@@ -628,7 +630,6 @@ fn create_devices(
         dynamic_mapping_device_tube,
         inflate_tube,
         init_balloon_size,
-        map_request,
         #[cfg(feature = "kiwi")]
         gpu_device_service_tube,
         tsc_frequency,
@@ -760,7 +761,6 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     broker_shutdown_evt: Option<Event>,
     balloon_host_tube: Option<Tube>,
     pvclock_host_tube: Option<Tube>,
-    map_request: Arc<Mutex<Option<ExternalMapping>>>,
     mut gralloc: RutabagaGralloc,
     #[cfg(feature = "stats")] stats: Option<Arc<Mutex<StatisticsCollector>>>,
     #[cfg(feature = "kiwi")] service_pipe_name: Option<String>,
@@ -1000,7 +1000,6 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                         let response = request.execute(
                                             &mut guest_os.vm,
                                             &mut sys_allocator_mutex.lock(),
-                                            Arc::clone(&map_request),
                                             &mut gralloc,
                                             &mut None,
                                         );
@@ -2032,7 +2031,6 @@ where
 
     let gralloc =
         RutabagaGralloc::new().exit_context(Exit::CreateGralloc, "failed to create gralloc")?;
-    let map_request: Arc<Mutex<Option<ExternalMapping>>> = Arc::new(Mutex::new(None));
 
     let (vm_evt_wrtube, vm_evt_rdtube) =
         Tube::directional_pair().context("failed to create vm event tube")?;
@@ -2105,7 +2103,6 @@ where
         dynamic_mapping_device_tube,
         /* inflate_tube= */ None,
         init_balloon_size,
-        Arc::clone(&map_request),
         ac97_host_tubes,
         #[cfg(feature = "kiwi")]
         gpu_device_service_tube,
@@ -2150,7 +2147,6 @@ where
         cfg.broker_shutdown_event.take(),
         balloon_host_tube,
         pvclock_host_tube,
-        Arc::clone(&map_request),
         gralloc,
         #[cfg(feature = "stats")]
         stats,
