@@ -129,6 +129,7 @@ def main(
     interactive: bool = False,
     podman: bool = PODMAN_IS_DEFAULT,
     self_test: bool = False,
+    pull: bool = False,
 ):
     chdir(CROSVM_ROOT)
 
@@ -159,12 +160,19 @@ def main(
     if clean:
         delete_container(docker)
 
+    if pull:
+        docker("pull", f"gcr.io/crosvm-infra/crosvm_dev:{IMAGE_VERSION}").fg()
+        return
+
     # If a command is provided run non-interactive unless explicitly asked for.
     tty_args = []
     if not command or interactive:
         if not sys.stdin.isatty():
             raise Exception("Trying to run an interactive session in a non-interactive terminal.")
         tty_args = ["--interactive", "--tty"]
+    elif sys.stdin.isatty():
+        # Even if run non-interactively, we do want to pass along a tty for proper output.
+        tty_args = ["--tty"]
 
     # Start an interactive shell by default
     if hermetic:
