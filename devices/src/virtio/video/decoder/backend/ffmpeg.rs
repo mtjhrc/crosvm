@@ -287,7 +287,7 @@ impl FfmpegDecoderSession {
         };
 
         match self.context.try_receive_frame(&mut avframe) {
-            Ok(TryReceiveFrameResult::Received) => {
+            Ok(TryReceiveResult::Received) => {
                 // Now check whether the resolution of the stream has changed.
                 let new_visible_res = (avframe.width as usize, avframe.height as usize);
                 if new_visible_res != self.current_visible_res {
@@ -298,12 +298,12 @@ impl FfmpegDecoderSession {
 
                 Ok(true)
             }
-            Ok(TryReceiveFrameResult::TryAgain) => {
+            Ok(TryReceiveResult::TryAgain) => {
                 if self.is_flushing {
                     // Start flushing. `try_receive_frame` will return `FlushCompleted` when the
                     // flush is completed. `TryAgain` will not be returned again until the flush is
                     // completed.
-                    match self.context.flush() {
+                    match self.context.flush_decoder() {
                         // Call ourselves again so we can process the flush.
                         Ok(()) => self.try_receive_frame(),
                         Err(err) => {
@@ -319,7 +319,7 @@ impl FfmpegDecoderSession {
                     Ok(false)
                 }
             }
-            Ok(TryReceiveFrameResult::FlushCompleted) => {
+            Ok(TryReceiveResult::FlushCompleted) => {
                 self.is_flushing = false;
                 self.queue_event(DecoderEvent::FlushCompleted(Ok(())))?;
                 self.context.reset();
