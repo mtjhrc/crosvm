@@ -259,6 +259,14 @@ pub fn calculate_context_mask(context_names: Vec<String>) -> u64 {
     context_mask
 }
 
+pub fn calculate_context_types(context_mask: u64) -> Vec<String> {
+    RUTABAGA_CAPSETS
+        .iter()
+        .filter(|capset| context_mask & (1 << capset.capset_id) != 0)
+        .map(|capset| capset.name.to_string())
+        .collect()
+}
+
 /// The global libary handle used to query capability sets, create resources and contexts.
 ///
 /// Currently, Rutabaga only supports one default component.  Many components running at the
@@ -862,7 +870,7 @@ impl RutabagaBuilder {
     pub fn build(
         mut self,
         fence_handler: RutabagaFenceHandler,
-        render_server_fd: Option<SafeDescriptor>,
+        #[cfg(feature = "virgl_renderer_next")] render_server_fd: Option<SafeDescriptor>,
     ) -> RutabagaResult<Rutabaga> {
         let mut rutabaga_components: Map<RutabagaComponentType, Box<dyn RutabagaComponent>> =
             Default::default();
@@ -922,13 +930,6 @@ impl RutabagaBuilder {
         if self.default_component == RutabagaComponentType::Gfxstream {
             return Err(RutabagaError::InvalidRutabagaBuild(
                 "gfxstream feature not enabled",
-            ));
-        }
-
-        #[cfg(not(feature = "virgl_renderer_next"))]
-        if render_server_fd.is_some() {
-            return Err(RutabagaError::InvalidRutabagaBuild(
-                "render server FD is not supported with virgl_renderer_next feature",
             ));
         }
 
