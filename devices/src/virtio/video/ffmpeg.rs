@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 use std::error::Error;
+use std::fmt::{Display, Formatter};
 
 use thiserror::Error as ThisError;
 
@@ -126,10 +127,22 @@ impl TryAsAvFrameExt for GuestResource {
     }
 }
 
-/// The error returned by `AvPixelFormat::try_from` when there's no applicable format.
+/// The error returned when converting between `AvPixelFormat` and `Format` and there's no
+/// applicable format.
 // The empty field prevents constructing this and allows extending it in the future.
 #[derive(Debug)]
 pub struct TryFromFormatError(());
+
+impl Display for TryFromFormatError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "No matching format to convert between AvPixelFormat and Format"
+        )
+    }
+}
+
+impl Error for TryFromFormatError {}
 
 impl TryFrom<Format> for AvPixelFormat {
     type Error = TryFromFormatError;
@@ -145,5 +158,20 @@ impl TryFrom<Format> for AvPixelFormat {
             // The error case should never happen as long as we use valid constant values, but
             // don't panic in case something goes wrong. 
             TryFromFormatError(()))
+    }
+}
+
+impl TryFrom<AvPixelFormat> for Format {
+    type Error = TryFromFormatError;
+
+    fn try_from(fmt: AvPixelFormat) -> Result<Self, Self::Error> {
+        // https://github.com/rust-lang/rust/issues/39371 Lint wrongly warns the consumer
+        #![allow(non_upper_case_globals)]
+        use ffmpeg::*;
+        Ok(match fmt.pix_fmt() {
+            AVPixelFormat_AV_PIX_FMT_NV12 => Format::NV12,
+            AVPixelFormat_AV_PIX_FMT_YUV420P => Format::YUV420,
+            _ => return Err(TryFromFormatError(())),
+        })
     }
 }
