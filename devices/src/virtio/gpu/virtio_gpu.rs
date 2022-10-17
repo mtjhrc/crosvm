@@ -290,7 +290,6 @@ pub struct VirtioGpu {
     rutabaga: Rutabaga,
     resources: Map<u32, VirtioGpuResource>,
     external_blob: bool,
-    refresh_rate: u32,
     udmabuf_driver: Option<UdmabufDriver>,
     #[cfg(feature = "kiwi")]
     gpu_device_service_tube: Tube,
@@ -373,7 +372,6 @@ impl VirtioGpu {
             rutabaga,
             resources: Default::default(),
             external_blob,
-            refresh_rate: display_params[0].refresh_rate,
             udmabuf_driver,
             #[cfg(feature = "kiwi")]
             gpu_device_service_tube,
@@ -898,18 +896,18 @@ impl VirtioGpu {
         Ok(OkNoData)
     }
 
-    /// Gets the EDID for the specified scanout ID.
+    /// Gets the EDID for the specified scanout ID. If that scanout is not enabled, it would return
+    /// the EDID of a default display.
     pub fn get_edid(&self, scanout_id: u32) -> VirtioGpuResult {
-        let scanout = self
-            .scanouts
-            .get(&scanout_id)
-            .ok_or(ErrEdid(format!("Invalid scanout id: {}", scanout_id)))?;
-
-        EdidBytes::new(&DisplayInfo::new(
-            scanout.width,
-            scanout.height,
-            self.refresh_rate,
-        ))
+        let display_info = match self.scanouts.get(&scanout_id) {
+            Some(scanout) => {
+                // Primary scanouts should always have display params.
+                let params = scanout.display_params.as_ref().unwrap();
+                DisplayInfo::new(params)
+            }
+            None => DisplayInfo::new(&Default::default()),
+        };
+        EdidBytes::new(&display_info)
     }
 
     /// Creates a rutabaga context.
