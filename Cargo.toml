@@ -104,6 +104,7 @@ exclude = [
     "common/io_uring",
     "common/p9",
     "common/sync",
+    "sandbox",
     "tube_transporter",
     "win_util",
     "tools/examples/baremetal",
@@ -114,6 +115,8 @@ exclude = [
 all-linux = [
     # TODO(b/203105868): Enable remaining features on linux builds.
     "arc_quota",
+    "chromeos",
+    "panic-memfd",
     "audio_cras",
     "composite-disk",
     "crash-report",
@@ -162,7 +165,7 @@ linux-armhf = [
     "gdb",
     "tpm",
     ]
-linux-x86_64 = ["all-linux", "plugin"]
+linux-x86_64 = ["all-linux", "plugin", "scudo"]
 linux-aarch64 = ["all-linux"]
 panic-memfd = []
 plugin = ["protos/plugin", "crosvm_plugin", "kvm", "kvm_sys", "protobuf"]
@@ -249,6 +252,7 @@ ctrlc = "*"
 futures = "0.3"
 gpu_display = { path = "gpu_display", optional = true }
 rand = "0.8"
+sandbox = { path = "sandbox" }
 tracing = { path = "tracing" }
 tube_transporter = { path = "tube_transporter" }
 winapi = "*"
