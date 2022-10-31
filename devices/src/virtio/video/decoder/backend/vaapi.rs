@@ -95,7 +95,7 @@ impl TryFrom<libva::VAProfile::Type> for Profile {
             libva::VAProfile::VAProfileH264MultiviewHigh => Ok(Self::H264MultiviewHigh),
             libva::VAProfile::VAProfileHEVCMain => Ok(Self::HevcMain),
             libva::VAProfile::VAProfileHEVCMain10 => Ok(Self::HevcMain10),
-            // (VP8Version0_3, VP8Profile0),
+            libva::VAProfile::VAProfileVP8Version0_3 => Ok(Self::VP8Profile0),
             libva::VAProfile::VAProfileVP9Profile0 => Ok(Self::VP9Profile0),
             libva::VAProfile::VAProfileVP9Profile1 => Ok(Self::VP9Profile1),
             libva::VAProfile::VAProfileVP9Profile2 => Ok(Self::VP9Profile2),
@@ -409,6 +409,8 @@ pub struct VaapiDecoderSession {
     event_queue: EventQueue<DecoderEvent>,
     /// Whether the decoder is currently flushing.
     flushing: bool,
+    /// The last value for "display_order" we have managed to output.
+    last_display_order: u64,
 }
 
 /// A convenience type implementing persistent slice access for BufferHandles.
@@ -532,12 +534,79 @@ impl VaapiDecoderSession {
     }
 
     fn drain_ready_queue(&mut self) -> Result<()> {
-        while let Some(decoded_frame) = self.ready_queue.pop_front() {
+        // Do not do anything if we haven't been given buffers yet.
+        if !matches!(self.output_queue_state, OutputQueueState::Decoding { .. }) {
+            return Ok(());
+        }
+
+        while let Some(mut decoded_frame) = self.ready_queue.pop_front() {
+            let display_order = decoded_frame.display_order().expect(
+                "A frame should have its display order set before being returned from the decoder.",
+            );
+
+            // We are receiving frames as-is from the decoder, which means there
+            // may be gaps if the decoder returns frames out of order.
+            // We simply wait in this case, as the decoder will eventually
+            // produce more frames that makes the gap not exist anymore.
+            //
+            // On the other hand, we take care to not stall. We compromise by
+            // emitting frames out of order instead. This should not really
+            // happen in production and a warn is left so we can think about
+            // bumping the number of resources allocated by the backends.
+            let gap = display_order != 0 && display_order != self.last_display_order + 1;
+
+            let stall = if let Some(left) = self.codec.num_resources_left() {
+                left == 0
+            } else {
+                false
+            };
+
+            if gap && !stall {
+                self.ready_queue.push_front(decoded_frame);
+                break;
+            } else if gap && stall {
+                self.ready_queue.push_front(decoded_frame);
+
+                // Try polling the decoder for all pending jobs.
+                let handles = self.codec.poll(true)?;
+                self.ready_queue.extend(handles);
+
+                self.ready_queue
+                    .make_contiguous()
+                    .sort_by_key(|h| h.display_order());
+
+                decoded_frame = self.ready_queue.pop_front().unwrap();
+
+                // See whether we *still* have a gap
+                let display_order = decoded_frame.display_order().expect(
+                "A frame should have its display order set before being returned from the decoder."
+                );
+
+                let gap = display_order != 0 && display_order != self.last_display_order + 1;
+
+                if gap {
+                    // If the stall is not due to a missing frame, then this may
+                    // signal that we are not allocating enough resources.
+                    base::warn!("Outputting out of order to avoid stalling.");
+                    base::warn!(
+                        "Expected {}, got {}",
+                        self.last_display_order + 1,
+                        display_order
+                    );
+                    base::warn!("Either a dropped frame, or not enough resources for the codec.");
+                    base::warn!(
+                        "Increasing the number of allocated resources can possibly fix this."
+                    );
+                }
+            }
+
             let outputted = self.output_picture(decoded_frame.as_ref())?;
             if !outputted {
                 self.ready_queue.push_front(decoded_frame);
                 break;
             }
+
+            self.last_display_order = display_order;
         }
 
         Ok(())
@@ -612,6 +681,10 @@ impl VaapiDecoderSession {
                 for decoded_frame in frames {
                     self.ready_queue.push_back(decoded_frame);
                 }
+
+                self.ready_queue
+                    .make_contiguous()
+                    .sort_by_key(|h| h.display_order());
 
                 self.drain_ready_queue()
                     .map_err(VideoError::BackendFailure)?;
@@ -727,9 +800,47 @@ impl DecoderSession for VaapiDecoderSession {
 
                 Ok(())
             }
-            _ => Err(VideoError::BackendFailure(anyhow!(
-                "Invalid state while calling set_output_parameters"
-            ))),
+            OutputQueueState::Decoding { .. } => {
+                // Covers the slightly awkward ffmpeg v4l2 stateful
+                // implementation for the capture queue setup.
+                //
+                // ffmpeg will queue a single OUTPUT buffer and immediately
+                // follow up with a VIDIOC_G_FMT call on the CAPTURE queue.
+                // This leads to a race condition, because it takes some
+                // appreciable time for the real resolution to propagate back to
+                // the guest as the virtio machinery processes and delivers the
+                // event.
+                //
+                // In the event that VIDIOC_G_FMT(capture) returns the default
+                // format, ffmpeg allocates buffers of the default resolution
+                // (640x480) only to immediately reallocate as soon as it
+                // processes the SRC_CH v4l2 event. Otherwise (if the resolution
+                // has propagated in time), this path will not be taken during
+                // the initialization.
+                //
+                // This leads to the following workflow in the virtio video
+                // worker:
+                // RESOURCE_QUEUE -> QUEUE_CLEAR -> RESOURCE_QUEUE
+                //
+                // Failing to accept this (as we previously did), leaves us
+                // with bad state and completely breaks the decoding process. We
+                // should replace the queue even if this is not 100% according
+                // to spec.
+                //
+                // On the other hand, this branch still exists to highlight the
+                // fact that we should assert that we have emitted a buffer with
+                // the LAST flag when support for buffer flags is implemented in
+                // a future CL. If a buffer with the LAST flag hasn't been
+                // emitted, it's technically a mistake to be here because we
+                // still have buffers of the old resolution to deliver.
+                *output_queue_state = OutputQueueState::Decoding {
+                    output_queue: OutputQueue::new(buffer_count),
+                };
+
+                // TODO: check whether we have emitted a buffer with the LAST
+                // flag before returning.
+                Ok(())
+            }
         }
     }
 
@@ -760,6 +871,10 @@ impl DecoderSession for VaapiDecoderSession {
 
         self.try_make_progress()?;
 
+        if self.submit_queue.len() != 0 {
+            return Ok(());
+        }
+
         // Retrieve ready frames from the codec, if any.
         let pics = self
             .codec
@@ -767,6 +882,9 @@ impl DecoderSession for VaapiDecoderSession {
             .map_err(|e| VideoError::BackendFailure(anyhow!(e)))?;
 
         self.ready_queue.extend(pics);
+        self.ready_queue
+            .make_contiguous()
+            .sort_by_key(|h| h.display_order());
 
         self.drain_ready_queue()
             .map_err(VideoError::BackendFailure)?;
@@ -947,6 +1065,7 @@ impl DecoderBackend for VaapiDecoder {
             submit_queue: Default::default(),
             event_queue: EventQueue::new().map_err(|e| VideoError::BackendFailure(anyhow!(e)))?,
             flushing: Default::default(),
+            last_display_order: Default::default(),
         })
     }
 }
