@@ -21,6 +21,9 @@ cfg_if::cfg_if! {
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use arch::MsrConfig;
@@ -35,6 +38,7 @@ use devices::virtio::device_constants::video::VideoDeviceConfig;
 #[cfg(feature = "audio")]
 use devices::virtio::snd::parameters::Parameters as SndParameters;
 use devices::virtio::vhost::user::device;
+use devices::virtio::GpuParameters;
 use devices::virtio::NetParameters;
 #[cfg(feature = "audio")]
 use devices::Ac97Parameters;
@@ -44,16 +48,18 @@ use devices::SerialParameters;
 use devices::StubPciParameters;
 use hypervisor::ProtectionType;
 use resources::AddressRange;
+use serde::Deserialize;
+use serde_keyvalue::FromKeyValues;
 #[cfg(feature = "gpu")]
 use vm_control::gpu::DisplayParameters as GpuDisplayParameters;
 
 #[cfg(feature = "gpu")]
-use super::sys::config::parse_gpu_options;
+use super::sys::config::fixup_gpu_options;
 #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
 use super::sys::config::parse_gpu_render_server_options;
 #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
 use super::sys::GpuRenderServerParameters;
-use crate::crosvm::config::numbered_disk_option;
+use crate::crosvm::config::from_key_values;
 #[cfg(feature = "audio")]
 use crate::crosvm::config::parse_ac97_options;
 use crate::crosvm::config::parse_bus_id_addr;
@@ -495,6 +501,57 @@ pub struct UsbListCommand {
     pub socket_path: String,
 }
 
+/// Structure containing the parameters for a single disk as well as a unique counter increasing
+/// each time a new disk parameter is parsed.
+///
+/// This allows the letters assigned to each disk to reflect the order of their declaration, as
+/// we have several options for specifying disks (rwroot, root, etc) and order can thus be lost
+/// when they are aggregated.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields, from = "DiskOption")]
+struct DiskOptionWithId {
+    disk_option: DiskOption,
+    index: usize,
+}
+
+/// FromStr implementation for argh.
+impl FromStr for DiskOptionWithId {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let disk_option: DiskOption = from_key_values(s)?;
+        Ok(Self::from(disk_option))
+    }
+}
+
+/// Assign the next id to `disk_option`.
+impl From<DiskOption> for DiskOptionWithId {
+    fn from(disk_option: DiskOption) -> Self {
+        static DISK_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        Self {
+            disk_option,
+            index: DISK_COUNTER.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+/// Container for GpuParameters that have been fixed after parsing using serde.
+///
+/// This deserializes as a regular `GpuParameters` and applies validation.
+#[cfg(feature = "gpu")]
+#[derive(Debug, Deserialize, FromKeyValues)]
+#[serde(try_from = "GpuParameters")]
+pub struct FixedGpuParameters(pub GpuParameters);
+
+#[cfg(feature = "gpu")]
+impl TryFrom<GpuParameters> for FixedGpuParameters {
+    type Error = String;
+
+    fn try_from(gpu_params: GpuParameters) -> Result<Self, Self::Error> {
+        fixup_gpu_options(gpu_params)
+    }
+}
+
 /// Start a new crosvm instance
 #[remain::sorted]
 #[argh_helpers::pad_description_for_argh]
@@ -521,17 +578,17 @@ pub struct RunCommand {
     ///     socket_type - Set specific socket type for cras backend.
     pub ac97: Vec<Ac97Parameters>,
 
-    #[argh(option, long = "acpi-table", arg_name = "PATH")]
+    #[argh(option, arg_name = "PATH")]
     /// path to user provided ACPI table
-    pub acpi_tables: Vec<PathBuf>,
+    pub acpi_table: Vec<PathBuf>,
 
     #[argh(option)]
     /// path to Android fstab
     pub android_fstab: Option<PathBuf>,
 
-    #[argh(option, arg_name = "N", long = "balloon-bias-mib")]
+    #[argh(option, arg_name = "N")]
     /// amount to bias balance of memory between host and guest as the balloon inflates, in mib.
-    pub balloon_bias: Option<i64>,
+    pub balloon_bias_mib: Option<i64>,
 
     #[argh(option, arg_name = "PATH")]
     /// path for balloon controller socket.
@@ -552,6 +609,27 @@ pub struct RunCommand {
     #[argh(option)]
     /// path to BIOS/firmware ROM
     pub bios: Option<PathBuf>,
+
+    #[argh(option, arg_name = "PATH[,key=value[,key=value[,...]]]")]
+    /// parameters for setting up a block device.
+    /// Valid keys:
+    ///     path=PATH - Path to the disk image. Can be specified
+    ///         without the key as the first argument.
+    ///     ro=BOOL - Whether the block should be read-only.
+    ///         (default: false)
+    ///     root=BOOL - Whether the block device should be mounted
+    ///         as the root filesystem. This will add the required
+    ///         parameters to the kernel command-line. Can only be
+    ///         specified once. (default: false)
+    ///     sparse=BOOL - Indicates whether the disk should support
+    ///         the discard operation. (default: true)
+    ///     block_size=BYTES - Set the reported block size of the
+    ///         disk. (default: 512)
+    ///     id=STRING - Set the block device identifier to an ASCII
+    ///         string, up to 20 characters. (default: no ID)
+    ///     o_direct=BOOL - Use O_DIRECT mode to bypass page cache.
+    ///         (default: false)
+    block: Vec<DiskOptionWithId>,
 
     #[argh(option, arg_name = "CID")]
     /// context ID for virtual sockets.
@@ -574,6 +652,11 @@ pub struct RunCommand {
     ///        older which is less frequently checked generation.
     pub coiommu: Option<devices::CoIommuParameters>,
 
+    #[argh(option, arg_name = "CPUSET", from_str_fn(parse_cpu_affinity))]
+    /// comma-separated list of CPUs or CPU ranges to run VCPUs on (e.g. 0,1-3,5)
+    /// or colon-separated list of assignments of guest to host CPU assignments (e.g. 0=0:1=1:2=2) (default: no mask)
+    pub cpu_affinity: Option<VcpuAffinity>,
+
     #[argh(
         option,
         arg_name = "CPU=CAP[,CPU=CAP[,...]]",
@@ -582,17 +665,16 @@ pub struct RunCommand {
     /// set the relative capacity of the given CPU (default: no capacity)
     pub cpu_capacity: Option<BTreeMap<usize, u32>>, // CPU index -> capacity
 
-    #[argh(
-        option,
-        long = "cpu-cluster",
-        arg_name = "CPUSET",
-        from_str_fn(parse_cpu_set)
-    )]
+    #[argh(option, arg_name = "CPUSET", from_str_fn(parse_cpu_set))]
     /// group the given CPUs into a cluster (default: no clusters)
-    pub cpu_clusters: Vec<Vec<usize>>,
+    pub cpu_cluster: Vec<Vec<usize>>,
+
+    #[argh(option, short = 'c')]
+    /// number of VCPUs. (default: 1)
+    pub cpus: Option<usize>,
 
     #[cfg(feature = "crash-report")]
-    #[argh(option, long = "crash-pipe-name", arg_name = "\\\\.\\pipe\\PIPE_NAME")]
+    #[argh(option, arg_name = "\\\\.\\pipe\\PIPE_NAME")]
     /// the crash handler ipc pipe name.
     pub crash_pipe_name: Option<String>,
 
@@ -606,13 +688,9 @@ pub struct RunCommand {
     pub direct_edge_irq: Vec<u32>,
 
     #[cfg(feature = "direct")]
-    #[argh(
-        option,
-        long = "direct-fixed-event",
-        arg_name = "event=gbllock|powerbtn|sleepbtn|rtc"
-    )]
+    #[argh(option, arg_name = "event=gbllock|powerbtn|sleepbtn|rtc")]
     /// enable ACPI fixed event interrupt and register access passthrough
-    pub direct_fixed_evts: Vec<devices::ACPIPMFixedEvent>,
+    pub direct_fixed_event: Vec<devices::ACPIPMFixedEvent>,
 
     #[cfg(feature = "direct")]
     #[argh(option, arg_name = "gpe")]
@@ -650,13 +728,7 @@ pub struct RunCommand {
     /// disable INTx in virtio devices
     pub disable_virtio_intx: bool,
 
-    #[argh(
-        option,
-        short = 'd',
-        long = "disk",
-        arg_name = "PATH[,key=value[,key=value[,...]]]",
-        from_str_fn(numbered_disk_option)
-    )]
+    #[argh(option, short = 'd', arg_name = "PATH[,key=value[,key=value[,...]]]")]
     /// path to a disk image followed by optional comma-separated
     /// options.
     /// Valid keys:
@@ -667,7 +739,7 @@ pub struct RunCommand {
     ///    id=STRING - Set the block device identifier to an ASCII
     ///        string, up to 20 characters (default: no ID)
     ///    o_direct=BOOL - Use O_DIRECT mode to bypass page cache"
-    pub disks: Vec<(usize, DiskOption)>,
+    disk: Vec<DiskOptionWithId>,
 
     #[argh(switch)]
     /// capture keyboard input from the display window
@@ -677,9 +749,9 @@ pub struct RunCommand {
     /// capture keyboard input from the display window
     pub display_window_mouse: bool,
 
-    #[argh(option, long = "dmi", arg_name = "DIR")]
+    #[argh(option, arg_name = "DIR")]
     /// directory with smbios_entry_point/DMI files
-    pub dmi_path: Option<PathBuf>,
+    pub dmi: Option<PathBuf>,
 
     #[argh(switch)]
     /// expose HWP feature to the guest
@@ -689,18 +761,21 @@ pub struct RunCommand {
     /// expose Power and Perfomance (PnP) data to guest and guest can show these PnP data
     pub enable_pnp_data: bool,
 
+    #[argh(option, arg_name = "PATH")]
+    /// path to an event device node. The device will be grabbed (unusable from the host) and made available to the guest with the same configuration it shows on the host
+    pub evdev: Vec<PathBuf>,
+
     #[argh(positional, arg_name = "KERNEL")]
     /// bzImage of kernel to run
     pub executable_path: Option<PathBuf>,
 
     #[cfg(windows)]
-    #[argh(switch, long = "exit-stats")]
+    #[argh(switch)]
     /// gather and display statistics on Vm Exits and Bus Reads/Writes.
     pub exit_stats: bool,
 
     #[argh(
         option,
-        long = "file-backed-mapping",
         arg_name = "addr=NUM,size=SIZE,path=PATH[,offset=NUM][,rw][,sync]"
     )]
     /// map the given file into guest memory at the specified
@@ -714,7 +789,7 @@ pub struct RunCommand {
     ///     sync - open backing file with O_SYNC
     ///     align - whether to adjust addr and size to page
     ///        boundaries implicitly
-    pub file_backed_mappings: Vec<FileBackedMappingParameters>,
+    pub file_backed_mapping: Vec<FileBackedMappingParameters>,
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[argh(switch)]
@@ -729,23 +804,6 @@ pub struct RunCommand {
 
     #[cfg(feature = "gpu")]
     #[argh(option)]
-    /// (EXPERIMENTAL) Comma separated key=value pairs for setting
-    /// up a display on the virtio-gpu device
-    /// Possible key values:
-    ///     mode=(borderless_full_screen|windowed[width,height]) -
-    ///        Whether to show the window on the host in full
-    ///        screen or windowed mode. If not specified, windowed
-    ///        mode is used by default. "windowed" can also be
-    ///        specified explicitly to use a window size different
-    ///        from the default one.
-    ///     hidden[=true|=false] - If the display window is
-    ///        initially hidden (default: false).
-    ///     refresh-rate=INT - Force a specific vsync generation
-    ///        rate in hertz on the guest (default: 60)
-    pub gpu_display: Vec<GpuDisplayParameters>,
-
-    #[cfg(feature = "gpu")]
-    #[argh(option, long = "gpu", from_str_fn(parse_gpu_options))]
     /// (EXPERIMENTAL) Comma separated key=value pairs for setting
     /// up a virtio-gpu device
     /// Possible key values:
@@ -775,7 +833,24 @@ pub struct RunCommand {
     ///     cache-size=SIZE - The maximum size of the shader cache.
     ///     pci-bar-size=SIZE - The size for the PCI BAR in bytes
     ///        (default 8gb).
-    pub gpu_params: Option<devices::virtio::GpuParameters>,
+    pub gpu: Option<FixedGpuParameters>,
+
+    #[cfg(feature = "gpu")]
+    #[argh(option)]
+    /// (EXPERIMENTAL) Comma separated key=value pairs for setting
+    /// up a display on the virtio-gpu device
+    /// Possible key values:
+    ///     mode=(borderless_full_screen|windowed[width,height]) -
+    ///        Whether to show the window on the host in full
+    ///        screen or windowed mode. If not specified, windowed
+    ///        mode is used by default. "windowed" can also be
+    ///        specified explicitly to use a window size different
+    ///        from the default one.
+    ///     hidden[=true|=false] - If the display window is
+    ///        initially hidden (default: false).
+    ///     refresh-rate=INT - Force a specific vsync generation
+    ///        rate in hertz on the guest (default: 60)
+    pub gpu_display: Vec<GpuDisplayParameters>,
 
     #[cfg(all(unix, feature = "gpu", feature = "virgl_renderer_next"))]
     #[argh(option, from_str_fn(parse_gpu_render_server_options))]
@@ -793,7 +868,7 @@ pub struct RunCommand {
     pub host_cpu_topology: bool,
 
     #[cfg(windows)]
-    #[argh(option, long = "host-guid", arg_name = "PATH")]
+    #[argh(option, arg_name = "PATH")]
     /// string representation of the host guid in registry format, for namespacing vsock connections.
     pub host_guid: Option<String>,
 
@@ -810,32 +885,36 @@ pub struct RunCommand {
     #[argh(option)]
     pub hypervisor: Option<HypervisorKind>,
 
-    #[argh(option, long = "init-mem", arg_name = "N")]
+    #[argh(option, arg_name = "N")]
     /// amount of guest memory outside the balloon at boot in MiB. (default: --mem)
-    pub init_memory: Option<u64>,
+    pub init_mem: Option<u64>,
 
-    #[argh(option, short = 'i', long = "initrd", arg_name = "PATH")]
+    #[argh(option, short = 'i', arg_name = "PATH")]
     /// initial ramdisk to load
-    pub initrd_path: Option<PathBuf>,
+    pub initrd: Option<PathBuf>,
 
     #[cfg(windows)]
-    #[argh(option, long = "irqchip", arg_name = "kernel|split|userspace")]
+    #[argh(option, arg_name = "kernel|split|userspace")]
     /// type of interrupt controller emulation.  \"split\" is only available for x86 KVM.
-    pub irq_chip: Option<IrqChipKind>,
+    pub irqchip: Option<IrqChipKind>,
 
     #[argh(switch)]
     /// allow to enable ITMT scheduling feature in VM. The success of enabling depends on HWP and ACPI CPPC support on hardware
     pub itmt: bool,
 
     #[cfg(windows)]
-    #[argh(option, long = "kernel-log-file", arg_name = "PATH")]
+    #[argh(option, arg_name = "PATH")]
     /// forward hypervisor kernel driver logs for this VM to a file.
     pub kernel_log_file: Option<String>,
 
+    #[argh(option, arg_name = "PATH")]
+    /// path to a socket from where to read keyboard input events and write status updates to
+    pub keyboard: Vec<PathBuf>,
+
     #[cfg(unix)]
-    #[argh(option, long = "kvm-device", arg_name = "PATH")]
+    #[argh(option, arg_name = "PATH")]
     /// path to the KVM device. (default /dev/kvm)
-    pub kvm_device_path: Option<PathBuf>,
+    pub kvm_device: Option<PathBuf>,
 
     #[cfg(unix)]
     #[argh(switch)]
@@ -843,12 +922,12 @@ pub struct RunCommand {
     pub lock_guest_memory: bool,
 
     #[cfg(windows)]
-    #[argh(option, long = "log-file", arg_name = "PATH")]
+    #[argh(option, arg_name = "PATH")]
     /// redirect logs to the supplied log file at PATH rather than stderr. For multi-process mode, use --logs-directory instead
     pub log_file: Option<String>,
 
     #[cfg(windows)]
-    #[argh(option, long = "logs-directory", arg_name = "PATH")]
+    #[argh(option, arg_name = "PATH")]
     /// path to the logs directory used for crosvm processes. Logs will be sent to stderr if unset, and stderr/stdout will be uncaptured
     pub logs_directory: Option<String>,
 
@@ -857,27 +936,30 @@ pub struct RunCommand {
     /// MAC address for VM
     pub mac_address: Option<net_util::MacAddress>,
 
-    #[argh(option, long = "mem", short = 'm', arg_name = "N")]
+    #[argh(option, short = 'm', arg_name = "N")]
     /// amount of guest memory in MiB. (default: 256)
-    pub memory: Option<u64>,
+    pub mem: Option<u64>,
 
-    #[argh(
-        option,
-        long = "mmio-address-range",
-        from_str_fn(parse_mmio_address_range)
-    )]
+    #[argh(option, from_str_fn(parse_mmio_address_range))]
     /// MMIO address ranges
-    pub mmio_address_ranges: Option<Vec<AddressRange>>,
+    pub mmio_address_range: Option<Vec<AddressRange>>,
+
+    #[argh(option, arg_name = "PATH")]
+    /// path to a socket from where to read mouse input events and write status updates to
+    pub mouse: Vec<PathBuf>,
 
     #[cfg(target_arch = "aarch64")]
     #[argh(switch)]
     /// enable the Memory Tagging Extension in the guest
     pub mte: bool,
 
+    #[argh(option, arg_name = "PATH:WIDTH:HEIGHT")]
+    /// path to a socket from where to read multi touch input events (such as those from a touchscreen) and write status updates to, optionally followed by width and height (defaults to 800x1280)
+    pub multi_touch: Vec<TouchDeviceOption>,
+
     #[cfg(unix)]
     #[argh(
         option,
-        long = "net",
         arg_name = "tap_name=TAP_NAME|tap_fd=TAP_FD|host_ip=IP,netmask=NETMASK,mac=MAC_ADDRESS"
     )]
     /// comma separated key=value pairs for setting
@@ -941,9 +1023,9 @@ pub struct RunCommand {
     pub params: Vec<String>,
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[argh(option, long = "pci-start", arg_name = "pci_low_mmio_start")]
+    #[argh(option, arg_name = "pci_low_mmio_start")]
     /// the pci mmio start address below 4G
-    pub pci_low_start: Option<u64>,
+    pub pci_start: Option<u64>,
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[argh(
@@ -957,12 +1039,11 @@ pub struct RunCommand {
     #[cfg(feature = "direct")]
     #[argh(
         option,
-        long = "pcie-root-port",
         arg_name = "PATH[,hp_gpe=NUM]",
         from_str_fn(parse_pcie_root_port_params)
     )]
     /// path to sysfs of host pcie root port and host pcie root port hotplug gpe number
-    pub pcie_rp: Vec<HostPcieRootPortParameters>,
+    pub pcie_root_port: Vec<HostPcieRootPortParameters>,
 
     #[argh(switch)]
     /// enable per-VM core scheduling intead of the default one (per-vCPU core scheduing) by
@@ -972,14 +1053,13 @@ pub struct RunCommand {
 
     #[argh(
         option,
-        long = "pflash",
         arg_name = "path=PATH,[block_size=SIZE]",
         from_str_fn(parse_pflash_parameters)
     )]
     /// comma-seperated key-value pair for setting up the pflash device, which provides space to store UEFI variables.
     /// block_size defaults to 4K.
     /// [--pflash <path=PATH,[block_size=SIZE]>]
-    pub pflash_parameters: Option<PflashParameters>,
+    pub pflash: Option<PflashParameters>,
 
     #[argh(option, arg_name = "PATH")]
     /// path to empty directory to use for sandbox pivot root
@@ -991,14 +1071,19 @@ pub struct RunCommand {
     pub plugin: Option<PathBuf>,
 
     #[cfg(feature = "plugin")]
+    #[argh(option, arg_name = "GID:GID:INT")]
+    /// supplemental GIDs that should be mapped in plugin jail.  Can be given more than once
+    pub plugin_gid_map: Vec<GidMap>,
+
+    #[cfg(feature = "plugin")]
     #[argh(option)]
     /// path to the file listing supplemental GIDs that should be mapped in plugin jail.  Can be given more than once
     pub plugin_gid_map_file: Option<PathBuf>,
 
     #[cfg(feature = "plugin")]
-    #[argh(option, long = "plugin-gid-map", arg_name = "GID:GID:INT")]
-    /// supplemental GIDs that should be mapped in plugin jail.  Can be given more than once
-    pub plugin_gid_maps: Vec<GidMap>,
+    #[argh(option, arg_name = "PATH:PATH:BOOL")]
+    /// path to be mounted into the plugin's root filesystem.  Can be given more than once
+    pub plugin_mount: Vec<BindMount>,
 
     #[cfg(feature = "plugin")]
     #[argh(option, arg_name = "PATH")]
@@ -1006,45 +1091,40 @@ pub struct RunCommand {
     pub plugin_mount_file: Option<PathBuf>,
 
     #[cfg(feature = "plugin")]
-    #[argh(option, long = "plugin-mount", arg_name = "PATH:PATH:BOOL")]
-    /// path to be mounted into the plugin's root filesystem.  Can be given more than once
-    pub plugin_mounts: Vec<BindMount>,
-
-    #[cfg(feature = "plugin")]
     #[argh(option, arg_name = "PATH")]
     /// absolute path to a directory that will become root filesystem for the plugin process.
     pub plugin_root: Option<PathBuf>,
 
-    #[argh(option, long = "pmem-device", arg_name = "PATH")]
+    #[argh(option, arg_name = "PATH")]
     /// path to a disk image
-    pub pmem_devices: Vec<DiskOption>,
+    pub pmem_device: Vec<DiskOption>,
 
     #[argh(switch)]
     /// grant this Guest VM certain privileges to manage Host resources, such as power management
     pub privileged_vm: bool,
 
     #[cfg(feature = "process-invariants")]
-    #[argh(option, long = "process-invariants-handle", arg_name = "PATH")]
+    #[argh(option, arg_name = "PATH")]
     /// shared read-only memory address for a serialized EmulatorProcessInvariants proto
-    pub process_invariants_data_handle: Option<u64>,
+    pub process_invariants_handle: Option<u64>,
 
     #[cfg(feature = "process-invariants")]
-    #[argh(option, long = "process-invariants-size", arg_name = "PATH")]
+    #[argh(option, arg_name = "PATH")]
     /// size of the serialized EmulatorProcessInvariants proto pointed at by process-invariants-handle
-    pub process_invariants_data_size: Option<usize>,
+    pub process_invariants_size: Option<usize>,
 
     #[cfg(windows)]
-    #[argh(option, long = "product-channel")]
+    #[argh(option)]
     /// product channel
     pub product_channel: Option<String>,
 
     #[cfg(windows)]
-    #[argh(option, long = "product-name")]
+    #[argh(option)]
     /// the product name for file paths.
     pub product_name: Option<String>,
 
     #[cfg(windows)]
-    #[argh(option, long = "product-version")]
+    #[argh(option)]
     /// product version
     pub product_version: Option<String>,
 
@@ -1052,7 +1132,7 @@ pub struct RunCommand {
     /// prevent host access to guest memory
     pub protected_vm: bool,
 
-    #[argh(option, long = "protected-vm-with-firmware", arg_name = "PATH")]
+    #[argh(option, arg_name = "PATH")]
     /// (EXPERIMENTAL/FOR DEBUGGING) Use custom VM firmware to run in protected mode
     pub protected_vm_with_firmware: Option<PathBuf>,
 
@@ -1070,12 +1150,7 @@ pub struct RunCommand {
     /// enable virtio-pvclock.
     pub pvclock: bool,
 
-    #[argh(
-        option,
-        arg_name = "PATH[,key=value[,key=value[,...]]]",
-        short = 'r',
-        from_str_fn(numbered_disk_option)
-    )]
+    #[argh(option, arg_name = "PATH[,key=value[,key=value[,...]]]", short = 'r')]
     /// path to a disk image followed by optional comma-separated
     /// options.
     /// Valid keys:
@@ -1086,22 +1161,17 @@ pub struct RunCommand {
     ///     id=STRING - Set the block device identifier to an ASCII
     ///     string, up to 20 characters (default: no ID)
     ///     o_direct=BOOL - Use O_DIRECT mode to bypass page cache
-    root: Option<(usize, DiskOption)>,
+    root: Option<DiskOptionWithId>,
 
     #[argh(option, arg_name = "CPUSET", from_str_fn(parse_cpu_set))]
     /// comma-separated list of CPUs or CPU ranges to run VCPUs on. (e.g. 0,1-3,5) (default: none)
     pub rt_cpus: Option<Vec<usize>>,
 
-    #[argh(option, long = "rw-pmem-device", arg_name = "PATH")]
+    #[argh(option, arg_name = "PATH")]
     /// path to a writable disk image
-    rw_pmem_devices: Vec<DiskOption>,
+    rw_pmem_device: Vec<DiskOption>,
 
-    #[argh(
-        option,
-        long = "rwdisk",
-        arg_name = "PATH[,key=value[,key=value[,...]]]",
-        from_str_fn(numbered_disk_option)
-    )]
+    #[argh(option, arg_name = "PATH[,key=value[,key=value[,...]]]")]
     /// path to a read-write disk image followed by optional
     /// comma-separated options.
     /// Valid keys:
@@ -1112,13 +1182,9 @@ pub struct RunCommand {
     ///     id=STRING - Set the block device identifier to an ASCII
     ///       string, up to 20 characters (default: no ID)
     ///     o_direct=BOOL - Use O_DIRECT mode to bypass page cache
-    rwdisks: Vec<(usize, DiskOption)>,
+    rwdisk: Vec<DiskOptionWithId>,
 
-    #[argh(
-        option,
-        arg_name = "PATH[,key=value[,key=value[,...]]]",
-        from_str_fn(numbered_disk_option)
-    )]
+    #[argh(option, arg_name = "PATH[,key=value[,key=value[,...]]]")]
     /// path to a read-write root disk image followed by optional
     /// comma-separated options.
     /// Valid keys:
@@ -1129,7 +1195,7 @@ pub struct RunCommand {
     ///     id=STRING - Set the block device identifier to an ASCII
     ///        string, up to 20 characters (default: no ID)
     ///     o_direct=BOOL - Use O_DIRECT mode to bypass page cache
-    rwroot: Option<(usize, DiskOption)>,
+    rwroot: Option<DiskOptionWithId>,
 
     #[argh(switch)]
     /// set Low Power S0 Idle Capable Flag for guest Fixed ACPI
@@ -1149,7 +1215,6 @@ pub struct RunCommand {
 
     #[argh(
         option,
-        long = "serial",
         arg_name = "type=TYPE,[hardware=HW,num=NUM,path=PATH,input=PATH,console,earlycon,stdin]",
         from_str_fn(parse_serial_options)
     )]
@@ -1178,17 +1243,16 @@ pub struct RunCommand {
     ///     stdin - Direct standard input to this serial device.
     ///        Can only be given once. Will default to first serial
     ///        port if not provided.
-    pub serial_parameters: Vec<SerialParameters>,
+    pub serial: Vec<SerialParameters>,
 
     #[cfg(feature = "kiwi")]
-    #[argh(option, long = "service-pipe-name", arg_name = "PIPE_NAME")]
+    #[argh(option, arg_name = "PIPE_NAME")]
     /// the service ipc pipe name. (Prefix \\\\.\\pipe\\ not needed.
     pub service_pipe_name: Option<String>,
 
     #[cfg(unix)]
     #[argh(
         option,
-        long = "shared-dir",
         arg_name = "PATH:TAG[:type=TYPE:writeback=BOOL:timeout=SECONDS:uidmap=UIDMAP:gidmap=GIDMAP:cache=CACHE:dax=BOOL,posix_acl=BOOL]"
     )]
     /// colon-separated options for configuring a directory to be
@@ -1237,16 +1301,20 @@ pub struct RunCommand {
     ///        supports POSIX ACLs.  This should only be enabled
     ///        when the underlying file system supports POSIX ACLs.
     ///        The default value for this option is "true".
-    pub shared_dirs: Vec<SharedDir>,
+    pub shared_dir: Vec<SharedDir>,
+
+    #[argh(option, arg_name = "PATH:WIDTH:HEIGHT")]
+    /// path to a socket from where to read single touch input events (such as those from a touchscreen) and write status updates to, optionally followed by width and height (defaults to 800x1280)
+    pub single_touch: Vec<TouchDeviceOption>,
 
     #[cfg(feature = "slirp-ring-capture")]
-    #[argh(option, long = "slirp-capture-file", arg_name = "PATH")]
+    #[argh(option, arg_name = "PATH")]
     /// Redirects slirp network packets to the supplied log file rather than the current directory as `slirp_capture_packets.pcap`
     pub slirp_capture_file: Option<String>,
 
-    #[argh(option, short = 's', long = "socket", arg_name = "PATH")]
+    #[argh(option, short = 's', arg_name = "PATH")]
     /// path to put the control socket. If PATH is a directory, a name will be generated
-    pub socket_path: Option<PathBuf>,
+    pub socket: Option<PathBuf>,
 
     #[cfg(feature = "tpm")]
     #[argh(switch)]
@@ -1269,7 +1337,6 @@ pub struct RunCommand {
 
     #[argh(
         option,
-        long = "stub-pci-device",
         arg_name = "DOMAIN:BUS:DEVICE.FUNCTION[,vendor=NUM][,device=NUM][,class=NUM][,subsystem_vendor=NUM][,subsystem_device=NUM][,revision=NUM]",
         from_str_fn(parse_stub_pci_parameters)
     )]
@@ -1284,11 +1351,15 @@ pub struct RunCommand {
     ///     subsystem_vendor=NUM - PCI subsystem vendor ID
     ///     subsystem_device=NUM - PCI subsystem device ID
     ///     revision=NUM - revision
-    pub stub_pci_devices: Vec<StubPciParameters>,
+    pub stub_pci_device: Vec<StubPciParameters>,
 
     #[argh(option, arg_name = "N")]
     /// (EXPERIMENTAL) Size of virtio swiotlb buffer in MiB (default: 64 if `--protected-vm` or `--protected-vm-without-firmware` is present)
     pub swiotlb: Option<u64>,
+
+    #[argh(option, arg_name = "PATH")]
+    /// path to a socket from where to read switch input events and write status updates to
+    pub switches: Vec<PathBuf>,
 
     #[argh(option, arg_name = "TAG")]
     /// when logging to syslog, use the provided tag
@@ -1309,8 +1380,12 @@ pub struct RunCommand {
     /// comma-separated names of the task profiles to apply to all threads in crosvm including the vCPU threads
     pub task_profiles: Vec<String>,
 
+    #[argh(option, arg_name = "PATH:WIDTH:HEIGHT")]
+    /// path to a socket from where to read trackpad input events and write status updates to, optionally followed by screen width and height (defaults to 800x1280)
+    pub trackpad: Vec<TouchDeviceOption>,
+
     // Must be `Some` iff `protection_type == ProtectionType::UnprotectedWithFirmware`.
-    #[argh(option, long = "unprotected-vm-with-firmware", arg_name = "PATH")]
+    #[argh(option, arg_name = "PATH")]
     /// (EXPERIMENTAL/FOR DEBUGGING) Use VM firmware, but allow host access to guest memory
     pub unprotected_vm_with_firmware: Option<PathBuf>,
 
@@ -1330,23 +1405,9 @@ pub struct RunCommand {
     ///     filter=(yes|no) - if the msr is filtered in KVM.
     pub userspace_msr: Vec<(u32, MsrConfig)>,
 
-    #[argh(
-        option,
-        long = "cpu-affinity",
-        arg_name = "CPUSET",
-        from_str_fn(parse_cpu_affinity)
-    )]
-    /// comma-separated list of CPUs or CPU ranges to run VCPUs on (e.g. 0,1-3,5)
-    /// or colon-separated list of assignments of guest to host CPU assignments (e.g. 0=0:1=1:2=2) (default: no mask)
-    pub vcpu_affinity: Option<VcpuAffinity>,
-
     #[argh(option, arg_name = "PATH")]
     /// move all vCPU threads to this CGroup (default: nothing moves)
     pub vcpu_cgroup_path: Option<PathBuf>,
-
-    #[argh(option, long = "cpus", short = 'c')]
-    /// number of VCPUs. (default: 1)
-    pub vcpu_count: Option<usize>,
 
     #[cfg(unix)]
     #[argh(
@@ -1379,9 +1440,9 @@ pub struct RunCommand {
     pub vhost_net: bool,
 
     #[cfg(unix)]
-    #[argh(option, long = "vhost-net-device", arg_name = "PATH")]
+    #[argh(option, arg_name = "PATH")]
     /// path to the vhost-net device. (default /dev/vhost-net)
-    pub vhost_net_device_path: Option<PathBuf>,
+    pub vhost_net_device: Option<PathBuf>,
 
     #[argh(option, arg_name = "SOCKET_PATH")]
     /// path to a socket for vhost-user block
@@ -1434,43 +1495,22 @@ pub struct RunCommand {
     pub vhost_vsock_fd: Option<RawDescriptor>,
 
     #[cfg(feature = "video-decoder")]
-    #[argh(option, long = "video-decoder", arg_name = "[backend]")]
+    #[argh(option, arg_name = "[backend]")]
     /// (EXPERIMENTAL) enable virtio-video decoder device
     /// Possible backend values: libvda, ffmpeg, vaapi
-    pub video_dec: Option<VideoDeviceConfig>,
+    pub video_decoder: Option<VideoDeviceConfig>,
 
     #[cfg(feature = "video-encoder")]
-    #[argh(option, long = "video-encoder", arg_name = "[backend]")]
+    #[argh(option, arg_name = "[backend]")]
     /// (EXPERIMENTAL) enable virtio-video encoder device
     /// Possible backend values: libvda
-    pub video_enc: Option<VideoDeviceConfig>,
-
-    #[argh(option, long = "evdev", arg_name = "PATH")]
-    /// path to an event device node. The device will be grabbed (unusable from the host) and made available to the guest with the same configuration it shows on the host
-    pub virtio_input_evdevs: Vec<PathBuf>,
-
-    #[argh(option, long = "keyboard", arg_name = "PATH")]
-    /// path to a socket from where to read keyboard input events and write status updates to
-    pub virtio_keyboard: Vec<PathBuf>,
-
-    #[argh(option, long = "mouse", arg_name = "PATH")]
-    /// path to a socket from where to read mouse input events and write status updates to
-    pub virtio_mice: Vec<PathBuf>,
-
-    #[argh(option, long = "multi-touch", arg_name = "PATH:WIDTH:HEIGHT")]
-    /// path to a socket from where to read multi touch input events (such as those from a touchscreen) and write status updates to, optionally followed by width and height (defaults to 800x1280)
-    pub virtio_multi_touch: Vec<TouchDeviceOption>,
-
-    #[argh(option, long = "single-touch", arg_name = "PATH:WIDTH:HEIGHT")]
-    /// path to a socket from where to read single touch input events (such as those from a touchscreen) and write status updates to, optionally followed by width and height (defaults to 800x1280)
-    pub virtio_single_touch: Vec<TouchDeviceOption>,
+    pub video_encoder: Option<VideoDeviceConfig>,
 
     #[cfg(feature = "audio")]
     #[argh(
         option,
         arg_name = "[capture=true,backend=BACKEND,num_output_devices=1,
-        num_input_devices=1,num_output_streams=1,num_input_streams=1]",
-        long = "virtio-snd"
+        num_input_devices=1,num_output_streams=1,num_input_streams=1]"
     )]
     /// comma separated key=value pairs for setting up virtio snd
     /// devices.
@@ -1490,15 +1530,7 @@ pub struct RunCommand {
     ///         streams per device.
     ///     num_input_streams=INT - Set number of input PCM streams
     ///         per device.
-    pub virtio_snds: Vec<SndParameters>,
-
-    #[argh(option, long = "switches", arg_name = "PATH")]
-    /// path to a socket from where to read switch input events and write status updates to
-    pub virtio_switches: Vec<PathBuf>,
-
-    #[argh(option, long = "trackpad", arg_name = "PATH:WIDTH:HEIGHT")]
-    /// path to a socket from where to read trackpad input events and write status updates to, optionally followed by screen width and height (defaults to 800x1280)
-    pub virtio_trackpad: Vec<TouchDeviceOption>,
+    pub virtio_snd: Vec<SndParameters>,
 
     #[cfg(all(feature = "vtpm", target_arch = "x86_64"))]
     #[argh(switch)]
@@ -1519,14 +1551,9 @@ pub struct RunCommand {
     pub vvu_proxy: Vec<VvuOption>,
 
     #[cfg(unix)]
-    #[argh(
-        option,
-        long = "wayland-sock",
-        arg_name = "PATH[,name=NAME]",
-        from_str_fn(parse_wayland_sock)
-    )]
+    #[argh(option, arg_name = "PATH[,name=NAME]", from_str_fn(parse_wayland_sock))]
     /// path to the Wayland socket to use. The unnamed one is used for displaying virtual screens. Named ones are only for IPC
-    pub wayland_socket_paths: Vec<(String, PathBuf)>,
+    pub wayland_sock: Vec<(String, PathBuf)>,
 
     #[cfg(unix)]
     #[argh(option, arg_name = "DISPLAY")]
@@ -1547,12 +1574,12 @@ impl TryFrom<RunCommand> for super::config::Config {
         }
 
         #[cfg(unix)]
-        if let Some(p) = cmd.kvm_device_path {
+        if let Some(p) = cmd.kvm_device {
             cfg.kvm_device_path = p;
         }
 
         #[cfg(unix)]
-        if let Some(p) = cmd.vhost_net_device_path {
+        if let Some(p) = cmd.vhost_net_device {
             if !p.exists() {
                 return Err(format!("vhost-net-device path {:?} does not exist", p));
             }
@@ -1565,11 +1592,11 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         cfg.per_vm_core_scheduling = cmd.per_vm_core_scheduling;
 
-        cfg.vcpu_count = cmd.vcpu_count;
+        cfg.vcpu_count = cmd.cpus;
 
-        cfg.vcpu_affinity = cmd.vcpu_affinity;
+        cfg.vcpu_affinity = cmd.cpu_affinity;
 
-        cfg.cpu_clusters = cmd.cpu_clusters;
+        cfg.cpu_clusters = cmd.cpu_cluster;
 
         if let Some(capacity) = cmd.cpu_capacity {
             cfg.cpu_capacity = capacity;
@@ -1585,11 +1612,11 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         cfg.delay_rt = cmd.delay_rt;
 
-        cfg.memory = cmd.memory;
+        cfg.memory = cmd.mem;
 
         #[cfg(target_arch = "aarch64")]
         {
-            if cmd.mte && !(cmd.pmem_devices.is_empty() && cmd.rw_pmem_devices.is_empty()) {
+            if cmd.mte && !(cmd.pmem_device.is_empty() && cmd.rw_pmem_device.is_empty()) {
                 return Err(
                     "--mte cannot be specified together with --pmem-device or --rw-pmem-device"
                         .to_string(),
@@ -1615,7 +1642,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         }
         cfg.vhost_user_snd = cmd.vhost_user_snd;
 
-        for serial_params in cmd.serial_parameters {
+        for serial_params in cmd.serial {
             super::sys::config::check_serial_params(&serial_params)?;
 
             let num = serial_params.num;
@@ -1672,49 +1699,62 @@ impl TryFrom<RunCommand> for super::config::Config {
             cfg.serial_parameters.insert(key, serial_params);
         }
 
-        if cmd.root.is_some() && cmd.rwroot.is_some() {
-            return Err("Only one of [root,rwroot] has to be specified".to_string());
+        // Aggregate all the disks with the expected read-only and root values according to the
+        // option they have been passed with.
+        let mut disks = cmd
+            .root
+            .into_iter()
+            .map(|mut d| {
+                d.disk_option.read_only = true;
+                d.disk_option.root = true;
+                d
+            })
+            .chain(cmd.rwroot.into_iter().map(|mut d| {
+                d.disk_option.read_only = false;
+                d.disk_option.root = true;
+                d
+            }))
+            .chain(cmd.disk.into_iter().map(|mut d| {
+                d.disk_option.read_only = true;
+                d.disk_option.root = false;
+                d
+            }))
+            .chain(cmd.rwdisk.into_iter().map(|mut d| {
+                d.disk_option.read_only = false;
+                d.disk_option.root = false;
+                d
+            }))
+            .chain(cmd.block.into_iter())
+            .collect::<Vec<_>>();
+
+        // Sort all our disks by index.
+        disks.sort_by_key(|d| d.index);
+
+        // Check that we don't have more than one root disk.
+        if disks.iter().filter(|d| d.disk_option.root).count() > 1 {
+            return Err("only one root disk can be specified".to_string());
         }
 
-        let root_disk = if let Some((read_only, (index, mut disk_option))) = cmd
-            .root
-            .map(|d| (true, d))
-            .or(cmd.rwroot.map(|d| (false, d)))
-        {
-            if index >= 26 {
+        // If we have a root disk, add the corresponding command-line parameters.
+        if let Some(d) = disks.iter().find(|d| d.disk_option.root) {
+            if d.index >= 26 {
                 return Err("ran out of letters for to assign to root disk".to_string());
             }
-            disk_option.read_only = read_only;
-
             cfg.params.push(format!(
                 "root=/dev/vd{} {}",
-                char::from(b'a' + index as u8),
-                if read_only { "ro" } else { "rw" }
+                char::from(b'a' + d.index as u8),
+                if d.disk_option.read_only { "ro" } else { "rw" }
             ));
-            Some((index, disk_option))
-        } else {
-            None
-        };
+        }
 
-        let mut disks = root_disk
-            .into_iter()
-            .chain(cmd.disks.into_iter().map(|(i, mut d)| {
-                d.read_only = true;
-                (i, d)
-            }))
-            .chain(cmd.rwdisks.into_iter().map(|(i, mut d)| {
-                d.read_only = false;
-                (i, d)
-            }))
-            .collect::<Vec<_>>();
-        disks.sort_by_key(|(i, _)| *i);
-        cfg.disks = disks.into_iter().map(|(_, d)| d).collect();
+        // Pass the sorted disks to the VM config.
+        cfg.disks = disks.into_iter().map(|d| d.disk_option).collect();
 
         for (mut pmem, read_only) in cmd
-            .pmem_devices
+            .pmem_device
             .into_iter()
             .map(|p| (p, true))
-            .chain(cmd.rw_pmem_devices.into_iter().map(|p| (p, false)))
+            .chain(cmd.rw_pmem_device.into_iter().map(|p| (p, false)))
         {
             pmem.read_only = read_only;
             cfg.pmem_devices.push(pmem);
@@ -1729,15 +1769,15 @@ impl TryFrom<RunCommand> for super::config::Config {
             cfg.product_name = cmd.product_name;
             cfg.exit_stats = cmd.exit_stats;
             cfg.host_guid = cmd.host_guid;
-            cfg.irq_chip = cmd.irq_chip;
+            cfg.irq_chip = cmd.irqchip;
             cfg.kernel_log_file = cmd.kernel_log_file;
             cfg.log_file = cmd.log_file;
             cfg.logs_directory = cmd.logs_directory;
             #[cfg(feature = "process-invariants")]
             {
-                cfg.process_invariants_data_handle = cmd.process_invariants_data_handle;
+                cfg.process_invariants_data_handle = cmd.process_invariants_handle;
 
-                cfg.process_invariants_data_size = cmd.process_invariants_data_size;
+                cfg.process_invariants_data_size = cmd.process_invariants_size;
             }
             cfg.pvclock = cmd.pvclock;
             #[cfg(feature = "kiwi")]
@@ -1755,7 +1795,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         cfg.pstore = cmd.pstore;
 
         #[cfg(unix)]
-        for (name, params) in cmd.wayland_socket_paths {
+        for (name, params) in cmd.wayland_sock {
             if cfg.wayland_socket_paths.contains_key(&name) {
                 return Err(format!("wayland socket name already used: '{}'", name));
             }
@@ -1770,7 +1810,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         cfg.display_window_keyboard = cmd.display_window_keyboard;
         cfg.display_window_mouse = cmd.display_window_mouse;
 
-        if let Some(mut socket_path) = cmd.socket_path {
+        if let Some(mut socket_path) = cmd.socket {
             if socket_path.is_dir() {
                 socket_path.push(format!("crosvm-{}.sock", getpid()));
             }
@@ -1797,7 +1837,7 @@ impl TryFrom<RunCommand> for super::config::Config {
                 cfg.executable_path = Some(Executable::Plugin(p));
             }
             cfg.plugin_root = cmd.plugin_root;
-            cfg.plugin_mounts = cmd.plugin_mounts;
+            cfg.plugin_mounts = cmd.plugin_mount;
 
             if let Some(path) = cmd.plugin_mount_file {
                 let file = File::open(path)
@@ -1813,7 +1853,7 @@ impl TryFrom<RunCommand> for super::config::Config {
                 }
             }
 
-            cfg.plugin_gid_maps = cmd.plugin_gid_maps;
+            cfg.plugin_gid_maps = cmd.plugin_gid_map;
 
             if let Some(path) = cmd.plugin_gid_map_file {
                 let file = File::open(path)
@@ -1842,20 +1882,20 @@ impl TryFrom<RunCommand> for super::config::Config {
             cfg.vtpm_proxy = cmd.vtpm_proxy;
         }
 
-        cfg.virtio_single_touch = cmd.virtio_single_touch;
-        cfg.virtio_multi_touch = cmd.virtio_multi_touch;
-        cfg.virtio_trackpad = cmd.virtio_trackpad;
-        cfg.virtio_mice = cmd.virtio_mice;
-        cfg.virtio_keyboard = cmd.virtio_keyboard;
-        cfg.virtio_switches = cmd.virtio_switches;
-        cfg.virtio_input_evdevs = cmd.virtio_input_evdevs;
+        cfg.virtio_single_touch = cmd.single_touch;
+        cfg.virtio_multi_touch = cmd.multi_touch;
+        cfg.virtio_trackpad = cmd.trackpad;
+        cfg.virtio_mice = cmd.mouse;
+        cfg.virtio_keyboard = cmd.keyboard;
+        cfg.virtio_switches = cmd.switches;
+        cfg.virtio_input_evdevs = cmd.evdev;
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             cfg.split_irqchip = cmd.split_irqchip;
         }
 
-        cfg.initrd_path = cmd.initrd_path;
+        cfg.initrd_path = cmd.initrd;
 
         if let Some(p) = cmd.bios {
             if cfg.executable_path.is_some() {
@@ -1866,18 +1906,18 @@ impl TryFrom<RunCommand> for super::config::Config {
             }
             cfg.executable_path = Some(Executable::Bios(p));
         }
-        cfg.pflash_parameters = cmd.pflash_parameters;
+        cfg.pflash_parameters = cmd.pflash;
 
         #[cfg(feature = "video-decoder")]
         {
-            cfg.video_dec = cmd.video_dec;
+            cfg.video_dec = cmd.video_decoder;
         }
         #[cfg(feature = "video-encoder")]
         {
-            cfg.video_enc = cmd.video_enc;
+            cfg.video_enc = cmd.video_encoder;
         }
 
-        cfg.acpi_tables = cmd.acpi_tables;
+        cfg.acpi_tables = cmd.acpi_table;
 
         cfg.usb = !cmd.no_usb;
         cfg.rng = !cmd.no_rng;
@@ -1885,12 +1925,12 @@ impl TryFrom<RunCommand> for super::config::Config {
         cfg.balloon_page_reporting = cmd.balloon_page_reporting;
         #[cfg(feature = "audio")]
         {
-            cfg.virtio_snds = cmd.virtio_snds;
+            cfg.virtio_snds = cmd.virtio_snd;
         }
 
         #[cfg(feature = "gpu")]
         {
-            cfg.gpu_parameters = cmd.gpu_params;
+            cfg.gpu_parameters = cmd.gpu.map(|p| p.0);
             if !cmd.gpu_display.is_empty() {
                 cfg.gpu_parameters
                     .get_or_insert_with(Default::default)
@@ -1924,7 +1964,7 @@ impl TryFrom<RunCommand> for super::config::Config {
                 cfg.vhost_vsock_device = Some(PathBuf::from(format!("/proc/self/fd/{}", fd)));
             }
 
-            cfg.shared_dirs = cmd.shared_dirs;
+            cfg.shared_dirs = cmd.shared_dir;
 
             cfg.net = cmd.net;
             cfg.host_ip = cmd.host_ip;
@@ -2017,7 +2057,7 @@ impl TryFrom<RunCommand> for super::config::Config {
             cfg.host_cpu_topology = cmd.host_cpu_topology;
             cfg.force_s2idle = cmd.s2idle;
             cfg.pcie_ecam = cmd.pcie_ecam;
-            cfg.pci_low_start = cmd.pci_low_start;
+            cfg.pci_low_start = cmd.pci_start;
             cfg.no_i8042 = cmd.no_i8042;
             cfg.no_rtc = cmd.no_rtc;
             cfg.oem_strings = cmd.oem_strings;
@@ -2033,7 +2073,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         }
 
         // cfg.balloon_bias is in bytes.
-        if let Some(b) = cmd.balloon_bias {
+        if let Some(b) = cmd.balloon_bias_mib {
             cfg.balloon_bias = b * 1024 * 1024;
         }
 
@@ -2054,14 +2094,14 @@ impl TryFrom<RunCommand> for super::config::Config {
             cfg.direct_level_irq = cmd.direct_level_irq;
             cfg.direct_edge_irq = cmd.direct_edge_irq;
             cfg.direct_gpe = cmd.direct_gpe;
-            cfg.direct_fixed_evts = cmd.direct_fixed_evts;
-            cfg.pcie_rp = cmd.pcie_rp;
-            cfg.mmio_address_ranges = cmd.mmio_address_ranges.unwrap_or_default();
+            cfg.direct_fixed_evts = cmd.direct_fixed_event;
+            cfg.pcie_rp = cmd.pcie_root_port;
+            cfg.mmio_address_ranges = cmd.mmio_address_range.unwrap_or_default();
         }
 
         cfg.disable_virtio_intx = cmd.disable_virtio_intx;
 
-        cfg.dmi_path = cmd.dmi_path;
+        cfg.dmi_path = cmd.dmi;
 
         cfg.itmt = cmd.itmt;
 
@@ -2082,13 +2122,13 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         cfg.privileged_vm = cmd.privileged_vm;
 
-        cfg.stub_pci_devices = cmd.stub_pci_devices;
+        cfg.stub_pci_devices = cmd.stub_pci_device;
 
         cfg.vvu_proxy = cmd.vvu_proxy;
 
-        cfg.file_backed_mappings = cmd.file_backed_mappings;
+        cfg.file_backed_mappings = cmd.file_backed_mapping;
 
-        cfg.init_memory = cmd.init_memory;
+        cfg.init_memory = cmd.init_mem;
 
         cfg.strict_balloon = cmd.strict_balloon;
 
