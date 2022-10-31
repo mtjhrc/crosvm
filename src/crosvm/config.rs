@@ -1306,15 +1306,15 @@ pub struct Config {
     pub vhost_user_mac80211_hwsim: Option<VhostUserOption>,
     pub vhost_user_net: Vec<VhostUserOption>,
     pub vhost_user_snd: Vec<VhostUserOption>,
-    pub vhost_user_video_dec: Option<VhostUserOption>,
+    pub vhost_user_video_dec: Vec<VhostUserOption>,
     pub vhost_user_vsock: Vec<VhostUserOption>,
     pub vhost_user_wl: Option<VhostUserOption>,
     #[cfg(unix)]
     pub vhost_vsock_device: Option<PathBuf>,
     #[cfg(feature = "video-decoder")]
-    pub video_dec: Option<VideoDeviceConfig>,
+    pub video_dec: Vec<VideoDeviceConfig>,
     #[cfg(feature = "video-encoder")]
-    pub video_enc: Option<VideoDeviceConfig>,
+    pub video_enc: Vec<VideoDeviceConfig>,
     pub virtio_input_evdevs: Vec<PathBuf>,
     pub virtio_keyboard: Vec<PathBuf>,
     pub virtio_mice: Vec<PathBuf>,
@@ -1502,7 +1502,7 @@ impl Default for Config {
             vhost_net_device_path: PathBuf::from(VHOST_NET_PATH),
             vhost_user_blk: Vec::new(),
             vhost_user_console: Vec::new(),
-            vhost_user_video_dec: None,
+            vhost_user_video_dec: Vec::new(),
             vhost_user_fs: Vec::new(),
             vhost_user_gpu: Vec::new(),
             vhost_user_mac80211_hwsim: None,
@@ -1513,9 +1513,9 @@ impl Default for Config {
             #[cfg(unix)]
             vhost_vsock_device: None,
             #[cfg(feature = "video-decoder")]
-            video_dec: None,
+            video_dec: Vec::new(),
             #[cfg(feature = "video-encoder")]
-            video_enc: None,
+            video_enc: Vec::new(),
             virtio_input_evdevs: Vec::new(),
             virtio_keyboard: Vec::new(),
             virtio_mice: Vec::new(),
@@ -2229,22 +2229,22 @@ mod tests {
         #[cfg(feature = "libvda")]
         {
             let params: VideoDeviceConfig = from_key_values("libvda").unwrap();
-            assert_eq!(params.backend_type, VideoBackendType::Libvda);
+            assert_eq!(params.backend, VideoBackendType::Libvda);
 
             let params: VideoDeviceConfig = from_key_values("libvda-vd").unwrap();
-            assert_eq!(params.backend_type, VideoBackendType::LibvdaVd);
+            assert_eq!(params.backend, VideoBackendType::LibvdaVd);
         }
 
         #[cfg(feature = "ffmpeg")]
         {
             let params: VideoDeviceConfig = from_key_values("ffmpeg").unwrap();
-            assert_eq!(params.backend_type, VideoBackendType::Ffmpeg);
+            assert_eq!(params.backend, VideoBackendType::Ffmpeg);
         }
 
         #[cfg(feature = "vaapi")]
         {
             let params: VideoDeviceConfig = from_key_values("vaapi").unwrap();
-            assert_eq!(params.backend_type, VideoBackendType::Vaapi);
+            assert_eq!(params.backend, VideoBackendType::Vaapi);
         }
     }
 
