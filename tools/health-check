@@ -114,9 +114,6 @@ KNOWN_DISABLED_FEATURES = [
     "direct",
     "gfxstream",
     "libvda",
-    "plugin-render-server",
-    "vaapi",
-    "video-encoder",
     "whpx",
 ]
 
@@ -136,10 +133,11 @@ def check_rust_features(_: CheckContext):
 
     all_platform_features = set(
         (
-            *collect_features("linux-aarch64"),
-            *collect_features("linux-armhf"),
-            *collect_features("linux-x86_64"),
-            *collect_features("win64"),
+            *collect_features("all-x86_64"),
+            *collect_features("all-aarch64"),
+            *collect_features("all-armhf"),
+            *collect_features("all-mingw64"),
+            *collect_features("all-msvc64"),
         )
     )
     disabled_features = [
