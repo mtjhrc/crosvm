@@ -5,23 +5,22 @@
 use std::convert::TryFrom;
 use std::io::Cursor;
 
-use anyhow::anyhow;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use bytes::Buf;
 use log::debug;
 
-use crate::bool_decoder::BoolDecoder;
-use crate::probs::COEFF_DEFAULT_PROBS;
-use crate::probs::COEFF_UPDATE_PROBS;
-use crate::probs::KF_UV_MODE_PROBS;
-use crate::probs::KF_Y_MODE_PROBS;
-use crate::probs::MV_DEFAULT_PROBS;
-use crate::probs::MV_UPDATE_PROBS;
-use crate::probs::NK_UV_MODE_PROBS;
-use crate::probs::NK_Y_MODE_PROBS;
+use crate::decoders::vp8::bool_decoder::BoolDecoder;
+use crate::decoders::vp8::probs::COEFF_DEFAULT_PROBS;
+use crate::decoders::vp8::probs::COEFF_UPDATE_PROBS;
+use crate::decoders::vp8::probs::KF_UV_MODE_PROBS;
+use crate::decoders::vp8::probs::KF_Y_MODE_PROBS;
+use crate::decoders::vp8::probs::MV_DEFAULT_PROBS;
+use crate::decoders::vp8::probs::MV_UPDATE_PROBS;
+use crate::decoders::vp8::probs::NK_UV_MODE_PROBS;
+use crate::decoders::vp8::probs::NK_Y_MODE_PROBS;
 
 /// Dequantization indices as parsed from the quant_indices() syntax.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct QuantIndices {
     /// The dequantization table index used for the luma AC coefficients (and
     /// other coefficient groups if no delta value is present).
@@ -43,7 +42,7 @@ pub struct QuantIndices {
     pub uv_ac_delta: i8,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MbLfAdjustments {
     /// Indicates if the MB-level loop filter adjustment (based on the used
     /// reference frame and coding mode) is on for the current frame.
@@ -61,7 +60,7 @@ pub struct MbLfAdjustments {
     pub mb_mode_delta: [i8; 4],
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Segmentation {
     /// Enables the segmentation feature for the current frame.
     pub segmentation_enabled: bool,
@@ -84,7 +83,7 @@ pub struct Segmentation {
     pub segment_prob: [u8; 3],
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModeProbs {
     /// Branch probabilities of the luma intra prediction mode decoding tree,
     /// kept live between frames.
@@ -94,7 +93,7 @@ pub struct ModeProbs {
     pub intra_chroma_prob: [u8; 3],
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Header {
     /// Indicates if the current frame is a key frame or not.
     key_frame: bool,
@@ -355,8 +354,8 @@ impl Header {
     }
 
     /// Get a reference to the header's mode probs.
-    pub fn mode_probs(&self) -> ModeProbs {
-        self.mode_probs
+    pub fn mode_probs(&self) -> &ModeProbs {
+        &self.mode_probs
     }
 
     /// Get a reference to the header's bd range.
@@ -404,6 +403,7 @@ impl<T: AsRef<[u8]>> AsRef<[u8]> for Frame<T> {
 }
 
 /// A VP8 parser based on GStreamer's vp8parser and Chromium's VP8 parser.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Parser {
     /// Segmentation data kept live across frames.
     segmentation: Segmentation,
@@ -703,7 +703,7 @@ impl Parser {
             frame.refresh_entropy_probs = bd.read_bool()?;
             frame.refresh_last = bd.read_bool()?;
 
-            frame.mode_probs = self.mode_probs;
+            frame.mode_probs = self.mode_probs.clone();
         }
 
         frame.coeff_prob = self.coeff_prob;
@@ -743,7 +743,7 @@ impl Parser {
             self.mv_prob = frame.mv_prob;
 
             if !frame.key_frame {
-                self.mode_probs = frame.mode_probs;
+                self.mode_probs = frame.mode_probs.clone();
             }
         }
 
@@ -836,8 +836,8 @@ mod tests {
 
     // Test and test data extracted from GStreamer
     // subprojects/gst-plugins-bad/tests/check/libs/vp8parser.c
-    const VP8_TEST_0_INTRA: &[u8] = include_bytes!("vp8-parser-test-0-intra.bin");
-    const VP8_TEST_0_INTER: &[u8] = include_bytes!("vp8-parser-test-0-inter.bin");
+    const VP8_TEST_0_INTRA: &[u8] = include_bytes!("test_data/vp8-parser-test-0-intra.bin");
+    const VP8_TEST_0_INTER: &[u8] = include_bytes!("test_data/vp8-parser-test-0-inter.bin");
 
     #[test]
     fn gst_vp8parser_test_intra() {

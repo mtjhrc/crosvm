@@ -2,6 +2,5 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-mod bool_decoder;
-pub mod parser;
-mod probs;
+#[cfg(feature = "vaapi")]
+pub mod vaapi;
