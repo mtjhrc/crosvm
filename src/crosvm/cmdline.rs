@@ -38,6 +38,7 @@ use devices::virtio::device_constants::video::VideoDeviceConfig;
 #[cfg(feature = "audio")]
 use devices::virtio::snd::parameters::Parameters as SndParameters;
 use devices::virtio::vhost::user::device;
+#[cfg(feature = "gpu")]
 use devices::virtio::GpuParameters;
 use devices::virtio::NetParameters;
 #[cfg(feature = "audio")]
@@ -49,6 +50,7 @@ use devices::StubPciParameters;
 use hypervisor::ProtectionType;
 use resources::AddressRange;
 use serde::Deserialize;
+#[cfg(feature = "gpu")]
 use serde_keyvalue::FromKeyValues;
 #[cfg(feature = "gpu")]
 use vm_control::gpu::DisplayParameters as GpuDisplayParameters;
@@ -1017,10 +1019,10 @@ pub struct RunCommand {
     /// comma separated key=value pairs for setting
     /// up a vhost-user net device
     /// Possible key values:
-    ///     tap_name=STRING - name of a configured persistent TAP
+    ///     tap-name=STRING - name of a configured persistent TAP
     ///        interface to use for networking.
-    ///     tap_fd=INT - File descriptor for configured tap device.
-    ///     host_ip=STRING - IP address to assign to
+    ///     tap-fd=INT - File descriptor for configured tap device.
+    ///     host-ip=STRING - IP address to assign to
     ///         host tap interface.
     ///     netmask=STRING - Netmask for VM subnet.
     ///     mac=STRING - MAC address for VM.

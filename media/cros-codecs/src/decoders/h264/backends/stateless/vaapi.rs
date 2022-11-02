@@ -181,11 +181,8 @@ impl Backend {
             value: rt_format,
         }];
 
-        let config = display.create_config(
-            Some(attrs),
-            va_profile,
-            libva::VAEntrypoint::VAEntrypointVLD,
-        )?;
+        let config =
+            display.create_config(attrs, va_profile, libva::VAEntrypoint::VAEntrypointVLD)?;
 
         let format_map = if let Some(format_map) = format_map {
             format_map
@@ -216,13 +213,13 @@ impl Backend {
         )?;
         self.num_allocated_surfaces = num_surfaces;
 
-        let context = Rc::new(display.create_context(
+        let context = display.create_context(
             &config,
             i32::try_from(frame_w)?,
             i32::try_from(frame_h)?,
             Some(&surfaces),
             true,
-        )?);
+        )?;
 
         let coded_resolution = Resolution {
             width: frame_w,
