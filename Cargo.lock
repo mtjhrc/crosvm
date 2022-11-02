@@ -141,10 +141,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47253b98986dafc7a3e1cf3259194f1f47ac61abb57a57f46ec09e48d004ecda"
 
 [[package]]
-name = "assertions"
-version = "0.1.0"
-
-[[package]]
 name = "async-task"
 version = "4.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -423,6 +419,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "cros_asyncv2"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-task",
+ "base",
+ "data_model",
+ "futures",
+ "futures-executor",
+ "futures-util",
+ "intrusive-collections",
+ "io-uring",
+ "libc",
+ "memoffset 0.6.5",
+ "mio",
+ "once_cell",
+ "slab",
+ "smallvec",
+ "sync",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "cros_fdt"
 version = "0.1.0"
 dependencies = [
@@ -464,7 +484,6 @@ dependencies = [
  "arch",
  "argh",
  "argh_helpers",
- "assertions",
  "audio_streams",
  "base",
  "bit_field",
@@ -511,6 +530,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_keyvalue",
+ "static_assertions",
  "sync",
  "tempfile",
  "terminal_size",
@@ -520,6 +540,7 @@ dependencies = [
  "vhost",
  "vm_control",
  "vm_memory",
+ "win_audio",
  "win_util",
  "winapi",
  "x86_64",
@@ -591,11 +612,11 @@ dependencies = [
 name = "data_model"
 version = "0.1.0"
 dependencies = [
- "assertions",
  "cfg-if",
  "libc",
  "remain",
  "serde",
+ "static_assertions",
  "thiserror",
  "winapi",
 ]
@@ -692,6 +713,7 @@ dependencies = [
  "vm_control",
  "vm_memory",
  "vmm_vhost",
+ "win_audio",
  "win_util",
  "winapi",
 ]
@@ -1060,6 +1082,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00d78c9f2db2a9800dfd15c69543896dae2135112dde0d1944442e83da8ce23a"
+dependencies = [
+ "bitflags",
+ "libc",
+]
+
+[[package]]
 name = "io_uring"
 version = "0.1.1"
 dependencies = [
@@ -1318,6 +1350,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
+name = "mio"
+version = "0.7.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8067b404fe97c70829f082dec8bcf4f71225d7eaea1d8645349cb76fa06205cc"
+dependencies = [
+ "libc",
+ "log",
+ "miow",
+ "ntapi",
+ "winapi",
+]
+
+[[package]]
+name = "miow"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9f1c5b025cda876f66ef43a113f91ebc9f4ccef34843000e0adf6ebbab84e21"
+dependencies = [
+ "winapi",
+]
+
+[[package]]
 name = "net_sys"
 version = "0.1.0"
 dependencies = [
@@ -1368,6 +1422,15 @@ checksum = "a8903e5a29a317527874d0402f867152a3d21c908bb0b933e416c65e301d4c36"
 dependencies = [
  "memchr",
  "minimal-lexical",
+]
+
+[[package]]
+name = "ntapi"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c28774a7fd2fbb4f0babd8237ce554b73af68021b5f695a3cebd6c59bac0980f"
+dependencies = [
+ "winapi",
 ]
 
 [[package]]
@@ -1780,6 +1843,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fd0db749597d91ff862fd1d55ea87f7855a744a8425a64695b6fca237d1dad1"
 
 [[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
 name = "strsim"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1974,11 +2043,11 @@ dependencies = [
 name = "usb_util"
 version = "0.1.0"
 dependencies = [
- "assertions",
  "base",
  "data_model",
  "libc",
  "remain",
+ "static_assertions",
  "thiserror",
  "usb_sys",
 ]
@@ -2011,11 +2080,11 @@ dependencies = [
 name = "vhost"
 version = "0.1.0"
 dependencies = [
- "assertions",
  "base",
  "libc",
  "net_util",
  "remain",
+ "static_assertions",
  "thiserror",
  "virtio_sys",
  "vm_memory",
@@ -2117,6 +2186,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "17882f045410753661207383517a6f62ec3dbeb6a4ed2acce01f0728238d1983"
 
 [[package]]
+name = "win_audio"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "audio_streams",
+ "base",
+ "libc",
+ "metrics",
+ "once_cell",
+ "prebuilts",
+ "sync",
+ "thiserror",
+ "win_util",
+ "winapi",
+ "wio",
+]
+
+[[package]]
 name = "win_util"
 version = "0.1.0"
 dependencies = [
@@ -2188,6 +2275,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wio"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d129932f4644ac2396cb456385cbf9e63b5b30c6e8dc4820bdca4eb082037a5"
+dependencies = [
+ "winapi",
+]
+
+[[package]]
 name = "wire_format_derive"
 version = "0.1.0"
 dependencies = [
@@ -2217,7 +2313,6 @@ dependencies = [
  "acpi_tables",
  "anyhow",
  "arch",
- "assertions",
  "base",
  "cfg-if",
  "chrono",
