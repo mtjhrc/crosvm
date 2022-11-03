@@ -540,6 +540,7 @@ dependencies = [
  "vhost",
  "vm_control",
  "vm_memory",
+ "which",
  "win_audio",
  "win_util",
  "winapi",
@@ -2190,8 +2191,10 @@ name = "win_audio"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "audio_streams",
  "base",
+ "cros_async",
  "libc",
  "metrics",
  "once_cell",
