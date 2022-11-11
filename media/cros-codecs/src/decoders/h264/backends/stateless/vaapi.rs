@@ -2,9 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::cell::Ref;
 use std::cell::RefCell;
-use std::cell::RefMut;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -37,9 +35,8 @@ use crate::decoders::h264::parser::Slice;
 use crate::decoders::h264::parser::Sps;
 use crate::decoders::h264::picture::Field;
 use crate::decoders::h264::picture::H264Picture;
+use crate::decoders::h264::picture::PictureData;
 use crate::decoders::h264::picture::Reference;
-use crate::decoders::DynDecodedHandle;
-use crate::decoders::DynPicture;
 use crate::decoders::Error as DecoderError;
 use crate::decoders::Result as DecoderResult;
 use crate::decoders::StatelessBackendError;
@@ -735,7 +732,7 @@ impl VideoDecoderBackend for Backend {
 }
 
 impl StatelessDecoderBackend for Backend {
-    type Handle = VADecodedHandle<InnerHandle>;
+    type Handle = VADecodedHandle<H264Picture<GenericBackendHandle>>;
 
     fn new_sequence(&mut self, sps: &Sps, dpb_size: usize) -> StatelessBackendResult<()> {
         self.negotiation_status = NegotiationStatus::Possible {
@@ -1024,7 +1021,7 @@ impl StatelessDecoderBackend for Backend {
             // Remove from the queue in order.
             let job = &self.pending_jobs[i];
 
-            if H264Picture::same(&job.h264_picture, &handle.picture_container()) {
+            if H264Picture::same(&job.h264_picture, handle.picture_container()) {
                 let job = self.pending_jobs.remove(i).unwrap();
 
                 let current_picture = job.va_picture.sync()?;
@@ -1050,25 +1047,12 @@ impl StatelessDecoderBackend for Backend {
     }
 }
 
-type InnerHandle = H264Picture<GenericBackendHandle>;
-
-impl DecodedHandle for VADecodedHandle<InnerHandle> {
+impl DecodedHandle for VADecodedHandle<H264Picture<GenericBackendHandle>> {
+    type CodecData = PictureData<Self::BackendHandle>;
     type BackendHandle = GenericBackendHandle;
 
-    fn picture(&self) -> Ref<H264Picture<Self::BackendHandle>> {
-        self.inner().borrow()
-    }
-
-    fn picture_mut(&self) -> RefMut<H264Picture<Self::BackendHandle>> {
-        self.inner().borrow_mut()
-    }
-
-    fn picture_container(&self) -> Rc<RefCell<H264Picture<Self::BackendHandle>>> {
-        self.inner().clone()
-    }
-
-    fn timestamp(&self) -> u64 {
-        self.picture().timestamp()
+    fn picture_container(&self) -> &ContainedPicture<Self::BackendHandle> {
+        self.inner()
     }
 
     fn display_resolution(&self) -> Resolution {
@@ -1081,28 +1065,6 @@ impl DecodedHandle for VADecodedHandle<InnerHandle> {
 
     fn set_display_order(&mut self, display_order: u64) {
         self.display_order = Some(display_order)
-    }
-}
-
-impl DynDecodedHandle for VADecodedHandle<InnerHandle> {
-    fn dyn_picture(&self) -> Ref<dyn crate::decoders::DynPicture> {
-        self.picture()
-    }
-
-    fn dyn_picture_mut(&self) -> RefMut<dyn DynPicture> {
-        self.picture_mut()
-    }
-
-    fn timestamp(&self) -> u64 {
-        DecodedHandle::timestamp(self)
-    }
-
-    fn display_resolution(&self) -> Resolution {
-        DecodedHandle::display_resolution(self)
-    }
-
-    fn display_order(&self) -> Option<u64> {
-        DecodedHandle::display_order(self)
     }
 }
 
