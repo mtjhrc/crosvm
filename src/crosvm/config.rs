@@ -9,9 +9,12 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use arch::set_default_serial_parameters;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use arch::MsrAction;
 use arch::MsrConfig;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use arch::MsrFilter;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use arch::MsrRWType;
 use arch::MsrValueFrom;
 use arch::Pstore;
@@ -1504,7 +1507,7 @@ pub fn validate_config(cfg: &mut Config) -> std::result::Result<(), String> {
 
     #[cfg(feature = "gpu")]
     {
-        crate::crosvm::sys::validate_gpu_config(cfg)?;
+        crate::crosvm::gpu_config::validate_gpu_config(cfg)?;
     }
     #[cfg(feature = "gdb")]
     if cfg.gdb.is_some() && cfg.vcpu_count.unwrap_or(1) != 1 {

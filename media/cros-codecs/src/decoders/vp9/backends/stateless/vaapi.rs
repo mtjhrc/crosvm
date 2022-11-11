@@ -15,7 +15,6 @@ use libva::BufferType;
 use libva::Picture as VaPicture;
 use libva::PictureEnd;
 use libva::SegmentParameterVP9;
-use libva::Surface;
 use libva::UsageHint;
 
 use crate::decoders::vp9::backends::stateless::AsBackendHandle;
@@ -24,6 +23,7 @@ use crate::decoders::vp9::backends::stateless::ContainedPicture;
 use crate::decoders::vp9::backends::stateless::DecodedHandle;
 use crate::decoders::vp9::backends::stateless::Result as StatelessBackendResult;
 use crate::decoders::vp9::backends::stateless::StatelessDecoderBackend;
+use crate::decoders::vp9::backends::stateless::Vp9Picture;
 use crate::decoders::vp9::lookups::AC_QLOOKUP;
 use crate::decoders::vp9::lookups::AC_QLOOKUP_10;
 use crate::decoders::vp9::lookups::AC_QLOOKUP_12;
@@ -45,7 +45,6 @@ use crate::decoders::vp9::parser::NUM_REF_FRAMES;
 use crate::decoders::vp9::parser::SEG_LVL_ALT_L;
 use crate::decoders::vp9::parser::SEG_LVL_REF_FRAME;
 use crate::decoders::vp9::parser::SEG_LVL_SKIP;
-use crate::decoders::vp9::picture::Picture as Vp9Picture;
 use crate::decoders::DynDecodedHandle;
 use crate::decoders::DynPicture;
 use crate::decoders::Error as DecoderError;
@@ -58,7 +57,6 @@ use crate::utils::vaapi::FormatMap;
 use crate::utils::vaapi::GenericBackendHandle;
 use crate::utils::vaapi::GenericBackendHandleInner;
 use crate::utils::vaapi::StreamMetadataState;
-use crate::utils::vaapi::SurfaceContainer;
 use crate::utils::vaapi::SurfacePoolHandle;
 use crate::DecodedFormat;
 use crate::Resolution;
@@ -660,20 +658,20 @@ impl StatelessDecoderBackend for Backend {
         let context = self.metadata_state.context()?;
 
         let pic_param =
-            context.create_buffer(Backend::build_pic_param(&picture.header, reference_frames)?)?;
+            context.create_buffer(Backend::build_pic_param(&picture.data, reference_frames)?)?;
 
         #[cfg(test)]
         {
             let mut seg = self.segmentation.clone();
             self.save_params(
-                Backend::build_pic_param(&picture.header, reference_frames)?,
-                Backend::build_slice_param(&picture.header, &mut seg, bitstream.as_ref().len())?,
+                Backend::build_pic_param(&picture.data, reference_frames)?,
+                Backend::build_slice_param(&picture.data, &mut seg, bitstream.as_ref().len())?,
                 libva::BufferType::SliceData(Vec::from(bitstream.as_ref())),
             );
         }
 
         let slice_param = context.create_buffer(Backend::build_slice_param(
-            &picture.header,
+            &picture.data,
             &mut self.segmentation,
             bitstream.as_ref().len(),
         )?)?;
@@ -902,30 +900,7 @@ impl VideoDecoderBackend for Backend {
     }
 }
 
-type InnerHandle = RefCell<Vp9Picture<GenericBackendHandle>>;
-
-impl SurfaceContainer for InnerHandle {
-    fn into_surface(self) -> Result<Option<Surface>> {
-        let backend_handle = self.into_inner().backend_handle;
-
-        let backend_handle = match backend_handle {
-            Some(backend_handle) => backend_handle,
-            None => return Ok(None),
-        };
-
-        let surface = match backend_handle.inner {
-            GenericBackendHandleInner::Ready { picture, .. } => picture.take_surface().map(Some),
-            GenericBackendHandleInner::Pending(id) => {
-                return Err(anyhow!(
-                "Attempting to retrieve a surface (id: {:?}) that might have operations pending.",
-                id
-            ))
-            }
-        };
-
-        surface
-    }
-}
+type InnerHandle = Vp9Picture<GenericBackendHandle>;
 
 impl DecodedHandle for VADecodedHandle<InnerHandle> {
     type BackendHandle = GenericBackendHandle;
@@ -947,7 +922,7 @@ impl DecodedHandle for VADecodedHandle<InnerHandle> {
     }
 
     fn display_resolution(&self) -> Resolution {
-        let hdr = &self.picture().header;
+        let hdr = &self.picture().data;
         Resolution {
             width: hdr.width() as u32,
             height: hdr.height() as u32,
@@ -1004,7 +979,7 @@ mod tests {
     use crate::decoders::vp9::decoder::tests::run_decoding_loop;
     use crate::decoders::vp9::decoder::Decoder;
     use crate::decoders::vp9::parser::NUM_REF_FRAMES;
-    use crate::decoders::MappableHandle;
+    use crate::decoders::DynPicture;
 
     fn as_vaapi_backend(
         backend: &dyn StatelessDecoderBackend<Handle = AssociatedHandle>,
@@ -1021,7 +996,7 @@ mod tests {
         frame_num: i32,
     ) {
         let mut picture = handle.picture_mut();
-        let backend_handle = picture.backend_handle_unchecked_mut();
+        let backend_handle = picture.dyn_mappable_handle_mut();
 
         let resolution = backend_handle.mapped_resolution().unwrap();
 
@@ -1555,7 +1530,7 @@ mod tests {
                     // check so as to not fail because of that, as some of the
                     // intermediary resolutions in this file fail this
                     // condition.
-                    let expected_crcs = if handle.picture().header.width() % 4 == 0 {
+                    let expected_crcs = if handle.picture().data.width() % 4 == 0 {
                         Some(&mut expected_crcs)
                     } else {
                         None

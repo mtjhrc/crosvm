@@ -17,7 +17,6 @@ use libva::IQMatrixBufferVP8;
 use libva::Picture as VaPicture;
 use libva::PictureEnd;
 use libva::ProbabilityDataBufferVP8;
-use libva::Surface;
 use libva::UsageHint;
 
 use crate::decoders::h264::backends::stateless::Result as StatelessBackendResult;
@@ -26,11 +25,11 @@ use crate::decoders::vp8::backends::stateless::BlockingMode;
 use crate::decoders::vp8::backends::stateless::ContainedPicture;
 use crate::decoders::vp8::backends::stateless::DecodedHandle;
 use crate::decoders::vp8::backends::stateless::StatelessDecoderBackend;
+use crate::decoders::vp8::backends::stateless::Vp8Picture;
 use crate::decoders::vp8::parser::Header;
 use crate::decoders::vp8::parser::MbLfAdjustments;
 use crate::decoders::vp8::parser::Parser;
 use crate::decoders::vp8::parser::Segmentation;
-use crate::decoders::vp8::picture::Picture as Vp8Picture;
 use crate::decoders::DynDecodedHandle;
 use crate::decoders::DynPicture;
 use crate::decoders::Error as DecoderError;
@@ -43,7 +42,6 @@ use crate::utils::vaapi::FormatMap;
 use crate::utils::vaapi::GenericBackendHandle;
 use crate::utils::vaapi::GenericBackendHandleInner;
 use crate::utils::vaapi::StreamMetadataState;
-use crate::utils::vaapi::SurfaceContainer;
 use crate::utils::vaapi::SurfacePoolHandle;
 use crate::DecodedFormat;
 use crate::Resolution;
@@ -449,15 +447,14 @@ impl StatelessDecoderBackend for Backend {
 
         let context = self.metadata_state.context()?;
 
-        let iq_buffer =
-            context.create_buffer(Backend::build_iq_matrix(&picture.header, parser)?)?;
+        let iq_buffer = context.create_buffer(Backend::build_iq_matrix(&picture.data, parser)?)?;
 
-        let probs = context.create_buffer(Backend::build_probability_table(&picture.header))?;
+        let probs = context.create_buffer(Backend::build_probability_table(&picture.data))?;
 
         let coded_resolution = self.metadata_state.coded_resolution()?;
 
         let pic_param = context.create_buffer(Backend::build_pic_param(
-            &picture.header,
+            &picture.data,
             &coded_resolution,
             parser.segmentation(),
             parser.mb_lf_adjust(),
@@ -467,7 +464,7 @@ impl StatelessDecoderBackend for Backend {
         )?)?;
 
         let slice_param = context.create_buffer(Backend::build_slice_param(
-            &picture.header,
+            &picture.data,
             bitstream.as_ref().len(),
         )?)?;
 
@@ -497,7 +494,7 @@ impl StatelessDecoderBackend for Backend {
         #[cfg(test)]
         self.save_params(
             Backend::build_pic_param(
-                &picture.header,
+                &picture.data,
                 &coded_resolution,
                 parser.segmentation(),
                 parser.mb_lf_adjust(),
@@ -505,10 +502,10 @@ impl StatelessDecoderBackend for Backend {
                 golden_ref,
                 alt_ref,
             )?,
-            Backend::build_slice_param(&picture.header, bitstream.as_ref().len())?,
+            Backend::build_slice_param(&picture.data, bitstream.as_ref().len())?,
             libva::BufferType::SliceData(Vec::from(bitstream.as_ref())),
-            Backend::build_iq_matrix(&picture.header, parser)?,
-            Backend::build_probability_table(&picture.header),
+            Backend::build_iq_matrix(&picture.data, parser)?,
+            Backend::build_probability_table(&picture.data),
         );
 
         let picture = Rc::new(RefCell::new(picture));
@@ -714,30 +711,7 @@ impl VideoDecoderBackend for Backend {
     }
 }
 
-type InnerHandle = RefCell<Vp8Picture<GenericBackendHandle>>;
-
-impl SurfaceContainer for InnerHandle {
-    fn into_surface(self) -> Result<Option<Surface>> {
-        let backend_handle = self.into_inner().backend_handle;
-
-        let backend_handle = match backend_handle {
-            Some(backend_handle) => backend_handle,
-            None => return Ok(None),
-        };
-
-        let surface = match backend_handle.inner {
-            GenericBackendHandleInner::Ready { picture, .. } => picture.take_surface().map(Some),
-            GenericBackendHandleInner::Pending(id) => {
-                return Err(anyhow!(
-                "Attempting to retrieve a surface (id: {:?}) that might have operations pending.",
-                id
-            ))
-            }
-        };
-
-        surface
-    }
-}
+type InnerHandle = Vp8Picture<GenericBackendHandle>;
 
 impl DecodedHandle for VADecodedHandle<InnerHandle> {
     type BackendHandle = GenericBackendHandle;
@@ -759,7 +733,7 @@ impl DecodedHandle for VADecodedHandle<InnerHandle> {
     }
 
     fn display_resolution(&self) -> Resolution {
-        let hdr = &self.picture().header;
+        let hdr = &self.picture().data;
         Resolution {
             width: hdr.width() as u32,
             height: hdr.height() as u32,
@@ -817,7 +791,7 @@ mod tests {
     use crate::decoders::vp8::decoder::tests::process_ready_frames;
     use crate::decoders::vp8::decoder::tests::run_decoding_loop;
     use crate::decoders::vp8::decoder::Decoder;
-    use crate::decoders::MappableHandle;
+    use crate::decoders::DynPicture;
 
     fn as_vaapi_backend(
         backend: &dyn StatelessDecoderBackend<Handle = AssociatedHandle>,
@@ -834,7 +808,7 @@ mod tests {
         frame_num: i32,
     ) {
         let mut picture = handle.picture_mut();
-        let backend_handle = picture.backend_handle_unchecked_mut();
+        let backend_handle = picture.dyn_mappable_handle_mut();
 
         let resolution = backend_handle.mapped_resolution().unwrap();
 
