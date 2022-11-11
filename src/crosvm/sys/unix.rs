@@ -31,8 +31,6 @@ use std::process;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Barrier;
-#[cfg(any(target_arch = "x86_64", feature = "gdb"))]
-use std::thread;
 #[cfg(feature = "balloon")]
 use std::time::Duration;
 
@@ -1840,7 +1838,7 @@ where
         }
 
         let pci_root = linux.root_config.clone();
-        thread::Builder::new()
+        std::thread::Builder::new()
             .name("pci_root".to_string())
             .spawn(move || start_pci_root_worker(pci_root, hp_worker_tube))?;
     }
@@ -2470,7 +2468,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             to_vcpu_channels,
             from_vcpu_channel.unwrap(), // Must succeed to unwrap()
         );
-        thread::Builder::new()
+        std::thread::Builder::new()
             .name("gdb".to_owned())
             .spawn(move || gdb_thread(target, gdb_port_num))
             .context("failed to spawn GDB thread")?;
@@ -2544,10 +2542,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                     );
                 }
                 Token::ChildSignal => {
-                    // Print all available siginfo structs, then exit the loop if child process has
-                    // been exited except CLD_STOPPED and CLD_CONTINUED. the two should be ignored
-                    // here since they are used by the vmm-swap feature.
-                    let mut do_exit = false;
+                    // Print all available siginfo structs, then exit the loop.
                     while let Some(siginfo) =
                         sigchld_fd.read().context("failed to create signalfd")?
                     {
@@ -2556,24 +2551,12 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                             Some(label) => format!("{} (pid {})", label, pid),
                             None => format!("pid {}", pid),
                         };
-
-                        // TODO(kawasin): this is a temporary exception until device suspension.
-                        #[cfg(feature = "swap")]
-                        if siginfo.ssi_code == libc::CLD_STOPPED
-                            || siginfo.ssi_code == libc::CLD_CONTINUED
-                        {
-                            continue;
-                        }
-
                         error!(
-                            "child {} exited: signo {}, status {}, code {}",
+                            "child {} died: signo {}, status {}, code {}",
                             pid_label, siginfo.ssi_signo, siginfo.ssi_status, siginfo.ssi_code
                         );
-                        do_exit = true;
                     }
-                    if do_exit {
-                        break 'wait;
-                    }
+                    break 'wait;
                 }
                 Token::IrqFd { index } => {
                     if let Err(e) = linux.irq_chip.service_irq_event(index) {

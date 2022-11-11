@@ -85,7 +85,6 @@ members = [
     "resources",
     "rutabaga_gfx",
     "serde_keyvalue",
-    "swap",
     "system_api",
     "third_party/vmm_vhost",
     "tpm2-sys",
@@ -311,6 +310,7 @@ all-x86_64 = ["all-aarch64", "plugin", "scudo"]
 all-armhf = [
     "composite-disk",
     "default",
+    "gdb", # no effect because gdb is not supported for armhf
     "libvda-stub",
     "tpm",
     ]
@@ -389,9 +389,6 @@ aarch64 = { path = "aarch64" }
 [target.'cfg(unix)'.dependencies]
 minijail = "*" # provided by ebuild
 p9 = "*"
-
-[target.'cfg(target_os="linux")'.dependencies]
-swap = { path = "swap", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 anti_tamper = { path = "anti_tamper" }

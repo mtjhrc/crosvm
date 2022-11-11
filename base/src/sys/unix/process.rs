@@ -125,6 +125,8 @@ where
 }
 
 #[cfg(test)]
+// TODO(b/258371694) --test-threads not works on aarch64 and armhf
+#[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
 mod tests {
     use std::thread;
     use std::time::Duration;
@@ -186,7 +188,7 @@ mod tests {
         let keep_rds = vec![fork_tube.as_raw_descriptor()];
         let thread_name = String::from("12345678901234567890");
 
-        let child = fork_process(jail, keep_rds, Some(thread_name.clone()), || {
+        let child = fork_process(jail, keep_rds, Some(thread_name), || {
             fork_tube.send::<u32>(&1).unwrap();
             thread::sleep(Duration::from_secs(10));
         })
