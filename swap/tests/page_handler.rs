@@ -5,19 +5,24 @@
 //! Integration tests for [PageHandler]. these are more than unit tests since [PageHandler] rely on
 //! the userfaultfd(2) kernel feature.
 
-use userfaultfd::UffdBuilder;
-
 use std::array;
 use std::thread;
 use std::time;
 
 use base::pagesize;
+use base::sys::wait_for_pid;
+use base::AsRawDescriptor;
+use base::FromRawDescriptor;
+use base::IntoRawDescriptor;
 use base::MemoryMappingBuilder;
+use base::SafeDescriptor;
 use base::SharedMemory;
+use base::Tube;
 use data_model::VolatileMemory;
 use swap::page_handler::Error;
 use swap::page_handler::PageHandler;
 use swap::userfaultfd::Userfaultfd;
+use userfaultfd::UffdBuilder;
 
 fn create_uffd_for_test() -> Userfaultfd {
     UffdBuilder::new()
@@ -29,7 +34,7 @@ fn create_uffd_for_test() -> Userfaultfd {
 
 #[test]
 fn register_region_success() {
-    let dir_path = tempfile::tempdir().unwrap().into_path();
+    let dir_path = tempfile::tempdir().unwrap();
     let mmap = MemoryMappingBuilder::new(6 * pagesize()).build().unwrap();
     let uffd: Userfaultfd = create_uffd_for_test();
     let base_addr = mmap.get_ref::<u8>(0).unwrap().as_mut_ptr() as usize;
@@ -37,7 +42,7 @@ fn register_region_success() {
     let result = unsafe {
         PageHandler::register_regions(
             array::from_ref(&uffd),
-            &dir_path,
+            dir_path.path(),
             &[
                 base_addr..(base_addr + 3 * pagesize()),
                 (base_addr + 3 * pagesize())..(base_addr + 6 * pagesize()),
@@ -49,8 +54,43 @@ fn register_region_success() {
 }
 
 #[test]
+fn register_region_skip_obsolete_process() {
+    let dir_path = tempfile::tempdir().unwrap();
+    let mmap = MemoryMappingBuilder::new(6 * pagesize()).build().unwrap();
+    let uffd: Userfaultfd = create_uffd_for_test();
+    let base_addr = mmap.get_ref::<u8>(0).unwrap().as_mut_ptr() as usize;
+    let (tube_main, tube_child) = Tube::pair().unwrap();
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        // child process
+        let uffd = create_uffd_for_test();
+        tube_child
+            .send(&unsafe { SafeDescriptor::from_raw_descriptor(uffd.as_raw_descriptor()) })
+            .unwrap();
+        std::process::exit(0);
+    }
+    let uffd_descriptor = tube_main
+        .recv::<SafeDescriptor>()
+        .unwrap()
+        .into_raw_descriptor();
+    wait_for_pid(pid, 0).unwrap();
+    let uffd_child = unsafe { Userfaultfd::from_raw_descriptor(uffd_descriptor) };
+
+    let result = unsafe {
+        PageHandler::register_regions(
+            &[uffd, uffd_child],
+            dir_path.path(),
+            &[base_addr..(base_addr + 3 * pagesize())],
+        )
+    };
+
+    // no error from ENOMEM
+    assert_eq!(result.is_ok(), true);
+}
+
+#[test]
 fn register_region_partially_overlap() {
-    let dir_path = tempfile::tempdir().unwrap().into_path();
+    let dir_path = tempfile::tempdir().unwrap();
     let mmap = MemoryMappingBuilder::new(3 * pagesize()).build().unwrap();
     let uffd: Userfaultfd = create_uffd_for_test();
     let base_addr = mmap.get_ref::<u8>(0).unwrap().as_mut_ptr() as usize;
@@ -70,7 +110,7 @@ fn register_region_partially_overlap() {
         let result = unsafe {
             PageHandler::register_regions(
                 array::from_ref(&uffd),
-                &dir_path,
+                dir_path.path(),
                 &[base_addr..(base_addr + 3 * pagesize()), range],
             )
         };
@@ -96,14 +136,14 @@ fn wait_thread_with_timeout<T>(join_handle: thread::JoinHandle<T>, timeout_milli
 
 #[test]
 fn handle_page_fault_success() {
-    let dir_path = tempfile::tempdir().unwrap().into_path();
+    let dir_path = tempfile::tempdir().unwrap();
     let mmap = MemoryMappingBuilder::new(3 * pagesize()).build().unwrap();
     let uffd: Userfaultfd = create_uffd_for_test();
     let base_addr = mmap.get_ref::<u8>(0).unwrap().as_mut_ptr() as usize;
     let mut page_handler = unsafe {
         PageHandler::register_regions(
             array::from_ref(&uffd),
-            &dir_path,
+            dir_path.path(),
             &[base_addr..(base_addr + 3 * pagesize())],
         )
     }
@@ -144,14 +184,14 @@ fn handle_page_fault_success() {
 
 #[test]
 fn handle_page_fault_invalid_address() {
-    let dir_path = tempfile::tempdir().unwrap().into_path();
+    let dir_path = tempfile::tempdir().unwrap();
     let mmap = MemoryMappingBuilder::new(3 * pagesize()).build().unwrap();
     let uffd: Userfaultfd = create_uffd_for_test();
     let base_addr = mmap.get_ref::<u8>(0).unwrap().as_mut_ptr() as usize;
     let mut page_handler = unsafe {
         PageHandler::register_regions(
             array::from_ref(&uffd),
-            &dir_path,
+            dir_path.path(),
             &[base_addr..(base_addr + 3 * pagesize())],
         )
     }
@@ -173,14 +213,14 @@ fn handle_page_fault_invalid_address() {
 
 #[test]
 fn handle_page_fault_duplicated_page_fault() {
-    let dir_path = tempfile::tempdir().unwrap().into_path();
+    let dir_path = tempfile::tempdir().unwrap();
     let mmap = MemoryMappingBuilder::new(3 * pagesize()).build().unwrap();
     let uffd: Userfaultfd = create_uffd_for_test();
     let base_addr = mmap.get_ref::<u8>(0).unwrap().as_mut_ptr() as usize;
     let mut page_handler = unsafe {
         PageHandler::register_regions(
             array::from_ref(&uffd),
-            &dir_path,
+            dir_path.path(),
             &[base_addr..(base_addr + 3 * pagesize())],
         )
     }
@@ -202,14 +242,14 @@ fn handle_page_fault_duplicated_page_fault() {
 
 #[test]
 fn handle_page_remove_success() {
-    let dir_path = tempfile::tempdir().unwrap().into_path();
+    let dir_path = tempfile::tempdir().unwrap();
     let mmap = MemoryMappingBuilder::new(3 * pagesize()).build().unwrap();
     let uffd: Userfaultfd = create_uffd_for_test();
     let base_addr = mmap.get_ref::<u8>(0).unwrap().as_mut_ptr() as usize;
     let mut page_handler = unsafe {
         PageHandler::register_regions(
             array::from_ref(&uffd),
-            &dir_path,
+            dir_path.path(),
             &[base_addr..(base_addr + 3 * pagesize())],
         )
     }
@@ -254,14 +294,14 @@ fn handle_page_remove_success() {
 
 #[test]
 fn handle_page_remove_invalid_address() {
-    let dir_path = tempfile::tempdir().unwrap().into_path();
+    let dir_path = tempfile::tempdir().unwrap();
     let mmap = MemoryMappingBuilder::new(3 * pagesize()).build().unwrap();
     let uffd: Userfaultfd = create_uffd_for_test();
     let base_addr = mmap.get_ref::<u8>(0).unwrap().as_mut_ptr() as usize;
     let mut page_handler = unsafe {
         PageHandler::register_regions(
             array::from_ref(&uffd),
-            &dir_path,
+            dir_path.path(),
             &[base_addr..(base_addr + 3 * pagesize())],
         )
     }
@@ -306,7 +346,7 @@ fn handle_page_remove_invalid_address() {
 #[test]
 fn swap_out_success() {
     let uffd: Userfaultfd = create_uffd_for_test();
-    let dir_path = tempfile::tempdir().unwrap().into_path();
+    let dir_path = tempfile::tempdir().unwrap();
     let shm1 = SharedMemory::new("shm1", 3 * pagesize() as u64).unwrap();
     let mmap1 = MemoryMappingBuilder::new(3 * pagesize())
         .from_shared_memory(&shm1)
@@ -322,7 +362,7 @@ fn swap_out_success() {
     let mut page_handler = unsafe {
         PageHandler::register_regions(
             array::from_ref(&uffd),
-            &dir_path,
+            dir_path.path(),
             &[
                 base_addr1..(base_addr1 + 3 * pagesize()),
                 base_addr2..(base_addr2 + 3 * pagesize()),
@@ -415,7 +455,7 @@ fn swap_out_success() {
 #[test]
 fn swap_out_twice() {
     let uffd: Userfaultfd = create_uffd_for_test();
-    let dir_path = tempfile::tempdir().unwrap().into_path();
+    let dir_path = tempfile::tempdir().unwrap();
     let shm1 = SharedMemory::new("shm1", 3 * pagesize() as u64).unwrap();
     let mmap1 = MemoryMappingBuilder::new(3 * pagesize())
         .from_shared_memory(&shm1)
@@ -431,7 +471,7 @@ fn swap_out_twice() {
     let mut page_handler = unsafe {
         PageHandler::register_regions(
             array::from_ref(&uffd),
-            &dir_path,
+            dir_path.path(),
             &[
                 base_addr1..(base_addr1 + 3 * pagesize()),
                 base_addr2..(base_addr2 + 3 * pagesize()),
@@ -546,7 +586,7 @@ fn swap_out_twice() {
 #[test]
 fn swap_out_invalid_base_addr() {
     let uffd: Userfaultfd = create_uffd_for_test();
-    let dir_path = tempfile::tempdir().unwrap().into_path();
+    let dir_path = tempfile::tempdir().unwrap();
     let shm = SharedMemory::new("shm1", 3 * pagesize() as u64).unwrap();
     let mmap = MemoryMappingBuilder::new(3 * pagesize())
         .from_shared_memory(&shm)
@@ -556,7 +596,7 @@ fn swap_out_invalid_base_addr() {
     let mut page_handler = unsafe {
         PageHandler::register_regions(
             array::from_ref(&uffd),
-            &dir_path,
+            dir_path.path(),
             &[base_addr..(base_addr + 3 * pagesize())],
         )
     }
