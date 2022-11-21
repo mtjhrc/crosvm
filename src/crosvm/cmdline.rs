@@ -88,6 +88,7 @@ use crate::crosvm::config::parse_userspace_msr_options;
 use crate::crosvm::config::BatteryConfig;
 #[cfg(feature = "plugin")]
 use crate::crosvm::config::BindMount;
+use crate::crosvm::config::CpuOptions;
 #[cfg(feature = "direct")]
 use crate::crosvm::config::DirectIoOption;
 use crate::crosvm::config::Executable;
@@ -97,6 +98,7 @@ use crate::crosvm::config::GidMap;
 #[cfg(feature = "direct")]
 use crate::crosvm::config::HostPcieRootPortParameters;
 use crate::crosvm::config::HypervisorKind;
+use crate::crosvm::config::MemOptions;
 use crate::crosvm::config::TouchDeviceOption;
 use crate::crosvm::config::VhostUserFsOption;
 use crate::crosvm::config::VhostUserOption;
@@ -846,10 +848,11 @@ pub struct RunCommand {
     pub cpu_cluster: Vec<Vec<usize>>,
 
     #[argh(option, short = 'c')]
-    #[serde(skip)] // TODO(b/255223604)
     #[merge(strategy = overwrite_option)]
-    /// number of VCPUs. (default: 1)
-    pub cpus: Option<usize>,
+    /// cpu parameters.
+    /// Possible key values:
+    ///     num-cores=NUM - number of VCPUs. (default: 1)
+    pub cpus: Option<CpuOptions>,
 
     #[cfg(feature = "crash-report")]
     #[argh(option, arg_name = "\\\\.\\pipe\\PIPE_NAME")]
@@ -1198,10 +1201,11 @@ pub struct RunCommand {
     pub mac_address: Option<net_util::MacAddress>,
 
     #[argh(option, short = 'm', arg_name = "N")]
-    #[serde(skip)] // TODO(b/255223604)
     #[merge(strategy = overwrite_option)]
-    /// amount of guest memory in MiB. (default: 256)
-    pub mem: Option<u64>,
+    /// memory parameters.
+    /// Possible key values:
+    ///     size=NUM - amount of guest memory in MiB. (default: 256)
+    pub mem: Option<MemOptions>,
 
     #[argh(option, from_str_fn(parse_mmio_address_range))]
     #[serde(skip)] // TODO(b/255223604)
@@ -2079,7 +2083,8 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         cfg.per_vm_core_scheduling = cmd.per_vm_core_scheduling;
 
-        cfg.vcpu_count = cmd.cpus;
+        let cpus = cmd.cpus.unwrap_or_default();
+        cfg.vcpu_count = cpus.num_cores;
 
         cfg.vcpu_affinity = cmd.cpu_affinity;
 
@@ -2099,7 +2104,8 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         cfg.delay_rt = cmd.delay_rt;
 
-        cfg.memory = cmd.mem;
+        let mem = cmd.mem.unwrap_or_default();
+        cfg.memory = mem.size;
 
         #[cfg(target_arch = "aarch64")]
         {
