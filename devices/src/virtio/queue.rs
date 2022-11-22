@@ -628,6 +628,11 @@ impl Queue {
             return None;
         }
 
+        // This fence ensures that subsequent reads from the descriptor do not
+        // get reordered and happen only after fetching the available_index and
+        // checking that there is a slot available.
+        fence(Ordering::SeqCst);
+
         let desc_idx_addr_offset = 4 + (u64::from(self.next_avail.0 % queue_size) * 2);
         let desc_idx_addr = self.avail_ring.checked_add(desc_idx_addr_offset)?;
 

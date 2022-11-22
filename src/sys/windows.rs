@@ -82,9 +82,13 @@ use devices::tsc::standard_deviation;
 use devices::tsc::TscSyncMitigations;
 use devices::virtio;
 use devices::virtio::block::block::DiskOption;
+#[cfg(feature = "gpu")]
+use devices::virtio::vhost::user::device::gpu::sys::windows::GpuVmmConfig;
 #[cfg(feature = "balloon")]
 use devices::virtio::BalloonMode;
 use devices::virtio::Console;
+#[cfg(feature = "gpu")]
+use devices::virtio::GpuParameters;
 #[cfg(feature = "slirp")]
 use devices::virtio::NetExt;
 #[cfg(feature = "pvclock")]
@@ -275,30 +279,33 @@ fn create_block_device(cfg: &Config, disk: &DiskOption, disk_device_tube: Tube) 
 }
 
 #[cfg(feature = "gpu")]
+fn create_vhost_user_gpu_device(base_features: u64, vhost_user_tube: Tube) -> DeviceResult {
+    let dev =
+        virtio::vhost::user::vmm::VhostUserVirtioDevice::new_gpu(base_features, vhost_user_tube)
+            .exit_context(
+                Exit::VhostUserGpuDeviceNew,
+                "failed to set up vhost-user gpu device",
+            )?;
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        jail: None,
+    })
+}
+
+#[cfg(feature = "gpu")]
 fn create_gpu_device(
     cfg: &Config,
+    gpu_parameters: &GpuParameters,
     vm_evt_wrtube: &SendTube,
-    gpu_device_tube: Tube,
     resource_bridges: Vec<Tube>,
     event_devices: Vec<EventDevice>,
-    #[cfg(feature = "kiwi")] gpu_device_service_tube: Tube,
 ) -> DeviceResult {
-    let gpu_parameters = cfg
-        .gpu_parameters
-        .as_ref()
-        .expect("No GPU parameters provided in config!");
     let display_backends = vec![virtio::DisplayBackend::WinApi(
         (&gpu_parameters.display_params[0]).into(),
     )];
-    let wndproc_thread = virtio::gpu::start_wndproc_thread(
-        #[cfg(feature = "kiwi")]
-        gpu_parameters.display_params[0]
-            .gpu_main_display_tube
-            .clone(),
-        #[cfg(not(feature = "kiwi"))]
-        None,
-    )
-    .expect("Failed to start wndproc_thread!");
+    let wndproc_thread =
+        virtio::gpu::start_wndproc_thread(None).expect("Failed to start wndproc_thread!");
 
     let features = virtio::base_features(cfg.protection_type);
     let dev = virtio::Gpu::new(
@@ -312,8 +319,6 @@ fn create_gpu_device(
         /* external_blob= */ false,
         features,
         BTreeMap::new(),
-        #[cfg(feature = "kiwi")]
-        Some(gpu_device_service_tube),
         wndproc_thread,
     );
 
@@ -462,14 +467,13 @@ fn create_vsock_device(cfg: &Config) -> DeviceResult {
 fn create_virtio_devices(
     cfg: &mut Config,
     vm_evt_wrtube: &SendTube,
-    gpu_device_tube: Tube,
+    #[allow(clippy::ptr_arg)] control_tubes: &mut Vec<TaggedControlTube>,
     disk_device_tubes: &mut Vec<Tube>,
     _balloon_device_tube: Option<Tube>,
     pvclock_device_tube: Option<Tube>,
     _dynamic_mapping_device_tube: Option<Tube>,
     _inflate_tube: Option<Tube>,
     _init_balloon_size: u64,
-    #[cfg(feature = "kiwi")] gpu_device_service_tube: Tube,
     tsc_frequency: u64,
 ) -> DeviceResult<Vec<VirtioDeviceStub>> {
     let mut devs = Vec::new();
@@ -536,59 +540,72 @@ fn create_virtio_devices(
     #[cfg(feature = "gpu")]
     {
         let resource_bridges = Vec::<Tube>::new();
-        let mut event_devices: Vec<EventDevice> = Vec::new();
 
         if !cfg.virtio_single_touch.is_empty() {
             unimplemented!("--single-touch is no longer supported. Use --multi-touch instead.");
         }
 
-        for (idx, multi_touch_spec) in cfg.virtio_multi_touch.iter().enumerate() {
-            let (event_device_pipe, virtio_input_pipe) =
-                StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
-                    .exit_context(Exit::EventDeviceSetup, "failed to set up EventDevice")?;
+        let mut gpu_vmm_config = cfg
+            .gpu_vmm_config
+            .take()
+            .expect("GPU VMM config should be set");
 
+        // Iterate event devices, create the VMM end.
+        for (idx, pipe) in gpu_vmm_config
+            .input_event_multi_touch_pipes
+            .drain(..)
+            .enumerate()
+        {
             devs.push(create_multi_touch_device(
                 cfg,
-                multi_touch_spec,
-                virtio_input_pipe,
+                &cfg.virtio_multi_touch[idx],
+                pipe,
                 idx as u32,
             )?);
-            event_devices.push(EventDevice::touchscreen(event_device_pipe));
         }
 
-        for (idx, _mouse_socket) in cfg.virtio_mice.iter().enumerate() {
-            let (event_device_pipe, virtio_input_pipe) =
-                StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
-                    .exit_context(Exit::EventDeviceSetup, "failed to set up EventDevice")?;
-            devs.push(create_mouse_device(cfg, virtio_input_pipe, idx as u32)?);
-            event_devices.push(EventDevice::mouse(event_device_pipe));
+        for (idx, pipe) in gpu_vmm_config.input_event_mouse_pipes.drain(..).enumerate() {
+            devs.push(create_mouse_device(cfg, pipe, idx as u32)?);
         }
 
-        let (event_device_pipe, virtio_input_pipe) =
-            StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
-                .exit_context(Exit::EventDeviceSetup, "failed to set up EventDevice")?;
-
+        let keyboard_pipe = gpu_vmm_config
+            .input_event_keyboard_pipes
+            .pop()
+            .expect("at least one keyboard should be in GPU VMM config");
         let dev = virtio::new_keyboard(
             /* idx= */ 0,
-            virtio_input_pipe,
+            keyboard_pipe,
             virtio::base_features(cfg.protection_type),
         )
         .exit_context(Exit::InputDeviceNew, "failed to set up input device")?;
+
         devs.push(VirtioDeviceStub {
             dev: Box::new(dev),
             jail: None,
         });
-        event_devices.push(EventDevice::keyboard(event_device_pipe));
 
-        devs.push(create_gpu_device(
-            cfg,
-            vm_evt_wrtube,
-            gpu_device_tube,
-            resource_bridges,
-            event_devices,
-            #[cfg(feature = "kiwi")]
-            gpu_device_service_tube,
-        )?);
+        match cfg.gpu_backend_config.take() {
+            None => {
+                // No backend config present means the backend is running in another process.
+                devs.push(create_vhost_user_gpu_device(
+                    virtio::base_features(cfg.protection_type),
+                    gpu_vmm_config
+                        .main_vhost_user_tube
+                        .take()
+                        .expect("GPU VMM vhost-user tube should be set"),
+                )?);
+            }
+            Some(backend_config) => {
+                // Backend config present, so initialize GPU in this process.
+                devs.push(create_gpu_device(
+                    cfg,
+                    &backend_config.params,
+                    &backend_config.exit_evt_wrtube,
+                    resource_bridges,
+                    backend_config.event_devices,
+                )?);
+            }
+        }
     }
 
     Ok(devs)
@@ -600,7 +617,6 @@ fn create_devices(
     exit_evt_wrtube: &SendTube,
     irq_control_tubes: &mut Vec<Tube>,
     control_tubes: &mut Vec<TaggedControlTube>,
-    gpu_device_tube: Tube,
     disk_device_tubes: &mut Vec<Tube>,
     balloon_device_tube: Option<Tube>,
     pvclock_device_tube: Option<Tube>,
@@ -608,21 +624,18 @@ fn create_devices(
     inflate_tube: Option<Tube>,
     init_balloon_size: u64,
     #[allow(unused)] ac97_device_tubes: Vec<Tube>,
-    #[cfg(feature = "kiwi")] gpu_device_service_tube: Tube,
     tsc_frequency: u64,
 ) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
     let stubs = create_virtio_devices(
         cfg,
         exit_evt_wrtube,
-        gpu_device_tube,
+        control_tubes,
         disk_device_tubes,
         balloon_device_tube,
         pvclock_device_tube,
         dynamic_mapping_device_tube,
         inflate_tube,
         init_balloon_size,
-        #[cfg(feature = "kiwi")]
-        gpu_device_service_tube,
         tsc_frequency,
     )?;
 
@@ -1959,9 +1972,6 @@ where
         disk_host_tubes.push(disk_host_tube);
         disk_device_tubes.push(disk_device_tube);
     }
-    let (gpu_host_tube, gpu_device_tube) =
-        Tube::pair().exit_context(Exit::CreateTube, "failed to create tube")?;
-    control_tubes.push(TaggedControlTube::VmMemory(gpu_host_tube));
 
     if let Some(ioapic_host_tube) = ioapic_host_tube {
         irq_control_tubes.push(ioapic_host_tube);
@@ -1995,37 +2005,18 @@ where
         (None, None)
     };
 
-    #[cfg(feature = "kiwi")]
-    {
-        if cfg.service_pipe_name.is_some() {
-            let (gpu_main_host_tube, gpu_main_display_tube) =
-                Tube::pair().exit_context(Exit::CreateTube, "failed to create tube")?;
-            control_tubes.push(TaggedControlTube::GpuServiceComm(gpu_main_host_tube));
-            let mut gpu_parameters = cfg
-                .gpu_parameters
-                .as_mut()
-                .expect("missing GpuParameters in config");
-            gpu_parameters.display_params.gpu_main_display_tube =
-                Some(Arc::new(Mutex::new(gpu_main_display_tube)));
-        }
-    };
-
-    // Create a ServiceComm tube to pass to the gpu device
-    #[cfg(feature = "kiwi")]
-    let gpu_device_service_tube = {
-        let (gpu_device_service_tube, gpu_device_service_host_tube) =
-            Tube::pair().exit_context(Exit::CreateTube, "failed to create tube")?;
-        control_tubes.push(TaggedControlTube::GpuDeviceServiceComm(
-            gpu_device_service_host_tube,
-        ));
-        gpu_device_service_tube
-    };
-
     let gralloc =
         RutabagaGralloc::new().exit_context(Exit::CreateGralloc, "failed to create gralloc")?;
 
-    let (vm_evt_wrtube, vm_evt_rdtube) =
-        Tube::directional_pair().context("failed to create vm event tube")?;
+    let (vm_evt_wrtube, vm_evt_rdtube) = (
+        cfg.vm_evt_wrtube
+            .take()
+            .expect("vm_evt_wrtube should be set"),
+        cfg.vm_evt_rdtube
+            .take()
+            .expect("vm_evt_rdtube should be set"),
+    );
+
     let pstore_size = components.pstore.as_ref().map(|pstore| pstore.size as u64);
     let mut sys_allocator = SystemAllocator::new(
         Arch::get_system_allocator_config(&vm),
@@ -2088,7 +2079,6 @@ where
         &vm_evt_wrtube,
         &mut irq_control_tubes,
         &mut control_tubes,
-        gpu_device_tube,
         &mut disk_device_tubes,
         balloon_device_tube,
         pvclock_device_tube,
@@ -2096,8 +2086,6 @@ where
         /* inflate_tube= */ None,
         init_balloon_size,
         ac97_host_tubes,
-        #[cfg(feature = "kiwi")]
-        gpu_device_service_tube,
         tsc_state.frequency,
     )?;
 
