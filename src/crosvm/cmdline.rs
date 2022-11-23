@@ -152,6 +152,7 @@ pub enum CrossPlatformCommands {
     Usb(UsbCommand),
     Version(VersionCommand),
     Vfio(VfioCrosvmCommand),
+    Snapshot(SnapshotCommand),
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -597,6 +598,30 @@ impl From<DiskOption> for DiskOptionWithId {
     }
 }
 
+#[derive(FromArgs)]
+#[argh(subcommand, name = "snapshot", description = "Snapshot commands")]
+/// Snapshot commands
+pub struct SnapshotCommand {
+    #[argh(subcommand)]
+    pub snapshot_command: SnapshotSubCommands,
+}
+
+#[derive(FromArgs)]
+#[argh(subcommand, name = "take")]
+/// Take a snapshot of the VM
+pub struct SnapshotTakeCommand {
+    #[argh(positional, arg_name = "VM_SOCKET")]
+    /// VM Socket path
+    pub socket_path: String,
+}
+
+#[derive(FromArgs)]
+#[argh(subcommand)]
+/// Snapshot commands
+pub enum SnapshotSubCommands {
+    Take(SnapshotTakeCommand),
+}
+
 /// Container for GpuParameters that have been fixed after parsing using serde.
 ///
 /// This deserializes as a regular `GpuParameters` and applies validation.
@@ -770,11 +795,11 @@ pub struct RunCommand {
     ///         specified once. (default: false)
     ///     sparse=BOOL - Indicates whether the disk should support
     ///         the discard operation. (default: true)
-    ///     block_size=BYTES - Set the reported block size of the
+    ///     block-size=BYTES - Set the reported block size of the
     ///         disk. (default: 512)
     ///     id=STRING - Set the block device identifier to an ASCII
     ///         string, up to 20 characters. (default: no ID)
-    ///     o_direct=BOOL - Use O_DIRECT mode to bypass page cache.
+    ///     direct=BOOL - Use O_DIRECT mode to bypass page cache.
     ///         (default: false)
     block: Vec<DiskOptionWithId>,
 
@@ -981,11 +1006,6 @@ pub struct RunCommand {
     /// path to an event device node. The device will be grabbed (unusable from the host) and made available to the guest with the same configuration it shows on the host
     pub evdev: Vec<PathBuf>,
 
-    #[argh(positional, arg_name = "KERNEL")]
-    #[merge(strategy = overwrite_option)]
-    /// bzImage of kernel to run
-    pub executable_path: Option<PathBuf>,
-
     #[cfg(windows)]
     #[argh(switch)]
     #[serde(skip)] // TODO(b/255223604)
@@ -1152,6 +1172,11 @@ pub struct RunCommand {
     #[merge(strategy = overwrite_false)]
     /// allow to enable ITMT scheduling feature in VM. The success of enabling depends on HWP and ACPI CPPC support on hardware
     pub itmt: bool,
+
+    #[argh(positional, arg_name = "KERNEL")]
+    #[merge(strategy = overwrite_option)]
+    /// bzImage of kernel to run
+    pub kernel: Option<PathBuf>,
 
     #[cfg(windows)]
     #[argh(option, arg_name = "PATH")]
@@ -2060,7 +2085,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         // TODO: we need to factor out some(?) of the checks into config::validate_config
 
         // Process arguments
-        if let Some(p) = cmd.executable_path {
+        if let Some(p) = cmd.kernel {
             cfg.executable_path = Some(Executable::Kernel(p));
         }
 
