@@ -41,6 +41,8 @@ use devices::virtio::device_constants::video::VideoDeviceConfig;
 use devices::virtio::snd::parameters::Parameters as SndParameters;
 use devices::virtio::vhost::user::device;
 #[cfg(feature = "gpu")]
+use devices::virtio::GpuDisplayParameters;
+#[cfg(feature = "gpu")]
 use devices::virtio::GpuParameters;
 #[cfg(unix)]
 use devices::virtio::NetParameters;
@@ -57,9 +59,9 @@ use resources::AddressRange;
 use serde::Deserialize;
 #[cfg(feature = "gpu")]
 use serde_keyvalue::FromKeyValues;
-#[cfg(feature = "gpu")]
-use vm_control::gpu::DisplayParameters as GpuDisplayParameters;
 
+#[cfg(feature = "gpu")]
+use super::gpu_config::fixup_gpu_display_options;
 #[cfg(feature = "gpu")]
 use super::gpu_config::fixup_gpu_options;
 #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
@@ -487,7 +489,7 @@ pub enum GpuSubCommand {
 pub struct GpuAddDisplaysCommand {
     #[argh(option)]
     /// displays
-    pub gpu_display: Vec<vm_control::gpu::DisplayParameters>,
+    pub gpu_display: Vec<GpuDisplayParameters>,
 
     #[argh(positional, arg_name = "VM_SOCKET")]
     /// VM Socket path
@@ -636,6 +638,24 @@ impl TryFrom<GpuParameters> for FixedGpuParameters {
 
     fn try_from(gpu_params: GpuParameters) -> Result<Self, Self::Error> {
         fixup_gpu_options(gpu_params)
+    }
+}
+
+/// Container for `GpuDisplayParameters` that have been fixed after parsing using serde.
+///
+/// This deserializes as a regular `GpuDisplayParameters` and applies validation.
+/// TODO(b/260101753): Remove this once the old syntax for specifying DPI is deprecated.
+#[cfg(feature = "gpu")]
+#[derive(Debug, Deserialize, FromKeyValues)]
+#[serde(try_from = "GpuDisplayParameters")]
+pub struct FixedGpuDisplayParameters(pub GpuDisplayParameters);
+
+#[cfg(feature = "gpu")]
+impl TryFrom<GpuDisplayParameters> for FixedGpuDisplayParameters {
+    type Error = String;
+
+    fn try_from(gpu_display_params: GpuDisplayParameters) -> Result<Self, Self::Error> {
+        fixup_gpu_display_options(gpu_display_params)
     }
 }
 
@@ -1059,12 +1079,17 @@ pub struct RunCommand {
     /// Possible key values:
     ///     backend=(2d|virglrenderer|gfxstream) - Which backend to
     ///        use for virtio-gpu (determining rendering protocol)
+    ///     displays=[[GpuDisplayParameters]] - The list of virtual
+    ///         displays to create. See the possible key values for
+    ///         GpuDisplayParameters in the section below.
     ///     context-types=LIST - The list of supported context
     ///       types, separated by ':' (default: no contexts enabled)
     ///     width=INT - The width of the virtual display connected
     ///        to the virtio-gpu.
+    ///        Deprecated - use `displays` instead.
     ///     height=INT - The height of the virtual display
     ///        connected to the virtio-gpu.
+    ///        Deprecated - use `displays` instead.
     ///     egl[=true|=false] - If the backend should use a EGL
     ///        context for rendering.
     ///     glx[=true|=false] - If the backend should use a GLX
@@ -1083,15 +1108,8 @@ pub struct RunCommand {
     ///     cache-size=SIZE - The maximum size of the shader cache.
     ///     pci-bar-size=SIZE - The size for the PCI BAR in bytes
     ///        (default 8gb).
-    pub gpu: Vec<FixedGpuParameters>,
-
-    #[cfg(feature = "gpu")]
-    #[argh(option)]
-    #[serde(skip)] // TODO(b/255223604)
-    #[merge(strategy = append)]
-    /// (EXPERIMENTAL) Comma separated key=value pairs for setting
-    /// up a display on the virtio-gpu device
-    /// Possible key values:
+    ///
+    /// Possible key values for GpuDisplayParameters:
     ///     mode=(borderless_full_screen|windowed[width,height]) -
     ///        Whether to show the window on the host in full
     ///        screen or windowed mode. If not specified, windowed
@@ -1102,7 +1120,24 @@ pub struct RunCommand {
     ///        initially hidden (default: false).
     ///     refresh-rate=INT - Force a specific vsync generation
     ///        rate in hertz on the guest (default: 60)
-    pub gpu_display: Vec<GpuDisplayParameters>,
+    ///     dpi=[INT,INT] - The horizontal and vertical DPI of the
+    ///        display (default: [320,320])
+    ///     horizontal-dpi=INT - The horizontal DPI of the display
+    ///        (default: 320)
+    ///        Deprecated - use `dpi` instead.
+    ///     vertical-dpi=INT - The vertical DPI of the display
+    ///        (default: 320)
+    ///        Deprecated - use `dpi` instead.
+    pub gpu: Vec<FixedGpuParameters>,
+
+    #[cfg(feature = "gpu")]
+    #[argh(option)]
+    #[serde(skip)] // TODO(b/255223604). Deprecated - use `gpu` instead.
+    #[merge(strategy = append)]
+    /// (EXPERIMENTAL) Comma separated key=value pairs for setting
+    /// up a display on the virtio-gpu device. See comments for `gpu`
+    /// for possible key values of GpuDisplayParameters.
+    pub gpu_display: Vec<FixedGpuDisplayParameters>,
 
     #[cfg(all(unix, feature = "gpu", feature = "virgl_renderer_next"))]
     #[argh(option)]
@@ -2461,7 +2496,7 @@ impl TryFrom<RunCommand> for super::config::Config {
                 cfg.gpu_parameters
                     .get_or_insert_with(Default::default)
                     .display_params
-                    .extend(cmd.gpu_display);
+                    .extend(cmd.gpu_display.into_iter().map(|p| p.0));
             }
 
             #[cfg(windows)]
