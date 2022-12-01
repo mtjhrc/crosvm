@@ -47,7 +47,6 @@ use devices::Ac97Parameters;
 #[cfg(feature = "direct")]
 use devices::BusRange;
 use devices::PciAddress;
-use devices::PciClassCode;
 use devices::PflashParameters;
 use devices::StubPciParameters;
 use hypervisor::ProtectionType;
@@ -60,7 +59,6 @@ use vm_control::BatteryType;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use x86_64::set_enable_pnp_data_msr_config;
 
-use super::argument::parse_hex_or_decimal;
 pub(crate) use super::sys::HypervisorKind;
 
 cfg_if::cfg_if! {
@@ -569,6 +567,18 @@ impl Default for JailConfig {
     }
 }
 
+fn parse_hex_or_decimal(maybe_hex_string: &str) -> Result<u64, String> {
+    // Parse string starting with 0x as hex and others as numbers.
+    if let Some(hex_string) = maybe_hex_string.strip_prefix("0x") {
+        u64::from_str_radix(hex_string, 16)
+    } else if let Some(hex_string) = maybe_hex_string.strip_prefix("0X") {
+        u64::from_str_radix(hex_string, 16)
+    } else {
+        u64::from_str(maybe_hex_string)
+    }
+    .map_err(|e| format!("invalid numeric value {}: {}", maybe_hex_string, e))
+}
+
 pub fn parse_mmio_address_range(s: &str) -> Result<Vec<AddressRange>, String> {
     s.split(",")
         .map(|s| {
@@ -591,59 +601,40 @@ pub fn parse_mmio_address_range(s: &str) -> Result<Vec<AddressRange>, String> {
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[derive(Deserialize, Serialize, serde_keyvalue::FromKeyValues)]
+#[serde(deny_unknown_fields)]
+struct UserspaceMsrOptions {
+    pub index: u32,
+    #[serde(rename = "type")]
+    pub rw_type: MsrRWType,
+    pub action: MsrAction,
+    #[serde(default = "default_msr_value_from")]
+    pub from: MsrValueFrom,
+    #[serde(default = "default_msr_filter")]
+    pub filter: MsrFilter,
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn default_msr_value_from() -> MsrValueFrom {
+    MsrValueFrom::RWFromRunningCPU
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn default_msr_filter() -> MsrFilter {
+    MsrFilter::Default
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub fn parse_userspace_msr_options(value: &str) -> Result<(u32, MsrConfig), String> {
-    let mut rw_type: Option<MsrRWType> = None;
-    let mut action: Option<MsrAction> = None;
-    let mut from = MsrValueFrom::RWFromRunningCPU;
-    let mut filter = MsrFilter::Default;
-
-    let mut options = super::argument::parse_key_value_options("userspace-msr", value, ',');
-    let index: u32 = options
-        .next()
-        .ok_or(String::from("userspace-msr: expected index"))?
-        .key_numeric()
-        .map_err(|e| e.to_string())?;
-
-    for opt in options {
-        match opt.key() {
-            "type" => match opt.value().map_err(|e| e.to_string())? {
-                "r" => rw_type = Some(MsrRWType::ReadOnly),
-                "w" => rw_type = Some(MsrRWType::WriteOnly),
-                "rw" | "wr" => rw_type = Some(MsrRWType::ReadWrite),
-                _ => {
-                    return Err(String::from("bad type"));
-                }
-            },
-            "action" => match opt.value().map_err(|e| e.to_string())? {
-                "pass" => action = Some(MsrAction::MsrPassthrough),
-                "emu" => action = Some(MsrAction::MsrEmulate),
-                _ => return Err(String::from("bad action")),
-            },
-            "from" => match opt.value().map_err(|e| e.to_string())? {
-                "cpu0" => from = MsrValueFrom::RWFromCPU0,
-                _ => return Err(String::from("bad from")),
-            },
-            "filter" => match opt.value().map_err(|e| e.to_string())? {
-                "yes" => filter = MsrFilter::Override,
-                "no" => filter = MsrFilter::Default,
-                _ => return Err(String::from("bad filter")),
-            },
-
-            _ => return Err(opt.invalid_key_err().to_string()),
-        }
-    }
-
-    let rw_type = rw_type.ok_or(String::from("userspace-msr: type is required"))?;
-
-    let action = action.ok_or(String::from("userspace-msr: action is required"))?;
+    let options: UserspaceMsrOptions = from_key_values(value)?;
 
     Ok((
-        index,
+        options.index,
         MsrConfig {
-            rw_type,
-            action,
-            from,
-            filter,
+            rw_type: options.rw_type,
+            action: options.action,
+            from: options.from,
+            filter: options.filter,
         },
     ))
 }
@@ -1020,58 +1011,6 @@ pub fn parse_direct_io_options(s: &str) -> Result<DirectIoOption, String> {
 
 pub fn executable_is_plugin(executable: &Option<Executable>) -> bool {
     matches!(executable, Some(Executable::Plugin(_)))
-}
-
-pub fn parse_stub_pci_parameters(s: &str) -> Result<StubPciParameters, String> {
-    let mut options = super::argument::parse_key_value_options("stub-pci-device", s, ',');
-    let addr = options
-        .next()
-        .ok_or(String::from("stub-pci-device: expected device address"))?
-        .key();
-    let mut params = StubPciParameters {
-        address: PciAddress::from_str(addr).map_err(|e| {
-            invalid_value_err(
-                addr,
-                format!("stub-pci-device: expected PCI address: {}", e),
-            )
-        })?,
-        vendor_id: 0,
-        device_id: 0,
-        class: PciClassCode::Other,
-        subclass: 0,
-        programming_interface: 0,
-        subsystem_device_id: 0,
-        subsystem_vendor_id: 0,
-        revision_id: 0,
-    };
-    for opt in options {
-        match opt.key() {
-            "vendor" => params.vendor_id = opt.parse_numeric::<u16>().map_err(|e| e.to_string())?,
-            "device" => params.device_id = opt.parse_numeric::<u16>().map_err(|e| e.to_string())?,
-            "class" => {
-                let class = opt.parse_numeric::<u32>().map_err(|e| e.to_string())?;
-                params.class = PciClassCode::try_from((class >> 16) as u8)
-                    .map_err(|_| String::from("Unknown class code"))?;
-                params.subclass = (class >> 8) as u8;
-                params.programming_interface = class as u8;
-            }
-            "multifunction" => {} // Ignore but allow the multifunction option for compatibility.
-            "subsystem_vendor" => {
-                params.subsystem_vendor_id =
-                    opt.parse_numeric::<u16>().map_err(|e| e.to_string())?
-            }
-            "subsystem_device" => {
-                params.subsystem_device_id =
-                    opt.parse_numeric::<u16>().map_err(|e| e.to_string())?
-            }
-            "revision" => {
-                params.revision_id = opt.parse_numeric::<u8>().map_err(|e| e.to_string())?
-            }
-            _ => return Err(opt.invalid_key_err().to_string()),
-        }
-    }
-
-    Ok(params)
 }
 
 pub fn parse_pflash_parameters(s: &str) -> Result<PflashParameters, String> {
@@ -1708,6 +1647,8 @@ fn validate_file_backed_mapping(mapping: &mut FileBackedMappingParameters) -> Re
 #[cfg(test)]
 mod tests {
     use argh::FromArgs;
+    use devices::PciClassCode;
+    use devices::StubPciParameters;
 
     use super::*;
 
@@ -2014,18 +1955,18 @@ mod tests {
 
     #[test]
     fn parse_stub_pci() {
-        let params = parse_stub_pci_parameters("0000:01:02.3,vendor=0xfffe,device=0xfffd,class=0xffc1c2,subsystem_vendor=0xfffc,subsystem_device=0xfffb,revision=0xa").unwrap();
+        let params = from_key_values::<StubPciParameters>("0000:01:02.3,vendor=0xfffe,device=0xfffd,class=0xffc1c2,subsystem_vendor=0xfffc,subsystem_device=0xfffb,revision=0xa").unwrap();
         assert_eq!(params.address.bus, 1);
         assert_eq!(params.address.dev, 2);
         assert_eq!(params.address.func, 3);
-        assert_eq!(params.vendor_id, 0xfffe);
-        assert_eq!(params.device_id, 0xfffd);
-        assert_eq!(params.class as u8, PciClassCode::Other as u8);
-        assert_eq!(params.subclass, 0xc1);
-        assert_eq!(params.programming_interface, 0xc2);
-        assert_eq!(params.subsystem_vendor_id, 0xfffc);
-        assert_eq!(params.subsystem_device_id, 0xfffb);
-        assert_eq!(params.revision_id, 0xa);
+        assert_eq!(params.vendor, 0xfffe);
+        assert_eq!(params.device, 0xfffd);
+        assert_eq!(params.class.class as u8, PciClassCode::Other as u8);
+        assert_eq!(params.class.subclass, 0xc1);
+        assert_eq!(params.class.programming_interface, 0xc2);
+        assert_eq!(params.subsystem_vendor, 0xfffc);
+        assert_eq!(params.subsystem_device, 0xfffb);
+        assert_eq!(params.revision, 0xa);
     }
 
     #[cfg(feature = "direct")]
