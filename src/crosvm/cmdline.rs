@@ -154,6 +154,7 @@ pub enum CrossPlatformCommands {
     Version(VersionCommand),
     Vfio(VfioCrosvmCommand),
     Snapshot(SnapshotCommand),
+    Restore(RestoreCommand),
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -612,6 +613,9 @@ pub struct SnapshotCommand {
 #[argh(subcommand, name = "take")]
 /// Take a snapshot of the VM
 pub struct SnapshotTakeCommand {
+    #[argh(positional, arg_name = "snapshot_path")]
+    /// VM Image path
+    pub snapshot_path: PathBuf,
     #[argh(positional, arg_name = "VM_SOCKET")]
     /// VM Socket path
     pub socket_path: String,
@@ -622,6 +626,32 @@ pub struct SnapshotTakeCommand {
 /// Snapshot commands
 pub enum SnapshotSubCommands {
     Take(SnapshotTakeCommand),
+}
+#[derive(FromArgs)]
+#[argh(subcommand, name = "restore", description = "Restore commands")]
+/// Restore commands
+pub struct RestoreCommand {
+    #[argh(subcommand)]
+    pub restore_command: RestoreSubCommands,
+}
+
+#[derive(FromArgs)]
+#[argh(subcommand, name = "apply")]
+/// Restore VM
+pub struct RestoreApplyCommand {
+    #[argh(positional, arg_name = "restore_path")]
+    /// VM Restore image path
+    pub restore_path: PathBuf,
+    #[argh(positional, arg_name = "VM_SOCKET")]
+    /// VM Socket path
+    pub socket_path: String,
+}
+
+#[derive(FromArgs)]
+#[argh(subcommand)]
+/// Restore commands
+pub enum RestoreSubCommands {
+    Apply(RestoreApplyCommand),
 }
 
 /// Container for GpuParameters that have been fixed after parsing using serde.
@@ -821,6 +851,9 @@ pub struct RunCommand {
     ///         string, up to 20 characters. (default: no ID)
     ///     direct=BOOL - Use O_DIRECT mode to bypass page cache.
     ///         (default: false)
+    ///     async-executor=epoll|uring - set the async executor kind
+    ///         to simulate the block device with. This takes
+    ///         precedence over the global --async-executor option.
     block: Vec<DiskOptionWithId>,
 
     #[cfg(feature = "config-file")]
@@ -888,7 +921,7 @@ pub struct RunCommand {
     pub cpu_capacity: Option<BTreeMap<usize, u32>>, // CPU index -> capacity
 
     #[argh(option, arg_name = "CPUSET")]
-    #[serde(skip)] // TODO(b/255223604)
+    #[serde(skip)] // Deprecated - use `cpu clusters=[...]` instead.
     #[merge(strategy = append)]
     /// group the given CPUs into a cluster (default: no clusters)
     pub cpu_cluster: Vec<CpuSet>,
@@ -898,6 +931,18 @@ pub struct RunCommand {
     /// cpu parameters.
     /// Possible key values:
     ///     num-cores=NUM - number of VCPUs. (default: 1)
+    ///     clusters=[[CLUSTER],...] - CPU clusters (default: None)
+    ///       Each CLUSTER is a set containing a list of CPUs
+    ///       that should belong to the same cluster. Individual
+    ///       CPU ids or ranges can be specified, comma-separated.
+    ///       Examples:
+    ///       clusters=[[0],[1],[2],[3]] - creates 4 clusters, one
+    ///         for each specified core.
+    ///       clusters=[[0-3]] - creates a cluster for cores 0 to 3
+    ///         included.
+    ///       clusters=[[0,2],[1,3],[4-7,12]] - creates one cluster
+    ///         for cores 0 and 2, another one for cores 1 and 3,
+    ///         and one last for cores 4, 5, 6, 7 and 12.
     pub cpus: Option<CpuOptions>,
 
     #[cfg(feature = "crash-report")]
@@ -1557,6 +1602,12 @@ pub struct RunCommand {
     /// enable virtio-pvclock.
     pub pvclock: bool,
 
+    #[argh(option, long = "restore", arg_name = "PATH")]
+    #[serde(skip)] // TODO(b/255223604)
+    #[merge(strategy = overwrite_option)]
+    /// path of the snapshot that is used to restore the VM on startup.
+    pub restore: Option<PathBuf>,
+
     #[argh(option, arg_name = "PATH[,key=value[,key=value[,...]]]", short = 'r')]
     #[serde(skip)] // Deprecated - use `block` instead.
     #[merge(strategy = overwrite_option)]
@@ -2144,12 +2195,25 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         cfg.per_vm_core_scheduling = cmd.per_vm_core_scheduling;
 
-        let cpus = cmd.cpus.unwrap_or_default();
-        cfg.vcpu_count = cpus.num_cores;
+        // `--cpu` parameters.
+        {
+            let cpus = cmd.cpus.unwrap_or_default();
+            cfg.vcpu_count = cpus.num_cores;
+
+            // Only allow deprecated `--cpu-cluster` option only if `--cpu clusters=[...]` is not
+            // used.
+            cfg.cpu_clusters = match (&cpus.clusters.is_empty(), &cmd.cpu_cluster.is_empty()) {
+                (_, true) => cpus.clusters,
+                (true, false) => cmd.cpu_cluster,
+                (false, false) => {
+                    return Err(
+                        "cannot specify both --cpu clusters=[...] and --cpu_cluster".to_string()
+                    )
+                }
+            };
+        }
 
         cfg.vcpu_affinity = cmd.cpu_affinity;
-
-        cfg.cpu_clusters = cmd.cpu_cluster;
 
         if let Some(capacity) = cmd.cpu_capacity {
             cfg.cpu_capacity = capacity;
@@ -2365,6 +2429,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         cfg.display_window_mouse = cmd.display_window_mouse;
 
         cfg.swap_dir = cmd.swap_dir;
+        cfg.restore_path = cmd.restore;
 
         if let Some(mut socket_path) = cmd.socket {
             if socket_path.is_dir() {

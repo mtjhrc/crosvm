@@ -70,6 +70,7 @@ use vm_control::BalloonControlCommand;
 use vm_control::DiskControlCommand;
 use vm_control::HotPlugDeviceInfo;
 use vm_control::HotPlugDeviceType;
+use vm_control::RestoreCommand;
 use vm_control::SnapshotCommand;
 use vm_control::SwapCommand;
 use vm_control::UsbControlResult;
@@ -530,8 +531,25 @@ fn snapshot_vm(cmd: cmdline::SnapshotCommand) -> std::result::Result<(), ()> {
     use cmdline::SnapshotSubCommands::*;
     let (socket_path, request) = match cmd.snapshot_command {
         Take(path) => {
-            let req = VmRequest::Snapshot(SnapshotCommand::Take);
+            let req = VmRequest::Snapshot(SnapshotCommand::Take {
+                snapshot_path: path.snapshot_path,
+            });
             (path.socket_path, req)
+        }
+    };
+    let socket_path = Path::new(&socket_path);
+    vms_request(&request, socket_path)
+}
+
+fn restore_vm(cmd: cmdline::RestoreCommand) -> std::result::Result<(), ()> {
+    use cmdline::RestoreSubCommands::*;
+    let (socket_path, request) = match cmd.restore_command {
+        Apply(cmd) => {
+            let file_path = cmd.restore_path;
+            let req = VmRequest::Restore(RestoreCommand::Apply {
+                restore_path: file_path,
+            });
+            (cmd.socket_path, req)
         }
     };
     let socket_path = Path::new(&socket_path);
@@ -715,6 +733,9 @@ fn crosvm_main<I: IntoIterator<Item = String>>(args: I) -> Result<CommandStatus>
                     }
                     CrossPlatformCommands::Snapshot(cmd) => {
                         snapshot_vm(cmd).map_err(|_| anyhow!("snapshot subcommand failed"))
+                    }
+                    CrossPlatformCommands::Restore(cmd) => {
+                        restore_vm(cmd).map_err(|_| anyhow!("restore subcommand failed"))
                     }
                 }
                 .map(|_| CommandStatus::SuccessOrVmStop)

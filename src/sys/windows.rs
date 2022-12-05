@@ -28,6 +28,7 @@ use std::mem;
 #[cfg(feature = "gpu")]
 use std::num::NonZeroU8;
 use std::os::windows::fs::OpenOptionsExt;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
@@ -75,6 +76,7 @@ use broker_ipc::CommonChildStartupArgs;
 use crosvm_cli::sys::windows::exit::Exit;
 use crosvm_cli::sys::windows::exit::ExitContext;
 use crosvm_cli::sys::windows::exit::ExitContextAnyhow;
+use devices::create_devices_worker_thread;
 use devices::serial_device::SerialHardware;
 use devices::serial_device::SerialParameters;
 use devices::tsc::get_tsc_sync_mitigations;
@@ -180,6 +182,7 @@ use tube_transporter::TubeTransporterReader;
 use vm_control::Ac97Control;
 #[cfg(feature = "kiwi")]
 use vm_control::BalloonControlCommand;
+use vm_control::DeviceControlCommand;
 #[cfg(feature = "kiwi")]
 use vm_control::GpuSendToMain;
 #[cfg(feature = "kiwi")]
@@ -267,6 +270,7 @@ fn create_block_device(cfg: &Config, disk: &DiskOption, disk_device_tube: Tube) 
         disk.block_size,
         disk.id,
         Some(disk_device_tube),
+        None,
         None,
         None,
     )
@@ -773,6 +777,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     host_cpu_topology: bool,
     tsc_sync_mitigations: TscSyncMitigations,
     force_calibrated_tsc_leaf: bool,
+    restore_path: Option<PathBuf>,
 ) -> Result<ExitState> {
     #[cfg(not(feature = "kiwi"))]
     {
@@ -891,6 +896,25 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             // TODO(nkgold): as new control tubes are added, we'll need to add support for them
             _ => (),
         }
+    }
+
+    let (device_ctrl_tube, device_ctrl_resp) = Tube::pair().context("failed to create tube")?;
+    guest_os.devices_thread = match create_devices_worker_thread(
+        guest_os.io_bus.clone(),
+        guest_os.mmio_bus.clone(),
+        device_ctrl_resp,
+    ) {
+        Ok(join_handle) => Some(join_handle),
+        Err(e) => {
+            return Err(anyhow!("Failed to start devices thread: {}", e));
+        }
+    };
+    if let Some(path) = restore_path {
+        if let Err(e) =
+            device_ctrl_tube.send(&DeviceControlCommand::RestoreDevices { restore_path: path })
+        {
+            error!("fail to send command to devices control socket: {}", e);
+        };
     }
 
     let vcpus: Vec<Option<_>> = match guest_os.vcpus.take() {
@@ -2135,6 +2159,7 @@ where
         cfg.host_cpu_topology,
         tsc_sync_mitigations,
         cfg.force_calibrated_tsc_leaf,
+        cfg.restore_path,
     )
 }
 
