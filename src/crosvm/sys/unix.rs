@@ -3079,7 +3079,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
 /// Returns the pid of the jailed device process.
 fn jail_and_start_vu_device<T: VirtioDeviceBuilder>(
     jail_config: &Option<JailConfig>,
-    params: &T,
+    params: T,
     vhost: &str,
     name: &str,
 ) -> anyhow::Result<(libc::pid_t, Option<Box<dyn std::any::Any>>)> {
@@ -3087,19 +3087,7 @@ fn jail_and_start_vu_device<T: VirtioDeviceBuilder>(
 
     base::syslog::push_descriptors(&mut keep_rds);
 
-    // Create the device in the parent process, so the child does not need any privileges necessary
-    // to do it (only runtime capabilities are required).
-    let device = params
-        .create_vhost_user_device(&mut keep_rds)
-        .context("failed to create vhost-user backend")?;
-    let mut listener = VhostUserListener::new(vhost, device.max_queue_num(), Some(&mut keep_rds))
-        .context("failed to create the vhost listener")?;
-    let parent_resources = listener.take_parent_process_resources();
-
-    let jail_type = match &listener {
-        VhostUserListener::Socket(_) => VirtioDeviceType::VhostUser,
-        VhostUserListener::Vvu(_, _) => VirtioDeviceType::Vvu,
-    };
+    let jail_type = VhostUserListener::get_virtio_transport_type(vhost);
 
     // Create a jail from the configuration. If the configuration is `None`, `create_jail` will also
     // return `None` so fall back to an empty (i.e. non-constrained) Minijail.
@@ -3109,6 +3097,15 @@ fn jail_and_start_vu_device<T: VirtioDeviceBuilder>(
         .ok_or(())
         .or_else(|_| Minijail::new())
         .with_context(|| format!("failed to create empty jail for {}", name))?;
+
+    // Create the device in the parent process, so the child does not need any privileges necessary
+    // to do it (only runtime capabilities are required).
+    let device = params
+        .create_vhost_user_device(&mut keep_rds)
+        .context("failed to create vhost-user device")?;
+    let mut listener = VhostUserListener::new(vhost, device.max_queue_num(), Some(&mut keep_rds))
+        .context("failed to create the vhost listener")?;
+    let parent_resources = listener.take_parent_process_resources();
 
     let tz = std::env::var("TZ").unwrap_or_default();
 
@@ -3218,7 +3215,7 @@ pub fn start_devices(opts: DevicesCommand) -> anyhow::Result<()> {
 
     fn add_device<T: VirtioDeviceBuilder>(
         i: usize,
-        device_params: &T,
+        device_params: T,
         vhost: &str,
         jail_config: &Option<JailConfig>,
         devices_jails: &mut BTreeMap<libc::pid_t, DeviceJailInfo>,
@@ -3272,7 +3269,7 @@ pub fn start_devices(opts: DevicesCommand) -> anyhow::Result<()> {
             None
         };
         let disk_config = DiskConfig::new(&params.device, tube);
-        add_device(i, &disk_config, &params.vhost, &jail, &mut devices_jails)?;
+        add_device(i, disk_config, &params.vhost, &jail, &mut devices_jails)?;
     }
 
     let ex = Executor::new()?;
