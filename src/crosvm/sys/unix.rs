@@ -174,7 +174,7 @@ use crate::crosvm::config::SharedDirKind;
 use crate::crosvm::gdb::gdb_thread;
 #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "gdb"))]
 use crate::crosvm::gdb::GdbStub;
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), unix))]
 use crate::crosvm::ratelimit::Ratelimit;
 use crate::crosvm::sys::cmdline::DevicesCommand;
 use crate::crosvm::sys::config::VfioType;
@@ -804,14 +804,12 @@ fn create_devices(
             let res = unsafe { libc::getrlimit64(libc::RLIMIT_MEMLOCK, buf.as_mut_ptr()) };
             if res == 0 {
                 let limit = unsafe { buf.assume_init() };
-                let rlim_new = limit
-                    .rlim_cur
-                    .saturating_add(vm.get_memory().memory_size() as libc::rlim64_t);
+                let rlim_new = limit.rlim_cur.saturating_add(vm.get_memory().memory_size());
                 let rlim_max = max(limit.rlim_max, rlim_new);
                 if limit.rlim_cur < rlim_new {
                     let limit_arg = libc::rlimit64 {
-                        rlim_cur: rlim_new as libc::rlim64_t,
-                        rlim_max: rlim_max as libc::rlim64_t,
+                        rlim_cur: rlim_new,
+                        rlim_max,
                     };
                     let res = unsafe { libc::setrlimit64(libc::RLIMIT_MEMLOCK, &limit_arg) };
                     if res != 0 {
@@ -2474,9 +2472,9 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             Some(f)
         }
     };
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), unix))]
     let bus_lock_ratelimit_ctrl: Arc<Mutex<Ratelimit>> = Arc::new(Mutex::new(Ratelimit::new()));
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), unix))]
     if cfg.bus_lock_ratelimit > 0 {
         let bus_lock_ratelimit = cfg.bus_lock_ratelimit;
         if linux.vm.check_capability(VmCap::BusLockDetect) {
@@ -2520,7 +2518,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             cfg.no_smt,
             cfg.itmt,
         ));
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), unix))]
         let bus_lock_ratelimit_ctrl = Arc::clone(&bus_lock_ratelimit_ctrl);
 
         #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
@@ -2564,7 +2562,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             },
             cfg.userspace_msr.clone(),
             guest_suspended_cvar.clone(),
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), unix))]
             bus_lock_ratelimit_ctrl,
         )?;
         vcpu_handles.push((handle, to_vcpu_channel));
