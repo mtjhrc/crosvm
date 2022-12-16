@@ -105,6 +105,14 @@ pub mod block {
     unsafe impl DataInit for virtio_blk_discard_write_zeroes {}
 }
 
+pub mod fs {
+    /// The maximum allowable length of the tag used to identify a specific virtio-fs device.
+    pub const FS_MAX_TAG_LEN: usize = 36;
+
+    // The fs device does not have a fixed number of queues.
+    pub const QUEUE_SIZE: u16 = 1024;
+}
+
 pub mod gpu {
     use super::*;
 
@@ -258,4 +266,13 @@ pub mod vsock {
     pub const QUEUE_SIZE: u16 = 256;
     pub const NUM_QUEUES: usize = 3;
     pub const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE; NUM_QUEUES];
+}
+
+pub mod wl {
+    pub const QUEUE_SIZE: u16 = 256;
+    pub const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE, QUEUE_SIZE];
+
+    pub const VIRTIO_WL_F_TRANS_FLAGS: u32 = 0x01;
+    pub const VIRTIO_WL_F_SEND_FENCES: u32 = 0x02;
+    pub const VIRTIO_WL_F_USE_SHMEM: u32 = 0x03;
 }
