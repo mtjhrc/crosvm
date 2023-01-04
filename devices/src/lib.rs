@@ -55,6 +55,7 @@ use base::Tube;
 use base::TubeError;
 use cros_async::AsyncTube;
 use cros_async::Executor;
+use sync::Mutex;
 use vm_control::DeviceControlCommand;
 use vm_control::RestoreControlResult;
 use vm_control::SnapshotControlResult;
@@ -176,6 +177,7 @@ cfg_if::cfg_if! {
 use serde::Deserialize;
 /// Request CoIOMMU to unpin a specific range.
 use serde::Serialize;
+use serde::Serializer;
 #[derive(Serialize, Deserialize, Debug)]
 pub struct UnpinRequest {
     /// The ranges presents (start gfn, count).
@@ -212,6 +214,18 @@ impl FromStr for IommuDevType {
             _ => Err(ParseIommuDevTypeResult::NoSuchType),
         }
     }
+}
+
+fn serialize_arc_mutex<S, T: ?Sized>(
+    item: &Arc<Mutex<T>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    T: Serialize,
+{
+    let lock = item.lock();
+    serde::Serialize::serialize(&*lock, serializer)
 }
 
 // Thread that handles commands sent to devices - such as snapshot, sleep, suspend
@@ -373,7 +387,10 @@ async fn restore_handler(path: &std::path::Path, buses: &[&Bus]) -> anyhow::Resu
         wake_devices(bus);
     }
     for (key, _) in devices_map.iter().filter(|(_, v)| !v.is_empty()) {
-        info!("Device with device_id: {} did was not restored due to an error or the device might be missing.", key);
+        info!(
+            "Unused restore data for device_id {}, device might be missing.",
+            key
+        );
     }
 
     Ok(())
