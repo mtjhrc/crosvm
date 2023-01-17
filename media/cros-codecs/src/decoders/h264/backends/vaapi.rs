@@ -11,6 +11,7 @@ use anyhow::anyhow;
 use anyhow::Context as AnyhowContext;
 use anyhow::Result;
 use libva::BufferType;
+use libva::Display;
 use libva::IQMatrix;
 use libva::IQMatrixBufferH264;
 use libva::Picture as VaPicture;
@@ -22,11 +23,11 @@ use libva::SliceParameter;
 use libva::UsageHint;
 use log::debug;
 
-use crate::decoders::h264::backends::stateless::BlockingMode;
-use crate::decoders::h264::backends::stateless::ContainedPicture;
-use crate::decoders::h264::backends::stateless::DecodedHandle;
-use crate::decoders::h264::backends::stateless::Result as StatelessBackendResult;
-use crate::decoders::h264::backends::stateless::StatelessDecoderBackend;
+use crate::decoders::h264::backends::BlockingMode;
+use crate::decoders::h264::backends::ContainedPicture;
+use crate::decoders::h264::backends::DecodedHandle;
+use crate::decoders::h264::backends::Result as StatelessBackendResult;
+use crate::decoders::h264::backends::StatelessDecoderBackend;
 use crate::decoders::h264::decoder::Decoder;
 use crate::decoders::h264::decoder::Profile;
 use crate::decoders::h264::dpb::Dpb;
@@ -44,6 +45,7 @@ use crate::utils;
 use crate::utils::vaapi::DecodedHandle as VADecodedHandle;
 use crate::utils::vaapi::FormatMap;
 use crate::utils::vaapi::GenericBackendHandle;
+use crate::utils::vaapi::NegotiationStatus;
 use crate::utils::vaapi::StreamMetadataState;
 use crate::utils::vaapi::SurfacePoolHandle;
 use crate::DecodedFormat;
@@ -51,20 +53,6 @@ use crate::Resolution;
 
 /// Resolves to the type used as Handle by the backend.
 type AssociatedHandle = <Backend as StatelessDecoderBackend>::Handle;
-
-/// Keeps track of where the backend is in the negotiation process.
-#[derive(Clone, Debug)]
-enum NegotiationStatus {
-    NonNegotiated,
-    Possible { sps: Box<Sps>, dpb_size: usize },
-    Negotiated,
-}
-
-impl Default for NegotiationStatus {
-    fn default() -> Self {
-        NegotiationStatus::NonNegotiated
-    }
-}
 
 #[cfg(test)]
 #[derive(Default)]
@@ -108,7 +96,7 @@ struct PendingJob<BackendHandle> {
 }
 
 /// H.264 stateless decoder backend for VA-API.
-pub struct Backend {
+struct Backend {
     /// The metadata state. Updated whenever the decoder reads new data from the stream.
     metadata_state: StreamMetadataState,
     /// The current picture being worked on.
@@ -119,8 +107,8 @@ pub struct Backend {
     image_formats: Rc<Vec<libva::VAImageFormat>>,
     /// The number of allocated surfaces.
     num_allocated_surfaces: usize,
-    /// The negotiation status
-    negotiation_status: NegotiationStatus,
+    /// The negotiation status. First member is the Sps, second is the size of the DPB.
+    negotiation_status: NegotiationStatus<Box<(Sps, usize)>>,
 
     #[cfg(test)]
     /// Test params. Saves the metadata sent to VA-API for the purposes of
@@ -130,7 +118,7 @@ pub struct Backend {
 
 impl Backend {
     /// Creates a new codec backend for H.264.
-    pub fn new(display: Rc<libva::Display>) -> Result<Self> {
+    fn new(display: Rc<libva::Display>) -> Result<Self> {
         let image_formats = Rc::new(display.query_image_formats()?);
 
         Ok(Self {
@@ -661,7 +649,7 @@ impl VideoDecoderBackend for Backend {
 
     fn try_format(&mut self, format: DecodedFormat) -> DecoderResult<()> {
         let (sps, dpb_size) = match &self.negotiation_status {
-            NegotiationStatus::Possible { sps, dpb_size } => (sps, dpb_size),
+            NegotiationStatus::Possible(b) => (&b.0, b.1),
             _ => {
                 return Err(DecoderError::StatelessBackendError(
                     StatelessBackendError::NegotiationFailed(anyhow!(
@@ -681,7 +669,6 @@ impl VideoDecoderBackend for Backend {
                 .unwrap();
 
             let sps = sps.clone();
-            let dpb_size = *dpb_size;
             self.open(&sps, dpb_size, Some(map_format))?;
 
             Ok(())
@@ -725,10 +712,7 @@ impl StatelessDecoderBackend for Backend {
     type Handle = VADecodedHandle<H264Picture<GenericBackendHandle>>;
 
     fn new_sequence(&mut self, sps: &Sps, dpb_size: usize) -> StatelessBackendResult<()> {
-        self.negotiation_status = NegotiationStatus::Possible {
-            sps: Box::new(sps.clone()),
-            dpb_size,
-        };
+        self.negotiation_status = NegotiationStatus::Possible(Box::new((sps.clone(), dpb_size)));
 
         self.open(sps, dpb_size, None)
             .map_err(StatelessBackendError::Other)
@@ -968,14 +952,6 @@ impl StatelessDecoderBackend for Backend {
         }
     }
 
-    fn as_video_decoder_backend_mut(&mut self) -> &mut dyn VideoDecoderBackend {
-        self
-    }
-
-    fn as_video_decoder_backend(&self) -> &dyn VideoDecoderBackend {
-        self
-    }
-
     fn block_on_handle(&mut self, handle: &Self::Handle) -> StatelessBackendResult<()> {
         for i in 0..self.pending_jobs.len() {
             // Remove from the queue in order.
@@ -1004,31 +980,42 @@ impl StatelessDecoderBackend for Backend {
             "Asked to block on a pending job that doesn't exist"
         )))
     }
+
+    #[cfg(test)]
+    fn get_test_params(&self) -> &dyn std::any::Any {
+        &self.test_params
+    }
+}
+
+impl Decoder<VADecodedHandle<H264Picture<GenericBackendHandle>>> {
+    // Creates a new instance of the decoder using the VAAPI backend.
+    pub fn new_vaapi(display: Rc<Display>, blocking_mode: BlockingMode) -> Result<Self> {
+        Self::new(Box::new(Backend::new(display)?), blocking_mode)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::rc::Rc;
 
     use libva::Display;
 
-    use crate::decoders::h264::backends;
-    use crate::decoders::h264::backends::stateless::vaapi::AssociatedHandle;
-    use crate::decoders::h264::backends::stateless::vaapi::Backend;
-    use crate::decoders::h264::backends::stateless::BlockingMode;
-    use crate::decoders::h264::backends::stateless::DecodedHandle;
-    use crate::decoders::h264::backends::stateless::StatelessDecoderBackend;
+    use crate::decoders::h264::backends::vaapi::AssociatedHandle;
+    use crate::decoders::h264::backends::vaapi::TestParams;
+    use crate::decoders::h264::backends::BlockingMode;
+    use crate::decoders::h264::backends::DecodedHandle;
+    use crate::decoders::h264::backends::StatelessDecoderBackend;
     use crate::decoders::h264::decoder::tests::process_ready_frames;
     use crate::decoders::h264::decoder::tests::run_decoding_loop;
     use crate::decoders::h264::decoder::Decoder;
     use crate::decoders::DynPicture;
 
-    fn as_vaapi_backend(
+    fn get_test_params(
         backend: &dyn StatelessDecoderBackend<Handle = AssociatedHandle>,
-    ) -> &backends::stateless::vaapi::Backend {
+    ) -> &TestParams {
         backend
-            .downcast_ref::<backends::stateless::vaapi::Backend>()
+            .get_test_params()
+            .downcast_ref::<TestParams>()
             .unwrap()
     }
 
@@ -1071,15 +1058,13 @@ mod tests {
         /// h264::decoders::tests::test_16x16_progressive_i, but with an actual
         /// backend to test whether the backend specific logic works and the
         /// produced CRCs match their expected values.
-        const TEST_STREAM: &[u8] = include_bytes!("../../test_data/16x16-I.h264");
+        const TEST_STREAM: &[u8] = include_bytes!("../test_data/16x16-I.h264");
         let blocking_modes = [BlockingMode::Blocking, BlockingMode::NonBlocking];
 
         for blocking_mode in blocking_modes {
             let mut frame_num = 0;
-            let display = Rc::new(Display::open().unwrap());
-            let backend = Box::new(Backend::new(Rc::clone(&display)).unwrap());
-
-            let mut decoder = Decoder::new(backend, blocking_mode).unwrap();
+            let display = Display::open().unwrap();
+            let mut decoder = Decoder::new_vaapi(display, blocking_mode).unwrap();
 
             // CRC from the GStreamer decoder, should be good enough for us for now.
             let mut expected_crcs = HashSet::from(["2737596b"]);
@@ -1088,7 +1073,7 @@ mod tests {
                 process_ready_frames(decoder, &mut |decoder, handle| {
                     // Contains the params used to decode the picture. Useful if we want to
                     // write assertions against any particular value used therein.
-                    let _params = &as_vaapi_backend(decoder.backend()).test_params;
+                    let _params = get_test_params(decoder.backend());
 
                     process_handle(handle, false, Some(&mut expected_crcs), frame_num);
 
@@ -1112,14 +1097,13 @@ mod tests {
         /// h264::decoders::tests::test_16x16_progressive_i_and_p, but with an
         /// actual backend to test whether the backend specific logic works and
         /// the produced CRCs match their expected values.
-        const TEST_STREAM: &[u8] = include_bytes!("../../test_data/16x16-I-P.h264");
+        const TEST_STREAM: &[u8] = include_bytes!("../test_data/16x16-I-P.h264");
         let blocking_modes = [BlockingMode::Blocking, BlockingMode::NonBlocking];
 
         for blocking_mode in blocking_modes {
             let mut frame_num = 0;
-            let display = Rc::new(Display::open().unwrap());
-            let backend = Box::new(Backend::new(Rc::clone(&display)).unwrap());
-            let mut decoder = Decoder::new(backend, blocking_mode).unwrap();
+            let display = Display::open().unwrap();
+            let mut decoder = Decoder::new_vaapi(display, blocking_mode).unwrap();
 
             let mut expected_crcs = HashSet::from(["1d0295c6", "2563d883"]);
 
@@ -1128,7 +1112,7 @@ mod tests {
                 // if we want to write assertions against any particular value
                 // used therein.
                 process_ready_frames(decoder, &mut |decoder, handle| {
-                    let _params = &as_vaapi_backend(decoder.backend()).test_params;
+                    let _params = get_test_params(decoder.backend());
                     process_handle(handle, false, Some(&mut expected_crcs), frame_num);
 
                     frame_num += 1;
@@ -1151,24 +1135,22 @@ mod tests {
         /// h264::decoders::tests::test_16x16_progressive_i_p_b_p, but with an
         /// actual backend to test whether the backend specific logic works and
         /// the produced CRCs match their expected values.
-        const TEST_STREAM: &[u8] = include_bytes!("../../test_data/16x16-I-P-B-P.h264");
-        const STREAM_CRCS: &str = include_str!("../../test_data/16x16-I-P-B-P.h264.crc");
+        const TEST_STREAM: &[u8] = include_bytes!("../test_data/16x16-I-P-B-P.h264");
+        const STREAM_CRCS: &str = include_str!("../test_data/16x16-I-P-B-P.h264.crc");
         let blocking_modes = [BlockingMode::Blocking, BlockingMode::NonBlocking];
 
         for blocking_mode in blocking_modes {
             let mut expected_crcs = STREAM_CRCS.lines().collect::<HashSet<_>>();
             let mut frame_num = 0;
-
-            let display = Rc::new(Display::open().unwrap());
-            let backend = Box::new(Backend::new(Rc::clone(&display)).unwrap());
-            let mut decoder = Decoder::new(backend, blocking_mode).unwrap();
+            let display = Display::open().unwrap();
+            let mut decoder = Decoder::new_vaapi(display, blocking_mode).unwrap();
 
             run_decoding_loop(&mut decoder, TEST_STREAM, |decoder| {
                 process_ready_frames(decoder, &mut |decoder, handle| {
                     // Contains the VA-API params used to decode the picture.
                     // Useful if we want to write assertions against any
                     // particular value used therein.
-                    let _params = &as_vaapi_backend(decoder.backend()).test_params;
+                    let _params = get_test_params(decoder.backend());
 
                     process_handle(handle, false, Some(&mut expected_crcs), frame_num);
 
@@ -1192,24 +1174,22 @@ mod tests {
         /// h264::decoders::tests::test_16x16_progressive_i_p_b_p_high, but with
         /// an actual backend to test whether the backend specific logic works
         /// and the produced CRCs match their expected values.
-        const TEST_STREAM: &[u8] = include_bytes!("../../test_data/16x16-I-P-B-P-high.h264");
-        const STREAM_CRCS: &str = include_str!("../../test_data/16x16-I-P-B-P-high.h264.crc");
+        const TEST_STREAM: &[u8] = include_bytes!("../test_data/16x16-I-P-B-P-high.h264");
+        const STREAM_CRCS: &str = include_str!("../test_data/16x16-I-P-B-P-high.h264.crc");
         let blocking_modes = [BlockingMode::Blocking, BlockingMode::NonBlocking];
 
         for blocking_mode in blocking_modes {
             let mut expected_crcs = STREAM_CRCS.lines().collect::<HashSet<_>>();
             let mut frame_num = 0;
-
-            let display = Rc::new(Display::open().unwrap());
-            let backend = Box::new(Backend::new(Rc::clone(&display)).unwrap());
-            let mut decoder = Decoder::new(backend, blocking_mode).unwrap();
+            let display = Display::open().unwrap();
+            let mut decoder = Decoder::new_vaapi(display, blocking_mode).unwrap();
 
             run_decoding_loop(&mut decoder, TEST_STREAM, |decoder| {
                 process_ready_frames(decoder, &mut |decoder, handle| {
                     // Contains the VA-API params used to decode the picture.
                     // Useful if we want to write assertions against any
                     // particular value used therein.
-                    let _params = &as_vaapi_backend(decoder.backend()).test_params;
+                    let _params = get_test_params(decoder.backend());
 
                     process_handle(handle, false, Some(&mut expected_crcs), frame_num);
 
@@ -1233,25 +1213,22 @@ mod tests {
         /// h264::decoders::tests::test_interlaced_kodi_1080i, but with an
         /// actual backend to test whether the backend specific logic works and
         /// the produced CRCs match their expected values.
-        const TEST_STREAM: &[u8] = include_bytes!("../../test_data/test-kodi-1080i-25-H264.h264");
-        const STREAM_CRCS: &str = include_str!("../../test_data/test-kodi-1080i-25-H264.h264.crc");
+        const TEST_STREAM: &[u8] = include_bytes!("../test_data/test-kodi-1080i-25-H264.h264");
+        const STREAM_CRCS: &str = include_str!("../test_data/test-kodi-1080i-25-H264.h264.crc");
         let blocking_modes = [BlockingMode::Blocking, BlockingMode::NonBlocking];
 
         for blocking_mode in blocking_modes {
             let mut expected_crcs = STREAM_CRCS.lines().collect::<HashSet<_>>();
-
             let mut frame_num = 0;
-
-            let display = Rc::new(Display::open().unwrap());
-            let backend = Box::new(Backend::new(Rc::clone(&display)).unwrap());
-            let mut decoder = Decoder::new(backend, blocking_mode).unwrap();
+            let display = Display::open().unwrap();
+            let mut decoder = Decoder::new_vaapi(display, blocking_mode).unwrap();
 
             run_decoding_loop(&mut decoder, TEST_STREAM, |decoder| {
                 process_ready_frames(decoder, &mut |decoder, handle| {
                     // Contains the VA-API params used to decode the picture.
                     // Useful if we want to write assertions against any
                     // particular value used therein.
-                    let _params = &as_vaapi_backend(decoder.backend()).test_params;
+                    let _params = get_test_params(decoder.backend());
 
                     process_handle(handle, false, Some(&mut expected_crcs), frame_num);
 
@@ -1275,24 +1252,22 @@ mod tests {
         /// h264::decoders::tests::test_interlaced_kodi_1080p, but with an
         /// actual backend to test whether the backend specific logic works and
         /// the produced CRCs match their expected values.
-        const TEST_STREAM: &[u8] = include_bytes!("../../test_data/FPS_test_1080p24_l4_1.h264");
-        const STREAM_CRCS: &str = include_str!("../../test_data/FPS_test_1080p24_l4_1.h264.crc");
+        const TEST_STREAM: &[u8] = include_bytes!("../test_data/FPS_test_1080p24_l4_1.h264");
+        const STREAM_CRCS: &str = include_str!("../test_data/FPS_test_1080p24_l4_1.h264.crc");
         let blocking_modes = [BlockingMode::Blocking, BlockingMode::NonBlocking];
 
         for blocking_mode in blocking_modes {
             let mut expected_crcs = STREAM_CRCS.lines().collect::<HashSet<_>>();
             let mut frame_num = 0;
-
-            let display = Rc::new(Display::open().unwrap());
-            let backend = Box::new(Backend::new(Rc::clone(&display)).unwrap());
-            let mut decoder = Decoder::new(backend, blocking_mode).unwrap();
+            let display = Display::open().unwrap();
+            let mut decoder = Decoder::new_vaapi(display, blocking_mode).unwrap();
 
             run_decoding_loop(&mut decoder, TEST_STREAM, |decoder| {
                 process_ready_frames(decoder, &mut |decoder, handle| {
                     // Contains the VA-API params used to decode the picture.
                     // Useful if we want to write assertions against any
                     // particular value used therein.
-                    let _params = &as_vaapi_backend(decoder.backend()).test_params;
+                    let _params = get_test_params(decoder.backend());
 
                     process_handle(handle, false, Some(&mut expected_crcs), frame_num);
 
@@ -1316,24 +1291,22 @@ mod tests {
         /// h264::decoders::tests::test_25fps_interlaced_h264, but with an
         /// actual backend to test whether the backend specific logic works and
         /// the produced CRCs match their expected values.
-        const TEST_STREAM: &[u8] = include_bytes!("../../test_data/test-25fps-interlaced.h264");
-        const STREAM_CRCS: &str = include_str!("../../test_data/test-25fps-interlaced.h264.crc");
+        const TEST_STREAM: &[u8] = include_bytes!("../test_data/test-25fps-interlaced.h264");
+        const STREAM_CRCS: &str = include_str!("../test_data/test-25fps-interlaced.h264.crc");
         let blocking_modes = [BlockingMode::Blocking, BlockingMode::NonBlocking];
 
         for blocking_mode in blocking_modes {
             let mut expected_crcs = STREAM_CRCS.lines().collect::<HashSet<_>>();
             let mut frame_num = 0;
-
-            let display = Rc::new(Display::open().unwrap());
-            let backend = Box::new(Backend::new(Rc::clone(&display)).unwrap());
-            let mut decoder = Decoder::new(backend, blocking_mode).unwrap();
+            let display = Display::open().unwrap();
+            let mut decoder = Decoder::new_vaapi(display, blocking_mode).unwrap();
 
             run_decoding_loop(&mut decoder, TEST_STREAM, |decoder| {
                 process_ready_frames(decoder, &mut |decoder, handle| {
                     // Contains the VA-API params used to decode the picture.
                     // Useful if we want to write assertions against any
                     // particular value used therein.
-                    let _params = &as_vaapi_backend(decoder.backend()).test_params;
+                    let _params = get_test_params(decoder.backend());
 
                     process_handle(handle, false, Some(&mut expected_crcs), frame_num);
 
@@ -1356,24 +1329,22 @@ mod tests {
         /// This test is the same as h264::decoders::tests::test_25fps_h264, but
         /// with an actual backend to test whether the backend specific logic
         /// works and the produced CRCs match their expected values.
-        const TEST_STREAM: &[u8] = include_bytes!("../../test_data/test-25fps.h264");
-        const STREAM_CRCS: &str = include_str!("../../test_data/test-25fps.h264.crc");
+        const TEST_STREAM: &[u8] = include_bytes!("../test_data/test-25fps.h264");
+        const STREAM_CRCS: &str = include_str!("../test_data/test-25fps.h264.crc");
         let blocking_modes = [BlockingMode::Blocking, BlockingMode::NonBlocking];
 
         for blocking_mode in blocking_modes {
             let mut expected_crcs = STREAM_CRCS.lines().collect::<HashSet<_>>();
             let mut frame_num = 0;
-
-            let display = Rc::new(Display::open().unwrap());
-            let backend = Box::new(Backend::new(Rc::clone(&display)).unwrap());
-            let mut decoder = Decoder::new(backend, blocking_mode).unwrap();
+            let display = Display::open().unwrap();
+            let mut decoder = Decoder::new_vaapi(display, blocking_mode).unwrap();
 
             run_decoding_loop(&mut decoder, TEST_STREAM, |decoder| {
                 process_ready_frames(decoder, &mut |decoder, handle| {
                     // Contains the VA-API params used to decode the picture.
                     // Useful if we want to write assertions against any
                     // particular value used therein.
-                    let _params = &as_vaapi_backend(decoder.backend()).test_params;
+                    let _params = get_test_params(decoder.backend());
 
                     process_handle(handle, false, Some(&mut expected_crcs), frame_num);
 

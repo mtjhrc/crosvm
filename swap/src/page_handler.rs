@@ -10,7 +10,6 @@ use std::ops::Range;
 use std::path::Path;
 
 use base::error;
-use base::pagesize;
 use base::unix::FileDataIterator;
 use base::AsRawDescriptor;
 use data_model::VolatileSlice;
@@ -18,6 +17,12 @@ use thiserror::Error as ThisError;
 
 use crate::file::Error as FileError;
 use crate::file::SwapFile;
+use crate::pagesize::addr_to_page_idx;
+use crate::pagesize::bytes_to_pages;
+use crate::pagesize::is_page_aligned;
+use crate::pagesize::page_base_addr;
+use crate::pagesize::page_idx_to_addr;
+use crate::pagesize::pages_to_bytes;
 use crate::userfaultfd::UffdError;
 use crate::userfaultfd::Userfaultfd;
 
@@ -58,7 +63,10 @@ struct Region {
     /// the head page index of the region.
     head_page_idx: usize,
     file: SwapFile,
-    resident_pages: usize,
+    copied_pages: usize,
+    zeroed_pages: usize,
+    /// the amount of pages which were already initialized on page faults.
+    redundant_pages: usize,
     swap_active: bool,
 }
 
@@ -68,7 +76,6 @@ struct Region {
 /// All the addresses and sizes in bytes are converted to page id internally.
 pub struct PageHandler {
     regions: Vec<Region>,
-    pagesize_shift: u32,
 }
 
 impl PageHandler {
@@ -80,16 +87,8 @@ impl PageHandler {
     /// * `regions` - the list of the region. the start address must align with page. the size must
     ///   be multiple of pagesize.
     pub fn create(swap_dir: &Path, regions: &[Range<usize>]) -> Result<Self> {
-        let pagesize_shift = pagesize().trailing_zeros();
-        // pagesize() should be power of 2 in almost all cases. vmm-swap feature does not support
-        // systems in which page size is not power of 2.
-        if 1 << pagesize_shift != pagesize() {
-            panic!("page size is not power of 2");
-        }
-
         let mut handler = Self {
             regions: Vec::new(),
-            pagesize_shift,
         };
 
         for address_range in regions {
@@ -97,26 +96,6 @@ impl PageHandler {
         }
 
         Ok(handler)
-    }
-
-    /// The page index of the page which contains the "addr".
-    fn addr_to_page_idx(&self, addr: usize) -> usize {
-        addr >> self.pagesize_shift
-    }
-
-    /// The head address of the page.
-    fn page_idx_to_addr(&self, page_idx: usize) -> usize {
-        page_idx << self.pagesize_shift
-    }
-
-    /// The head address of the page which contains the "addr".
-    fn page_base_addr(&self, addr: usize) -> usize {
-        (addr >> self.pagesize_shift) << self.pagesize_shift
-    }
-
-    fn is_page_aligned(&self, addr: usize) -> bool {
-        let mask = (1 << self.pagesize_shift) - 1;
-        addr & mask == 0
     }
 
     fn find_region_position(&self, page_idx: usize) -> Option<usize> {
@@ -143,9 +122,9 @@ impl PageHandler {
     /// * `address_range` - the range of the region. the start address must align with page. the
     ///   size must be multiple of pagesize.
     fn add_region(&mut self, swap_dir: &Path, address_range: &Range<usize>) -> Result<()> {
-        let head_page_idx = self.addr_to_page_idx(address_range.start);
+        let head_page_idx = addr_to_page_idx(address_range.start);
         let region_size = address_range.end - address_range.start;
-        let num_of_pages = region_size >> self.pagesize_shift;
+        let num_of_pages = bytes_to_pages(region_size);
 
         // find an overlaping region
         match self.regions.iter().position(|region| {
@@ -160,20 +139,22 @@ impl PageHandler {
 
                 Err(Error::RegionOverlap(
                     address_range.clone(),
-                    self.page_idx_to_addr(region.head_page_idx)
-                        ..(self.page_idx_to_addr(region.head_page_idx + region.file.num_pages())),
+                    page_idx_to_addr(region.head_page_idx)
+                        ..(page_idx_to_addr(region.head_page_idx + region.file.num_pages())),
                 ))
             }
             None => {
                 let base_addr = address_range.start;
-                assert!(self.is_page_aligned(base_addr));
-                assert!(self.is_page_aligned(region_size));
+                assert!(is_page_aligned(base_addr));
+                assert!(is_page_aligned(region_size));
 
                 let file = SwapFile::new(swap_dir, num_of_pages)?;
                 self.regions.push(Region {
                     head_page_idx,
                     file,
-                    resident_pages: 0,
+                    copied_pages: 0,
+                    zeroed_pages: 0,
+                    redundant_pages: 0,
                     swap_active: false,
                 });
                 Ok(())
@@ -212,14 +193,16 @@ impl PageHandler {
     /// * `uffd` - the reference to the [Userfaultfd] for the faulting process.
     /// * `address` - the address that triggered the page fault.
     pub fn handle_page_fault(&mut self, uffd: &Userfaultfd, address: usize) -> Result<()> {
-        let page_idx = self.addr_to_page_idx(address);
+        let page_idx = addr_to_page_idx(address);
         // the head address of the page.
-        let page_addr = self.page_base_addr(address);
-        let page_size = 1 << self.pagesize_shift;
+        let page_addr = page_base_addr(address);
+        let page_size = pages_to_bytes(1);
         let Region {
             head_page_idx,
             file,
-            resident_pages,
+            copied_pages,
+            zeroed_pages,
+            redundant_pages,
             ..
         } = self
             .find_region(page_idx)
@@ -230,7 +213,7 @@ impl PageHandler {
             Some(page_slice) => {
                 Self::copy_all(uffd, page_addr, page_slice, true)?;
                 file.clear(idx_in_region)?;
-                *resident_pages += 1;
+                *copied_pages += 1;
                 Ok(())
             }
             None => {
@@ -239,12 +222,14 @@ impl PageHandler {
                 let result = uffd.zero(page_addr, page_size, true);
                 match result {
                     Ok(_) => {
-                        *resident_pages += 1;
+                        *zeroed_pages += 1;
                         Ok(())
                     }
                     Err(UffdError::ZeropageFailed(errno)) if errno as i32 == libc::EEXIST => {
                         // zeroing fails with EEXIST if the page is already filled. This case can
                         // happen if page faults on the same page happen on different processes.
+                        uffd.wake(page_addr, page_size)?;
+                        *redundant_pages += 1;
                         Ok(())
                     }
                     Err(e) => Err(e.into()),
@@ -267,15 +252,15 @@ impl PageHandler {
     ///   head address of the next memory area of the freed area. (i.e. the exact tail address of
     ///   the memory area is `end_addr - 1`.)
     pub fn handle_page_remove(&mut self, start_addr: usize, end_addr: usize) -> Result<()> {
-        if !self.is_page_aligned(start_addr) {
+        if !is_page_aligned(start_addr) {
             return Err(Error::InvalidAddress(start_addr));
-        } else if !self.is_page_aligned(end_addr) {
+        } else if !is_page_aligned(end_addr) {
             return Err(Error::InvalidAddress(end_addr));
         }
-        let start_page_idx = self.addr_to_page_idx(start_addr);
-        let last_page_idx = self.addr_to_page_idx(end_addr);
+        let start_page_idx = addr_to_page_idx(start_addr);
+        let last_page_idx = addr_to_page_idx(end_addr);
         for page_idx in start_page_idx..(last_page_idx) {
-            let page_addr = self.page_idx_to_addr(page_idx);
+            let page_addr = page_idx_to_addr(page_idx);
             let region = self
                 .find_region(page_idx)
                 .ok_or(Error::InvalidAddress(page_addr))?;
@@ -318,7 +303,7 @@ impl PageHandler {
     where
         T: AsRawDescriptor,
     {
-        let head_page_idx = self.addr_to_page_idx(base_addr);
+        let head_page_idx = addr_to_page_idx(base_addr);
         // use find_region_position instead of find_region() due to borrow checker.
         let region_position = self
             .find_region_position(head_page_idx)
@@ -326,18 +311,18 @@ impl PageHandler {
         if self.regions[region_position].head_page_idx != head_page_idx {
             return Err(Error::InvalidAddress(base_addr));
         }
-        let region_size = self.regions[region_position].file.num_pages() << self.pagesize_shift;
+        let region_size = pages_to_bytes(self.regions[region_position].file.num_pages());
         let file_data = FileDataIterator::new(memfd, base_offset, region_size as u64);
 
         let mut swapped_size = 0;
         for data_range in file_data {
             // assert offset is page aligned
             let offset = (data_range.start - base_offset) as usize;
-            assert!(self.is_page_aligned(offset));
+            assert!(is_page_aligned(offset));
             let addr = base_addr + offset;
-            let page_idx = self.addr_to_page_idx(addr);
+            let page_idx = addr_to_page_idx(addr);
             let size = (data_range.end - data_range.start) as usize;
-            assert!(self.is_page_aligned(size));
+            assert!(is_page_aligned(size));
             // safe because the page is within the range of the guest memory.
             let mem_slice = unsafe { std::slice::from_raw_parts(addr as *const u8, size) };
             self.regions[region_position]
@@ -358,17 +343,19 @@ impl PageHandler {
                 libc::MADV_REMOVE,
             );
         }
-        let swapped_pages = swapped_size >> self.pagesize_shift;
+        let swapped_pages = bytes_to_pages(swapped_size);
         let mut region = &mut self.regions[region_position];
-        // Suppress error log on the first swap_out, since regident_pages is not initialized but
+        // Suppress error log on the first swap_out, since page counts are not initialized but
         // zero.
-        if region.swap_active && swapped_pages != region.resident_pages {
+        if region.swap_active && swapped_pages != (region.copied_pages + region.zeroed_pages) {
             error!(
-                "swapped pages ({}) does not match with resident pages ({}).",
-                swapped_pages, region.resident_pages
+                "swapped pages ({}) does not match with resident pages (copied: {}, zeroed: {}).",
+                swapped_pages, region.copied_pages, region.zeroed_pages
             );
         }
-        region.resident_pages = 0;
+        region.copied_pages = 0;
+        region.zeroed_pages = 0;
+        region.redundant_pages = 0;
         region.swap_active = true;
 
         Ok(swapped_pages)
@@ -386,18 +373,36 @@ impl PageHandler {
         for region in self.regions.iter() {
             for pages in region.file.all_present_pages() {
                 let page_idx = region.head_page_idx + pages.base_idx;
-                let page_addr = self.page_idx_to_addr(page_idx);
+                let page_addr = page_idx_to_addr(page_idx);
                 let size = pages.content.size();
                 Self::copy_all(uffd, page_addr, pages.content, false)?;
                 swapped_size += size;
             }
         }
-        Ok(swapped_size >> self.pagesize_shift)
+        Ok(bytes_to_pages(swapped_size))
     }
 
     /// Returns count of pages active on the memory.
     pub fn compute_resident_pages(&self) -> usize {
-        self.regions.iter().map(|r| r.resident_pages).sum()
+        self.regions
+            .iter()
+            .map(|r| r.copied_pages + r.zeroed_pages)
+            .sum()
+    }
+
+    /// Returns count of pages copied from vmm-swap file on the memory.
+    pub fn compute_copied_pages(&self) -> usize {
+        self.regions.iter().map(|r| r.copied_pages).sum()
+    }
+
+    /// Returns count of pages initialized with zero.
+    pub fn compute_zeroed_pages(&self) -> usize {
+        self.regions.iter().map(|r| r.zeroed_pages).sum()
+    }
+
+    /// Returns count of pages which were already initialized on page faults.
+    pub fn compute_redundant_pages(&self) -> usize {
+        self.regions.iter().map(|r| r.redundant_pages).sum()
     }
 
     /// Returns count of pages present in the swap files.
@@ -408,6 +413,6 @@ impl PageHandler {
                 swapped_size += pages.content.size();
             }
         }
-        swapped_size >> self.pagesize_shift
+        bytes_to_pages(swapped_size)
     }
 }
