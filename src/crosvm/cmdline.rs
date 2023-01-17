@@ -308,6 +308,15 @@ pub struct SwapEnableCommand {
 }
 
 #[derive(FromArgs)]
+#[argh(subcommand, name = "out")]
+/// Enable swap of a VM
+pub struct SwapOutCommand {
+    #[argh(positional, arg_name = "VM_SOCKET")]
+    /// VM Socket path
+    pub socket_path: String,
+}
+
+#[derive(FromArgs)]
 #[argh(subcommand, name = "disable")]
 /// Disable swap of a VM
 pub struct SwapDisableCommand {
@@ -346,6 +355,7 @@ pub struct SwapCommand {
 /// Swap related operations
 pub enum SwapSubcommands {
     Enable(SwapEnableCommand),
+    SwapOut(SwapOutCommand),
     Disable(SwapDisableCommand),
     Status(SwapStatusCommand),
     LogPageFault(SwapLogPageFaultCommand),
@@ -1197,6 +1207,8 @@ pub struct RunCommand {
     ///     cache-path=PATH - The path to the render server shader
     ///         cache.
     ///     cache-size=SIZE - The maximum size of the shader cache
+    ///     foz-db-list-path=PATH - The path to GPU foz db list
+    ///         file for dynamically loading RO caches.
     pub gpu_render_server: Option<GpuRenderServerParameters>,
 
     #[argh(switch)]

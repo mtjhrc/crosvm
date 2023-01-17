@@ -3,7 +3,6 @@
 // found in the LICENSE file.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
@@ -15,7 +14,6 @@ use libva::Display;
 use libva::IQMatrix;
 use libva::IQMatrixBufferH264;
 use libva::Picture as VaPicture;
-use libva::PictureEnd;
 use libva::PictureNew;
 use libva::PictureParameter;
 use libva::PictureParameterBufferH264;
@@ -46,6 +44,7 @@ use crate::utils::vaapi::DecodedHandle as VADecodedHandle;
 use crate::utils::vaapi::FormatMap;
 use crate::utils::vaapi::GenericBackendHandle;
 use crate::utils::vaapi::NegotiationStatus;
+use crate::utils::vaapi::PendingJob;
 use crate::utils::vaapi::StreamMetadataState;
 use crate::utils::vaapi::SurfacePoolHandle;
 use crate::DecodedFormat;
@@ -79,22 +78,6 @@ impl TestParams {
     }
 }
 
-/// A type that keeps track of a pending decoding operation. The backend can
-/// complete the job by either querying its status with VA-API or by blocking on
-/// it at some point in the future.
-///
-/// Once the backend is sure that the operation went through, it can assign the
-/// handle to `h264_picture` and dequeue this object from the pending queue.
-struct PendingJob<BackendHandle> {
-    /// A picture that was already sent to VA-API. It is unclear whether it has
-    /// been decoded yet because we have been asked not to block on it.
-    va_picture: VaPicture<PictureEnd>,
-    /// A handle to the picture passed in by the H264 decoder. It has no handle
-    /// backing it yet, as we cannot be sure that the decoding operation went
-    /// through.
-    h264_picture: ContainedPicture<BackendHandle>,
-}
-
 /// H.264 stateless decoder backend for VA-API.
 struct Backend {
     /// The metadata state. Updated whenever the decoder reads new data from the stream.
@@ -102,9 +85,7 @@ struct Backend {
     /// The current picture being worked on.
     current_picture: Option<VaPicture<PictureNew>>,
     /// The FIFO for all pending pictures, in the order they were submitted.
-    pending_jobs: VecDeque<PendingJob<GenericBackendHandle>>,
-    /// The image formats we can decode into.
-    image_formats: Rc<Vec<libva::VAImageFormat>>,
+    pending_jobs: VecDeque<PendingJob<H264Picture<GenericBackendHandle>>>,
     /// The number of allocated surfaces.
     num_allocated_surfaces: usize,
     /// The negotiation status. First member is the Sps, second is the size of the DPB.
@@ -119,15 +100,12 @@ struct Backend {
 impl Backend {
     /// Creates a new codec backend for H.264.
     fn new(display: Rc<libva::Display>) -> Result<Self> {
-        let image_formats = Rc::new(display.query_image_formats()?);
-
         Ok(Self {
             metadata_state: StreamMetadataState::Unparsed { display },
             current_picture: Default::default(),
             pending_jobs: Default::default(),
             num_allocated_surfaces: Default::default(),
             negotiation_status: Default::default(),
-            image_formats,
 
             #[cfg(test)]
             test_params: Default::default(),
@@ -172,8 +150,8 @@ impl Backend {
                 .ok_or(anyhow!("Unsupported format {}", rt_format))?
         };
 
-        let map_format = self
-            .image_formats
+        let map_format = display
+            .query_image_formats()?
             .iter()
             .find(|f| f.fourcc == format_map.va_fourcc)
             .cloned()
@@ -660,7 +638,7 @@ impl VideoDecoderBackend for Backend {
             }
         };
 
-        let supported_formats_for_stream = self.supported_formats_for_stream()?;
+        let supported_formats_for_stream = &self.metadata_state.supported_formats_for_stream()?;
 
         if supported_formats_for_stream.contains(&format) {
             let map_format = utils::vaapi::FORMAT_MAP
@@ -682,23 +660,6 @@ impl VideoDecoderBackend for Backend {
         }
     }
 
-    fn supported_formats_for_stream(&self) -> DecoderResult<HashSet<DecodedFormat>> {
-        let rt_format = self.metadata_state.rt_format()?;
-        let image_formats = &self.image_formats;
-        let display = self.metadata_state.display();
-        let profile = self.metadata_state.profile()?;
-
-        let formats = utils::vaapi::supported_formats_for_rt_format(
-            display,
-            rt_format,
-            profile,
-            libva::VAEntrypoint::VAEntrypointVLD,
-            image_formats,
-        )?;
-
-        Ok(formats.into_iter().map(|f| f.decoded_format).collect())
-    }
-
     fn coded_resolution(&self) -> Option<Resolution> {
         self.metadata_state.coded_resolution().ok()
     }
@@ -712,10 +673,10 @@ impl StatelessDecoderBackend for Backend {
     type Handle = VADecodedHandle<H264Picture<GenericBackendHandle>>;
 
     fn new_sequence(&mut self, sps: &Sps, dpb_size: usize) -> StatelessBackendResult<()> {
+        self.open(sps, dpb_size, None)?;
         self.negotiation_status = NegotiationStatus::Possible(Box::new((sps.clone(), dpb_size)));
 
-        self.open(sps, dpb_size, None)
-            .map_err(StatelessBackendError::Other)
+        Ok(())
     }
 
     fn handle_picture(
@@ -828,7 +789,7 @@ impl StatelessDecoderBackend for Backend {
             // Append to our queue of pending jobs
             let pending_job = PendingJob {
                 va_picture: current_picture,
-                h264_picture: Rc::clone(&picture),
+                codec_picture: Rc::clone(&picture),
             };
 
             self.pending_jobs.push_back(pending_job);
@@ -867,9 +828,9 @@ impl StatelessDecoderBackend for Backend {
                 self.metadata_state.display_resolution()?,
             );
 
-            job.h264_picture.borrow_mut().backend_handle = Some(backend_handle);
+            job.codec_picture.borrow_mut().backend_handle = Some(backend_handle);
 
-            completed.push_back(job.h264_picture);
+            completed.push_back(job.codec_picture);
         }
 
         let completed = completed.into_iter().map(|picture| {
@@ -957,7 +918,7 @@ impl StatelessDecoderBackend for Backend {
             // Remove from the queue in order.
             let job = &self.pending_jobs[i];
 
-            if H264Picture::same(&job.h264_picture, handle.picture_container()) {
+            if H264Picture::same(&job.codec_picture, handle.picture_container()) {
                 let job = self.pending_jobs.remove(i).unwrap();
 
                 let current_picture = job.va_picture.sync()?;
@@ -970,7 +931,7 @@ impl StatelessDecoderBackend for Backend {
                     self.metadata_state.display_resolution()?,
                 );
 
-                job.h264_picture.borrow_mut().backend_handle = Some(backend_handle);
+                job.codec_picture.borrow_mut().backend_handle = Some(backend_handle);
 
                 return Ok(());
             }
