@@ -6,6 +6,7 @@
 
 //! Emulates virtual and hardware devices.
 
+pub mod ac_adapter;
 pub mod acpi;
 pub mod bat;
 mod bus;
@@ -58,6 +59,7 @@ use cros_async::Executor;
 use vm_control::DeviceControlCommand;
 use vm_control::RestoreControlResult;
 use vm_control::SnapshotControlResult;
+use vm_memory::GuestMemory;
 
 pub use self::acpi::ACPIPMFixedEvent;
 pub use self::acpi::ACPIPMResource;
@@ -152,6 +154,7 @@ cfg_if::cfg_if! {
             VfioPciDevice,
         };
         pub use self::platform::VfioPlatformDevice;
+        pub use self::ac_adapter::AcAdapter;
         pub use self::proxy::Error as ProxyError;
         pub use self::proxy::ProxyDevice;
         #[cfg(feature = "usb")]
@@ -209,18 +212,19 @@ impl Default for IommuDevType {
 // Thread that handles commands sent to devices - such as snapshot, sleep, suspend
 // Created when the VM is first created, and re-created on resumption of the VM.
 pub fn create_devices_worker_thread(
+    guest_memory: GuestMemory,
     io_bus: Arc<Bus>,
     mmio_bus: Arc<Bus>,
     device_ctrl_resp: Tube,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("device_control".to_string())
-        .spawn(|| {
+        .spawn(move || {
             let ex = Executor::new().expect("Failed to create an executor");
 
             let async_control = AsyncTube::new(&ex, device_ctrl_resp).unwrap();
             match ex.run_until(ex.spawn_local(async move {
-                handle_command_tube(async_control, io_bus, mmio_bus).await
+                handle_command_tube(async_control, guest_memory, io_bus, mmio_bus).await
             })) {
                 Ok(_) => {}
                 Err(e) => {
@@ -260,8 +264,11 @@ fn wake_devices(bus: &Bus) {
     }
 }
 
-fn snapshot_devices(bus: &Bus, devices_vec: &mut Vec<serde_json::Value>) -> anyhow::Result<()> {
-    match bus.snapshot_devices(devices_vec) {
+fn snapshot_devices(
+    bus: &Bus,
+    add_snapshot: impl FnMut(u32, serde_json::Value),
+) -> anyhow::Result<()> {
+    match bus.snapshot_devices(add_snapshot) {
         Ok(_) => {
             info!("Devices snapshot successfully");
             Ok(())
@@ -291,14 +298,40 @@ fn restore_devices(
     }
 }
 
-async fn snapshot_handler(path: &std::path::Path, buses: &[&Bus]) -> anyhow::Result<()> {
-    let mut devices_vec: Vec<serde_json::Value> = Vec::new();
-    let mut file = OpenOptions::new()
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SnapshotRoot {
+    guest_memory_metadata: serde_json::Value,
+    devices: Vec<HashMap<u32, serde_json::Value>>,
+}
+
+async fn snapshot_handler(
+    path: &std::path::Path,
+    guest_memory: &GuestMemory,
+    buses: &[&Bus],
+) -> anyhow::Result<()> {
+    let mut snapshot_root = SnapshotRoot {
+        guest_memory_metadata: serde_json::Value::Null,
+        devices: Vec::new(),
+    };
+
+    // TODO(b/268093674): Better output file format.
+    // TODO(b/268094487): If the snapshot fail, this leaves an incomplete memory snapshot at the
+    // requested path.
+
+    let mut json_file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(path)
         .with_context(|| format!("failed to open {}", path.display()))?;
+
+    let mem_path = path.with_extension("mem");
+    let mut mem_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&mem_path)
+        .with_context(|| format!("failed to open {}", mem_path.display()))?;
 
     for bus in buses {
         if let Err(e) = sleep_devices(bus) {
@@ -310,8 +343,21 @@ async fn snapshot_handler(path: &std::path::Path, buses: &[&Bus]) -> anyhow::Res
             return Err(e);
         }
     }
+    snapshot_root.guest_memory_metadata = match guest_memory.snapshot(&mut mem_file) {
+        Ok(x) => x,
+        Err(e) => {
+            // If snapshot fails, wake devices and return error.
+            error!("failed to snapshot memory: {}", e);
+            for bus in buses {
+                wake_devices(bus);
+            }
+            return Err(e);
+        }
+    };
     for bus in buses {
-        if let Err(e) = snapshot_devices(bus, &mut devices_vec) {
+        if let Err(e) = snapshot_devices(bus, |id, snapshot| {
+            snapshot_root.devices.push([(id, snapshot)].into())
+        }) {
             // If snapshot fails, wake devices and return error.
             error!("failed to snapshot devices: {}", e);
             for bus in buses {
@@ -324,21 +370,33 @@ async fn snapshot_handler(path: &std::path::Path, buses: &[&Bus]) -> anyhow::Res
         wake_devices(bus);
     }
 
-    serde_json::to_writer(&mut file, &devices_vec)?;
+    serde_json::to_writer(&mut json_file, &snapshot_root)?;
 
     Ok(())
 }
 
-async fn restore_handler(path: &std::path::Path, buses: &[&Bus]) -> anyhow::Result<()> {
+async fn restore_handler(
+    path: &std::path::Path,
+    guest_memory: &GuestMemory,
+    buses: &[&Bus],
+) -> anyhow::Result<()> {
     let file = OpenOptions::new()
         .read(true)
         .write(false)
         .open(path)
         .with_context(|| format!("failed to open {}", path.display()))?;
 
+    let mem_path = path.with_extension("mem");
+    let mut mem_file = OpenOptions::new()
+        .read(true)
+        .write(false)
+        .open(&mem_path)
+        .with_context(|| format!("failed to open {}", mem_path.display()))?;
+
+    let snapshot_root: SnapshotRoot = serde_json::from_reader(file)?;
+
     let mut devices_map: HashMap<u32, VecDeque<serde_json::Value>> = HashMap::new();
-    let deserialized_list: Vec<HashMap<u32, serde_json::Value>> = serde_json::from_reader(file)?;
-    for (id, device) in deserialized_list.into_iter().flatten() {
+    for (id, device) in snapshot_root.devices.into_iter().flatten() {
         devices_map.entry(id).or_default().push_back(device)
     }
     for bus in buses {
@@ -350,6 +408,12 @@ async fn restore_handler(path: &std::path::Path, buses: &[&Bus]) -> anyhow::Resu
             }
             return Err(e);
         }
+    }
+    if let Err(e) = guest_memory.restore(snapshot_root.guest_memory_metadata, &mut mem_file) {
+        for bus in buses {
+            wake_devices(bus);
+        }
+        return Err(e);
     }
     for bus in buses {
         if let Err(e) = restore_devices(bus, &mut devices_map) {
@@ -374,6 +438,7 @@ async fn restore_handler(path: &std::path::Path, buses: &[&Bus]) -> anyhow::Resu
 
 async fn handle_command_tube(
     command_tube: AsyncTube,
+    guest_memory: GuestMemory,
     io_bus: Arc<Bus>,
     mmio_bus: Arc<Bus>,
 ) -> anyhow::Result<()> {
@@ -385,7 +450,8 @@ async fn handle_command_tube(
                         snapshot_path: path,
                     } => {
                         if let Err(e) =
-                            snapshot_handler(path.as_path(), &[&*io_bus, &*mmio_bus]).await
+                            snapshot_handler(path.as_path(), &guest_memory, &[&*io_bus, &*mmio_bus])
+                                .await
                         {
                             error!("failed to snapshot: {}", e);
                             command_tube
@@ -401,7 +467,8 @@ async fn handle_command_tube(
                     }
                     DeviceControlCommand::RestoreDevices { restore_path: path } => {
                         if let Err(e) =
-                            restore_handler(path.as_path(), &[&*io_bus, &*mmio_bus]).await
+                            restore_handler(path.as_path(), &guest_memory, &[&*io_bus, &*mmio_bus])
+                                .await
                         {
                             error!("failed to restore: {}", e);
                             command_tube
