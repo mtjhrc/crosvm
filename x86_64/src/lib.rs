@@ -81,8 +81,6 @@ use devices::Debugcon;
 use devices::IrqChip;
 use devices::IrqChipX86_64;
 use devices::IrqEventSource;
-#[cfg(windows)]
-use devices::Minijail;
 use devices::PciAddress;
 use devices::PciConfigIo;
 use devices::PciConfigMmio;
@@ -117,6 +115,8 @@ use hypervisor::VcpuX86_64;
 use hypervisor::Vm;
 use hypervisor::VmCap;
 use hypervisor::VmX86_64;
+#[cfg(windows)]
+use jail::FakeMinijailStub as Minijail;
 #[cfg(unix)]
 use minijail::Minijail;
 use once_cell::sync::OnceCell;
@@ -448,6 +448,7 @@ fn configure_system(
     params.hdr.boot_flag = KERNEL_BOOT_FLAG_MAGIC;
     params.hdr.header = KERNEL_HDR_MAGIC;
     params.hdr.cmd_line_ptr = cmdline_addr.offset() as u32;
+    params.ext_cmd_line_ptr = (cmdline_addr.offset() >> 32) as u32;
     params.hdr.cmdline_size = cmdline_size as u32;
     params.hdr.kernel_alignment = KERNEL_MIN_ALIGNMENT_BYTES;
     if let Some(setup_data) = setup_data {

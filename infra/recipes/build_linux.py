@@ -8,8 +8,6 @@ from recipe_engine.recipe_api import Property
 from recipe_engine.post_process import DropExpectation, StatusFailure, Filter
 from PB.recipes.crosvm.build_linux import BuildLinuxProperties
 
-PYTHON_VERSION_COMPATIBILITY = "PY3"
-
 DEPS = [
     "crosvm",
     "recipe_engine/buildbucket",
@@ -46,6 +44,7 @@ def collect_binary_sizes(api, properties):
             "./tools/build_release",
             "--json",
             "--platform=" + str(properties.test_arch),
+            "--strip",
         ],
         stdout=api.raw_io.output_text(name="Obtain release build output", add_output_log=True),
     )
@@ -67,6 +66,8 @@ def collect_binary_sizes(api, properties):
                     target_name,
                     "--target-path",
                     binary_path,
+                    "--base-dir",
+                    "/scratch/cargo_target/crosvm",
                 ],
                 infra_step=True,
                 stdout=api.raw_io.output_text(),
