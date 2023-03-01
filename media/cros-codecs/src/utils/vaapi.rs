@@ -105,9 +105,9 @@ impl TryInto<Option<Surface>> for GenericBackendHandle {
     type Error = anyhow::Error;
 
     fn try_into(self) -> Result<Option<Surface>, Self::Error> {
-        match self.0 {
-            GenericBackendHandleInner::Ready { picture, .. } => picture.take_surface().map(Some),
-            GenericBackendHandleInner::Pending(id) => Err(anyhow!(
+        match self.state {
+            PictureState::Ready { picture, .. } => picture.take_surface().map(Some),
+            PictureState::Pending(id) => Err(anyhow!(
                 "Attempting to retrieve a surface (id: {:?}) that might have operations pending.",
                 id
             )),
@@ -150,13 +150,12 @@ impl DecodedHandle {
     /// Creates a new handle
     pub fn new(
         inner: Rc<RefCell<GenericBackendHandle>>,
-        resolution: Resolution,
         timestamp: u64,
         surface_pool: SurfacePoolHandle,
     ) -> Self {
         Self {
             inner: Some(inner),
-            resolution,
+            resolution: surface_pool.coded_resolution(),
             timestamp,
             surface_pool,
             display_order: None,
@@ -177,7 +176,7 @@ impl Drop for DecodedHandle {
             let pool = &mut self.surface_pool;
 
             // Only retrieve if the resolutions match, otherwise let the stale Surface drop.
-            if *pool.current_resolution() == self.resolution {
+            if pool.coded_resolution() == self.resolution {
                 // Retrieve if not currently used by another field.
                 if let Ok(Some(surface)) = inner.try_into() {
                     pool.add_surface(surface);
@@ -215,7 +214,7 @@ impl DecodedHandleTrait for DecodedHandle {
 #[derive(Clone)]
 pub struct SurfacePoolHandle {
     surfaces: Rc<RefCell<VecDeque<Surface>>>,
-    current_resolution: Resolution,
+    coded_resolution: Resolution,
 }
 
 impl SurfacePoolHandle {
@@ -223,13 +222,13 @@ impl SurfacePoolHandle {
     pub fn new(surfaces: Vec<Surface>, resolution: Resolution) -> Self {
         Self {
             surfaces: Rc::new(RefCell::new(VecDeque::from(surfaces))),
-            current_resolution: resolution,
+            coded_resolution: resolution,
         }
     }
 
-    /// Retrieve the current resolution for the pool
-    pub fn current_resolution(&self) -> &Resolution {
-        &self.current_resolution
+    /// Retrieve the current coded resolution of the pool
+    pub fn coded_resolution(&self) -> Resolution {
+        self.coded_resolution
     }
 
     /// Adds a new surface to the pool
@@ -263,114 +262,64 @@ pub(crate) trait StreamInfo {
     fn visible_rect(&self) -> ((u32, u32), (u32, u32));
 }
 
+pub(crate) struct ParsedStreamMetadata {
+    /// A VAContext from which we can decode from.
+    pub(crate) context: Rc<Context>,
+    /// The VAConfig that created the context. It must kept here so that
+    /// it does not get dropped while it is in use.
+    #[allow(dead_code)]
+    config: Config,
+    /// A pool of surfaces. We reuse surfaces as they are expensive to allocate.
+    pub(crate) surface_pool: SurfacePoolHandle,
+    /// The number of surfaces required to parse the stream.
+    pub(crate) min_num_surfaces: usize,
+    /// The decoder current display resolution.
+    pub(crate) display_resolution: Resolution,
+    /// The image format we will use to map the surfaces. This is usually the
+    /// same as the surface's internal format, but occasionally we can try
+    /// mapping in a different format if requested and if the VA-API driver can
+    /// do it.
+    pub(crate) map_format: Rc<libva::VAImageFormat>,
+    /// The rt_format parsed from the stream.
+    pub(crate) rt_format: u32,
+    /// The profile parsed from the stream.
+    pub(crate) profile: i32,
+}
+
 /// State of the input stream, which can be either unparsed (we don't know the stream properties
 /// yet) or parsed (we know the stream properties and are ready to decode).
 pub(crate) enum StreamMetadataState {
     /// The metadata for the current stream has not yet been parsed.
     Unparsed { display: Rc<Display> },
-
     /// The metadata for the current stream has been parsed and a suitable
     /// VAContext has been created to accomodate it.
-    Parsed {
-        /// A VAContext from which we can decode from.
-        context: Rc<Context>,
-        /// The VAConfig that created the context. It must kept here so that
-        /// it does not get dropped while it is in use.
-        #[allow(dead_code)]
-        config: Config,
-        /// A pool of surfaces. We reuse surfaces as they are expensive to allocate.
-        surface_pool: SurfacePoolHandle,
-        /// The number of surfaces required to parse the stream.
-        min_num_surfaces: usize,
-        /// The decoder current coded resolution.
-        coded_resolution: Resolution,
-        /// The decoder current display resolution.
-        display_resolution: Resolution,
-        /// The image format we will use to map the surfaces. This is usually the
-        /// same as the surface's internal format, but occasionally we can try
-        /// mapping in a different format if requested and if the VA-API driver can
-        /// do it.
-        map_format: Rc<libva::VAImageFormat>,
-        /// The rt_format parsed from the stream.
-        rt_format: u32,
-        /// The profile parsed from the stream.
-        profile: i32,
-    },
+    Parsed(ParsedStreamMetadata),
 }
 
 impl StreamMetadataState {
     pub(crate) fn display(&self) -> Rc<libva::Display> {
         match self {
             StreamMetadataState::Unparsed { display } => Rc::clone(display),
-            StreamMetadataState::Parsed { context, .. } => context.display(),
+            StreamMetadataState::Parsed(ParsedStreamMetadata { context, .. }) => context.display(),
         }
     }
 
-    pub(crate) fn context(&self) -> Result<Rc<libva::Context>> {
+    /// Returns a reference to the parsed metadata state or an error if we haven't reached that
+    /// state yet.
+    pub(crate) fn get_parsed(&self) -> Result<&ParsedStreamMetadata> {
         match self {
             StreamMetadataState::Unparsed { .. } => Err(anyhow!("Stream metadata not parsed yet")),
-            StreamMetadataState::Parsed { context, .. } => Ok(Rc::clone(context)),
+            StreamMetadataState::Parsed(parsed_metadata) => Ok(parsed_metadata),
         }
     }
 
-    pub(crate) fn coded_resolution(&self) -> Result<Resolution> {
+    /// Returns a mutable reference to the parsed metadata state or an error if we haven't reached
+    /// that state yet.
+    pub(crate) fn get_parsed_mut(&mut self) -> Result<&mut ParsedStreamMetadata> {
         match self {
             StreamMetadataState::Unparsed { .. } => Err(anyhow!("Stream metadata not parsed yet")),
-            StreamMetadataState::Parsed {
-                coded_resolution, ..
-            } => Ok(*coded_resolution),
+            StreamMetadataState::Parsed(parsed_metadata) => Ok(parsed_metadata),
         }
-    }
-
-    pub(crate) fn display_resolution(&self) -> Result<Resolution> {
-        match self {
-            StreamMetadataState::Unparsed { .. } => Err(anyhow!("Stream metadata not parsed yet")),
-            StreamMetadataState::Parsed {
-                display_resolution, ..
-            } => Ok(*display_resolution),
-        }
-    }
-
-    pub(crate) fn map_format(&self) -> Result<&Rc<libva::VAImageFormat>> {
-        match self {
-            StreamMetadataState::Unparsed { .. } => Err(anyhow!("Stream metadata not parsed yet")),
-            StreamMetadataState::Parsed { map_format, .. } => Ok(map_format),
-        }
-    }
-
-    pub(crate) fn rt_format(&self) -> Result<u32> {
-        match self {
-            StreamMetadataState::Unparsed { .. } => Err(anyhow!("Stream metadata not parsed yet")),
-            StreamMetadataState::Parsed { rt_format, .. } => Ok(*rt_format),
-        }
-    }
-
-    pub(crate) fn profile(&self) -> Result<i32> {
-        match self {
-            StreamMetadataState::Unparsed { .. } => Err(anyhow!("Stream metadata not parsed yet")),
-            StreamMetadataState::Parsed { profile, .. } => Ok(*profile),
-        }
-    }
-
-    pub(crate) fn surface_pool(&self) -> Result<SurfacePoolHandle> {
-        match self {
-            StreamMetadataState::Unparsed { .. } => Err(anyhow!("Invalid state")),
-            StreamMetadataState::Parsed { surface_pool, .. } => Ok(surface_pool.clone()),
-        }
-    }
-
-    pub(crate) fn min_num_surfaces(&self) -> Result<usize> {
-        match self {
-            StreamMetadataState::Unparsed { .. } => Err(anyhow!("Stream metadata not parsed yet")),
-            StreamMetadataState::Parsed {
-                min_num_surfaces, ..
-            } => Ok(*min_num_surfaces),
-        }
-    }
-
-    pub(crate) fn get_surface(&mut self) -> Result<Option<Surface>> {
-        let mut surface_pool = self.surface_pool()?;
-        Ok(surface_pool.get_surface())
     }
 
     /// Gets a set of supported formats for the particular stream being
@@ -379,15 +328,15 @@ impl StreamMetadataState {
     /// bit depth, and chroma format are returned such that no conversion is
     /// needed.
     pub(crate) fn supported_formats_for_stream(&self) -> Result<HashSet<DecodedFormat>> {
-        let rt_format = self.rt_format()?;
+        let metadata = self.get_parsed()?;
         let display = self.display();
+
         let image_formats = display.query_image_formats()?;
-        let profile = self.profile()?;
 
         let formats = supported_formats_for_rt_format(
             display,
-            rt_format,
-            profile,
+            metadata.rt_format,
+            metadata.profile,
             libva::VAEntrypoint::VAEntrypointVLD,
             &image_formats,
         )?;
@@ -464,32 +413,35 @@ impl StreamMetadataState {
 
         let surface_pool = SurfacePoolHandle::new(surfaces, coded_resolution);
 
-        *self = StreamMetadataState::Parsed {
+        *self = StreamMetadataState::Parsed(ParsedStreamMetadata {
             context,
             config,
             surface_pool,
             min_num_surfaces,
-            coded_resolution,
             display_resolution,
             map_format: Rc::new(map_format),
             rt_format,
             profile: va_profile,
-        };
+        });
 
         Ok(())
     }
 }
 
-/// The VA-API backend handle.
+/// VA-API backend handle.
 ///
-/// This is just a wrapper around the `GenericBackendHandleInner` enum in order to make its variants
-/// private.
-pub struct GenericBackendHandle(GenericBackendHandleInner);
+/// This includes the VA picture which can be pending rendering or complete, as well as useful
+/// meta-information.
+pub struct GenericBackendHandle {
+    state: PictureState,
+}
 
 impl GenericBackendHandle {
     /// Creates a new pending handle on `surface_id`.
     pub(crate) fn new_pending(surface_id: u32) -> Self {
-        Self(GenericBackendHandleInner::Pending(surface_id))
+        Self {
+            state: PictureState::Pending(surface_id),
+        }
     }
 
     /// Creates a new ready handle on a completed `picture`.
@@ -498,11 +450,13 @@ impl GenericBackendHandle {
         map_format: Rc<libva::VAImageFormat>,
         display_resolution: Resolution,
     ) -> Self {
-        Self(GenericBackendHandleInner::Ready {
-            map_format,
-            picture,
-            display_resolution,
-        })
+        Self {
+            state: PictureState::Ready {
+                map_format,
+                picture,
+                display_resolution,
+            },
+        }
     }
 
     /// Returns a mapped VAImage. this maps the VASurface onto our address space.
@@ -511,8 +465,8 @@ impl GenericBackendHandle {
     ///
     /// Note that DynMappableHandle is downcastable.
     pub fn image(&mut self) -> Result<Image> {
-        match &mut self.0 {
-            GenericBackendHandleInner::Ready {
+        match &mut self.state {
+            PictureState::Ready {
                 map_format,
                 picture,
                 display_resolution,
@@ -530,35 +484,34 @@ impl GenericBackendHandle {
 
                 Ok(image)
             }
-            GenericBackendHandleInner::Pending(_) => Err(anyhow!("Mapping failed")),
+            PictureState::Pending(_) => Err(anyhow!("Mapping failed")),
         }
     }
 
     /// Returns the picture of this handle.
     pub fn picture(&self) -> Option<&libva::Picture<PictureSync>> {
-        match &self.0 {
-            GenericBackendHandleInner::Ready { picture, .. } => Some(picture),
-            GenericBackendHandleInner::Pending(_) => None,
+        match &self.state {
+            PictureState::Ready { picture, .. } => Some(picture),
+            PictureState::Pending(_) => None,
         }
     }
 
     /// Returns the id of the VA surface backing this handle.
     pub fn surface_id(&self) -> libva::VASurfaceID {
-        match &self.0 {
-            GenericBackendHandleInner::Ready { picture, .. } => picture.surface().id(),
-            GenericBackendHandleInner::Pending(id) => *id,
+        match &self.state {
+            PictureState::Ready { picture, .. } => picture.surface().id(),
+            PictureState::Pending(id) => *id,
         }
     }
 
     /// Returns `true` if this handle is ready.
     pub fn is_ready(&self) -> bool {
-        matches!(self.0, GenericBackendHandleInner::Ready { .. })
+        matches!(self.state, PictureState::Ready { .. })
     }
 }
 
-/// A type so we do not expose the enum in the public interface, as enum members
-/// are inherently public.
-enum GenericBackendHandleInner {
+/// Rendering state of a VA picture.
+enum PictureState {
     Ready {
         map_format: Rc<libva::VAImageFormat>,
         picture: libva::Picture<PictureSync>,
@@ -721,11 +674,12 @@ where
         picture: &Rc<RefCell<GenericBackendHandle>>,
         timestamp: u64,
     ) -> Result<<Self as VideoDecoderBackend>::Handle> {
+        let metadata = self.metadata_state.get_parsed()?;
+
         Ok(DecodedHandle::new(
             Rc::clone(picture),
-            self.metadata_state.coded_resolution()?,
             timestamp,
-            self.metadata_state.surface_pool()?,
+            metadata.surface_pool.clone(),
         ))
     }
 }
@@ -737,26 +691,39 @@ where
     type Handle = DecodedHandle;
 
     fn coded_resolution(&self) -> Option<Resolution> {
-        self.metadata_state.coded_resolution().ok()
+        self.metadata_state
+            .get_parsed()
+            .map(|m| m.surface_pool.coded_resolution)
+            .ok()
     }
 
     fn display_resolution(&self) -> Option<Resolution> {
-        self.metadata_state.display_resolution().ok()
+        self.metadata_state
+            .get_parsed()
+            .map(|m| m.display_resolution)
+            .ok()
     }
 
     fn num_resources_total(&self) -> usize {
-        self.metadata_state.min_num_surfaces().unwrap_or(0)
+        self.metadata_state
+            .get_parsed()
+            .map(|m| m.min_num_surfaces)
+            .unwrap_or(0)
     }
 
     fn num_resources_left(&self) -> usize {
-        match self.metadata_state.surface_pool() {
-            Ok(pool) => pool.num_surfaces_left(),
-            Err(_) => 0,
-        }
+        self.metadata_state
+            .get_parsed()
+            .map(|m| m.surface_pool.num_surfaces_left())
+            .unwrap_or(0)
     }
 
     fn format(&self) -> Option<crate::DecodedFormat> {
-        let map_format = self.metadata_state.map_format().ok()?;
+        let map_format = self
+            .metadata_state
+            .get_parsed()
+            .map(|m| &m.map_format)
+            .ok()?;
         DecodedFormat::try_from(map_format.as_ref()).ok()
     }
 
@@ -800,6 +767,8 @@ where
         let candidates = self.pending_jobs.drain(..).collect::<VecDeque<_>>();
 
         for job in candidates {
+            let metadata = self.metadata_state.get_parsed()?;
+
             if matches!(blocking_mode, BlockingMode::NonBlocking) {
                 let status = job.va_picture.query_status()?;
                 if status != libva::VASurfaceStatus::VASurfaceReady {
@@ -809,11 +778,10 @@ where
             }
 
             let current_picture = job.va_picture.sync()?;
-            let map_format = self.metadata_state.map_format()?;
             let backend_handle = GenericBackendHandle::new_ready(
                 current_picture,
-                Rc::clone(map_format),
-                self.metadata_state.display_resolution()?,
+                Rc::clone(&metadata.map_format),
+                metadata.display_resolution,
             );
 
             *job.codec_picture.borrow_mut() = backend_handle;
@@ -837,17 +805,18 @@ where
 
     fn block_on_handle(&mut self, handle: &Self::Handle) -> StatelessBackendResult<()> {
         for i in 0..self.pending_jobs.len() {
+            let metadata = self.metadata_state.get_parsed()?;
+
             // Remove from the queue in order.
             let job = &self.pending_jobs[i];
 
             if Rc::ptr_eq(&job.codec_picture, handle.handle_rc()) {
                 let job = self.pending_jobs.remove(i).unwrap();
                 let current_picture = job.va_picture.sync()?;
-                let map_format = self.metadata_state.map_format()?;
                 let backend_handle = GenericBackendHandle::new_ready(
                     current_picture,
-                    Rc::clone(map_format),
-                    self.metadata_state.display_resolution()?,
+                    Rc::clone(&metadata.map_format),
+                    metadata.display_resolution,
                 );
 
                 *job.codec_picture.borrow_mut() = backend_handle;
