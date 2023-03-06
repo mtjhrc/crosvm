@@ -233,6 +233,7 @@ impl<'a> VirtioDeviceBuilder for DiskConfig<'a> {
                 self.disk.read_only,
                 self.disk.sparse,
                 self.disk.block_size,
+                self.disk.multiple_workers,
                 self.disk.id,
                 self.device_tube,
                 None,
@@ -256,6 +257,7 @@ impl<'a> VirtioDeviceBuilder for DiskConfig<'a> {
                 disk.read_only,
                 disk.sparse,
                 disk.block_size,
+                false,
                 disk.id,
                 self.device_tube,
                 None,
@@ -708,6 +710,7 @@ pub fn create_balloon_device(
     inflate_tube: Option<Tube>,
     init_balloon_size: u64,
     enabled_features: u64,
+    registered_evt_q: Option<SendTube>,
 ) -> DeviceResult {
     let dev = virtio::Balloon::new(
         virtio::base_features(protection_type),
@@ -716,6 +719,7 @@ pub fn create_balloon_device(
         init_balloon_size,
         mode,
         enabled_features,
+        registered_evt_q,
     )
     .context("failed to create balloon")?;
 
