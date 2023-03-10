@@ -161,7 +161,6 @@ pub trait PmeNotify: Send {
 pub trait PmResource {
     fn pwrbtn_evt(&mut self) {}
     fn slpbtn_evt(&mut self) {}
-    fn rtc_evt(&mut self) {}
     fn gpe_evt(&mut self, _gpe: u32) {}
     fn pme_evt(&mut self, _requester_id: u16) {}
     fn register_gpe_notify_dev(&mut self, _gpe: u32, _notify_dev: Arc<Mutex<dyn GpeNotify>>) {}
@@ -427,6 +426,15 @@ impl VmMemoryDestination {
     }
 }
 
+/// Request to register or unregister an ioevent.
+#[derive(Serialize, Deserialize)]
+pub struct IoEventRegisterRequest {
+    pub event: Event,
+    pub addr: u64,
+    pub datamatch: Datamatch,
+    pub register: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum VmMemoryRequest {
     RegisterMemory {
@@ -450,13 +458,14 @@ pub enum VmMemoryRequest {
     /// Unregister the given memory slot that was previously registered with `RegisterMemory`.
     UnregisterMemory(MemSlot),
     /// Register an ioeventfd
-    IoEvent {
+    IoEventWithAlloc {
         evt: Event,
         allocation: Alloc,
         offset: u64,
         datamatch: Datamatch,
         register: bool,
     },
+    IoEventRaw(IoEventRegisterRequest),
 }
 
 /// Struct for managing `VmMemoryRequest`s IOMMU related state.
@@ -582,7 +591,7 @@ impl VmMemoryRequest {
                 Ok(_) => VmMemoryResponse::Ok,
                 Err(e) => VmMemoryResponse::Err(e),
             },
-            IoEvent {
+            IoEventWithAlloc {
                 evt,
                 allocation,
                 offset,
@@ -610,6 +619,25 @@ impl VmMemoryRequest {
                     vm.register_ioevent(&evt, IoEventAddress::Mmio(addr), datamatch)
                 } else {
                     vm.unregister_ioevent(&evt, IoEventAddress::Mmio(addr), datamatch)
+                };
+                match res {
+                    Ok(_) => VmMemoryResponse::Ok,
+                    Err(e) => VmMemoryResponse::Err(e),
+                }
+            }
+            IoEventRaw(request) => {
+                let res = if request.register {
+                    vm.register_ioevent(
+                        &request.event,
+                        IoEventAddress::Mmio(request.addr),
+                        request.datamatch,
+                    )
+                } else {
+                    vm.unregister_ioevent(
+                        &request.event,
+                        IoEventAddress::Mmio(request.addr),
+                        request.datamatch,
+                    )
                 };
                 match res {
                     Ok(_) => VmMemoryResponse::Ok,
@@ -989,8 +1017,6 @@ pub enum VmRequest {
     Powerbtn,
     /// Trigger a sleep button event in the guest.
     Sleepbtn,
-    /// Trigger a RTC interrupt in the guest.
-    Rtc,
     /// Suspend the VM's VCPUs until resume.
     Suspend,
     /// Swap the memory content into files on a disk
@@ -1240,15 +1266,6 @@ impl VmRequest {
             VmRequest::Sleepbtn => {
                 if let Some(pm) = pm {
                     pm.lock().slpbtn_evt();
-                    VmResponse::Ok
-                } else {
-                    error!("{:#?} not supported", *self);
-                    VmResponse::Err(SysError::new(ENOTSUP))
-                }
-            }
-            VmRequest::Rtc => {
-                if let Some(pm) = pm {
-                    pm.lock().rtc_evt();
                     VmResponse::Ok
                 } else {
                     error!("{:#?} not supported", *self);
