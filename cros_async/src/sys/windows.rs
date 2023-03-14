@@ -7,6 +7,8 @@ pub mod event;
 pub mod executor;
 pub mod handle_executor;
 pub mod handle_source;
+mod io_completion_port;
+pub mod overlapped_source;
 mod timer;
 pub mod wait_for_handle;
 use std::future::Future;
@@ -21,7 +23,7 @@ use crate::Error;
 use crate::Result;
 
 pub fn run_one_handle<F: Future>(fut: F) -> Result<F::Output> {
-    let ex = HandleExecutor::new();
+    let ex = HandleExecutor::new().map_err(Error::HandleExecutor)?;
     ex.run_until(fut).map_err(Error::HandleExecutor)
 }
 
