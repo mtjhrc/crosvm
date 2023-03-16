@@ -8,54 +8,19 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use arch::get_serial_cmdline;
-use arch::GetSerialCmdlineError;
-use arch::MsrConfig;
-use arch::MsrExitHandlerError;
-use arch::RunnableLinuxVm;
-use arch::VmComponents;
-use arch::VmImage;
-use base::Event;
-use base::MemoryMappingBuilder;
-use base::SendTube;
-use devices::serial_device::SerialHardware;
-use devices::serial_device::SerialParameters;
-use devices::vmwdt::VMWDT_DEFAULT_CLOCK_HZ;
-use devices::vmwdt::VMWDT_DEFAULT_TIMEOUT_SEC;
-use devices::Bus;
-use devices::BusDeviceObj;
-use devices::BusError;
-use devices::IrqChip;
-use devices::IrqChipAArch64;
-use devices::IrqEventSource;
-use devices::PciAddress;
-use devices::PciConfigMmio;
-use devices::PciDevice;
-use devices::PciRootCommand;
-use devices::Serial;
-#[cfg(all(target_arch = "aarch64", feature = "gdb"))]
-use gdbstub::arch::Arch;
-#[cfg(all(target_arch = "aarch64", feature = "gdb"))]
-use gdbstub_arch::aarch64::AArch64 as GdbArch;
-use hypervisor::CpuConfigAArch64;
-use hypervisor::DeviceKind;
-use hypervisor::Hypervisor;
-use hypervisor::HypervisorCap;
-use hypervisor::ProtectionType;
-use hypervisor::VcpuAArch64;
-use hypervisor::VcpuFeature;
-use hypervisor::VcpuInitAArch64;
-use hypervisor::VcpuRegAArch64;
-use hypervisor::Vm;
-use hypervisor::VmAArch64;
-#[cfg(windows)]
-use jail::FakeMinijailStub as Minijail;
-use kernel_loader::LoadedKernel;
-#[cfg(unix)]
+use arch::{get_serial_cmdline, GetSerialCmdlineError, RunnableLinuxVm, VmComponents, VmImage};
+use base::{Event, MemoryMappingBuilder};
+use devices::serial_device::{SerialHardware, SerialParameters};
+use devices::{
+    Bus, BusDeviceObj, BusError, IrqChip, IrqChipAArch64, PciAddress, PciConfigMmio, PciDevice,
+};
+use hypervisor::{
+    arm64_core_reg, DeviceKind, Hypervisor, HypervisorCap, ProtectionType, VcpuAArch64,
+    VcpuFeature, Vm, VmAArch64,
+};
 use minijail::Minijail;
 use remain::sorted;
 use resources::AddressRange;
@@ -254,9 +219,7 @@ pub enum Error {
     #[error("initrd could not be loaded: {0}")]
     InitrdLoadFailure(arch::LoadImageError),
     #[error("kernel could not be loaded: {0}")]
-    KernelLoadFailure(kernel_loader::Error),
-    #[error("error loading Kernel from Elf image: {0}")]
-    LoadElfKernel(kernel_loader::Error),
+    KernelLoadFailure(arch::LoadImageError),
     #[error("failed to map arm pvtime memory: {0}")]
     MapPvtimeError(base::Error),
     #[error("pVM firmware could not be loaded: {0}")]
@@ -365,8 +328,7 @@ impl arch::LinuxArch for AArch64 {
         ramoops_region: Option<arch::pstore::RamoopsRegion>,
         devs: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>,
         irq_chip: &mut dyn IrqChipAArch64,
-        vcpu_ids: &mut Vec<usize>,
-        dump_device_tree_blob: Option<PathBuf>,
+        kvm_vcpu_ids: &mut Vec<usize>,
         _debugcon_jail: Option<Minijail>,
         #[cfg(feature = "swap")] swap_controller: Option<&swap::SwapController>,
     ) -> std::result::Result<RunnableLinuxVm<V, Vcpu>, Self::Error>
@@ -391,18 +353,10 @@ impl arch::LinuxArch for AArch64 {
                 }
             }
             VmImage::Kernel(ref mut kernel_image) => {
-                let loaded_kernel = if let Ok(elf_kernel) = kernel_loader::load_elf(
-                    &mem,
-                    get_kernel_addr(),
-                    kernel_image,
-                    AARCH64_PHYS_MEM_START,
-                ) {
-                    elf_kernel
-                } else {
-                    kernel_loader::load_arm64_kernel(&mem, get_kernel_addr(), kernel_image)
-                        .map_err(Error::KernelLoadFailure)?
-                };
-                let kernel_end = loaded_kernel.address_range.end;
+                let kernel_size =
+                    arch::load_image(&mem, kernel_image, get_kernel_addr(), u64::max_value())
+                        .map_err(Error::KernelLoadFailure)?;
+                let kernel_end = get_kernel_addr().offset() + kernel_size as u64;
                 initrd = match components.initrd_image {
                     Some(initrd_file) => {
                         let mut initrd_file = initrd_file;
@@ -446,7 +400,7 @@ impl arch::LinuxArch for AArch64 {
             );
             has_pvtime &= vcpu.has_pvtime_support();
             vcpus.push(vcpu);
-            vcpu_ids.push(vcpu_id);
+            kvm_vcpu_ids.push(vcpu_id);
             vcpu_init.push(per_vcpu_init);
         }
 
@@ -679,7 +633,6 @@ impl arch::LinuxArch for AArch64 {
             }),
             bat_mmio_base_and_irq,
             vmwdt_cfg,
-            dump_device_tree_blob,
         )
         .map_err(Error::CreateFdt)?;
 
@@ -928,16 +881,20 @@ impl AArch64 {
 
         // All interrupts masked
         let pstate = PSR_D_BIT | PSR_A_BIT | PSR_I_BIT | PSR_F_BIT | PSR_MODE_EL1H;
-        regs.insert(VcpuRegAArch64::Pstate, pstate);
+        vcpu.set_one_reg(arm64_core_reg!(pstate), pstate)
+            .map_err(Error::SetReg)?;
 
         // Other cpus are powered off initially
         if vcpu_id == 0 {
-            let entry_addr = if protection_type.loads_firmware() {
-                Some(AARCH64_PROTECTED_VM_FW_START)
-            } else if protection_type.runs_firmware() {
-                None // Initial PC value is set by the hypervisor
+            let entry_addr = if has_bios {
+                get_bios_addr()
             } else {
-                Some(payload.entry().offset())
+                get_kernel_addr()
+            };
+            let entry_addr_reg_id = if protected_vm == ProtectionType::Protected {
+                arm64_core_reg!(regs, 1)
+            } else {
+                arm64_core_reg!(pc)
             };
 
             /* PC -- entry point */
@@ -946,14 +903,15 @@ impl AArch64 {
             }
 
             /* X0 -- fdt address */
-            regs.insert(VcpuRegAArch64::X(0), fdt_address.offset());
+            let mem_size = guest_mem.memory_size();
+            let fdt_addr = (AARCH64_PHYS_MEM_START + fdt_offset(mem_size, has_bios)) as u64;
+            vcpu.set_one_reg(arm64_core_reg!(regs, 0), fdt_addr)
+                .map_err(Error::SetReg)?;
 
-            if protection_type.runs_firmware() {
-                /* X1 -- payload entry point */
-                regs.insert(VcpuRegAArch64::X(1), payload.entry().offset());
-
-                /* X2 -- image size */
-                regs.insert(VcpuRegAArch64::X(2), payload.size());
+            /* X2 -- image size */
+            if protected_vm == ProtectionType::Protected {
+                vcpu.set_one_reg(arm64_core_reg!(regs, 2), image_size as u64)
+                    .map_err(Error::SetReg)?;
             }
         }
 
