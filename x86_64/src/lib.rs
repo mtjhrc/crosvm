@@ -47,6 +47,7 @@ use std::fs::File;
 use std::io;
 use std::io::Seek;
 use std::mem;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::Arc;
 
@@ -678,7 +679,8 @@ impl arch::LinuxArch for X8664arch {
         ramoops_region: Option<arch::pstore::RamoopsRegion>,
         devs: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>,
         irq_chip: &mut dyn IrqChipX86_64,
-        kvm_vcpu_ids: &mut Vec<usize>,
+        vcpu_ids: &mut Vec<usize>,
+        dump_device_tree_blob: Option<PathBuf>,
         debugcon_jail: Option<Minijail>,
         pflash_jail: Option<Minijail>,
         #[cfg(feature = "swap")] swap_controller: Option<&swap::SwapController>,
@@ -917,7 +919,7 @@ impl arch::LinuxArch for X8664arch {
             6, // RST_CPU|SYS_RST
             &acpi_dev_resource,
             host_cpus,
-            kvm_vcpu_ids,
+            vcpu_ids,
             &pci_irqs,
             pcie_cfg_mmio_range.start,
             max_bus,
@@ -971,6 +973,7 @@ impl arch::LinuxArch for X8664arch {
                     components.android_fstab,
                     kernel_end,
                     params,
+                    dump_device_tree_blob,
                 )?;
 
                 // Configure the bootstrap VCPU for the Linux/x86 64-bit boot protocol.
@@ -1588,13 +1591,16 @@ impl X8664arch {
         android_fstab: Option<File>,
         kernel_end: u64,
         params: boot_params,
+        dump_device_tree_blob: Option<PathBuf>,
     ) -> Result<()> {
         kernel_loader::load_cmdline(mem, GuestAddress(CMDLINE_OFFSET), cmdline)
             .map_err(Error::LoadCmdline)?;
 
         let mut setup_data = Vec::<SetupData>::new();
         if let Some(android_fstab) = android_fstab {
-            setup_data.push(fdt::create_fdt(android_fstab).map_err(Error::CreateFdt)?);
+            setup_data.push(
+                fdt::create_fdt(android_fstab, dump_device_tree_blob).map_err(Error::CreateFdt)?,
+            );
         }
         setup_data.push(setup_data_rng_seed());
 
