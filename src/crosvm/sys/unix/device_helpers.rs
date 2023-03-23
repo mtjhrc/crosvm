@@ -40,7 +40,7 @@ use devices::virtio::vfio_wrapper::VfioWrapper;
 use devices::virtio::vhost::user::proxy::VirtioVhostUser;
 use devices::virtio::vhost::user::vmm::VhostUserVirtioDevice;
 use devices::virtio::vhost::user::VhostUserDevice;
-use devices::virtio::vhost::vsock::VhostVsockConfig;
+use devices::virtio::vsock::VsockConfig;
 #[cfg(feature = "balloon")]
 use devices::virtio::BalloonMode;
 use devices::virtio::NetError;
@@ -441,7 +441,7 @@ pub fn create_virtio_snd_device(
     use virtio::snd::parameters::StreamSourceBackend as Backend;
 
     let policy = match backend {
-        Backend::NULL => "snd_null_device",
+        Backend::NULL | Backend::FILE => "snd_null_device",
         #[cfg(feature = "audio_cras")]
         Backend::Sys(virtio::snd::sys::StreamSourceBackend::CRAS) => "snd_cras_device",
         #[cfg(not(feature = "audio_cras"))]
@@ -1057,11 +1057,11 @@ pub fn create_vhost_user_video_device(
 pub fn create_vhost_vsock_device(
     protection_type: ProtectionType,
     jail_config: &Option<JailConfig>,
-    vhost_config: &VhostVsockConfig,
+    vsock_config: &VsockConfig,
 ) -> DeviceResult {
     let features = virtio::base_features(protection_type);
 
-    let dev = virtio::vhost::Vsock::new(features, vhost_config)
+    let dev = virtio::vhost::Vsock::new(features, vsock_config)
         .context("failed to set up virtual socket device")?;
 
     Ok(VirtioDeviceStub {
