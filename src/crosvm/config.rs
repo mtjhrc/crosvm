@@ -7,7 +7,6 @@ use std::arch::x86_64::__cpuid;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use std::arch::x86_64::__cpuid_count;
 use std::collections::BTreeMap;
-use std::net;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -74,7 +73,6 @@ pub(crate) use super::sys::HypervisorKind;
 
 cfg_if::cfg_if! {
     if #[cfg(unix)] {
-        use base::RawDescriptor;
         use devices::virtio::fs::passthrough;
         #[cfg(feature = "gpu")]
         use crate::crosvm::sys::GpuRenderServerParameters;
@@ -411,6 +409,7 @@ pub struct SharedDir {
     pub src: PathBuf,
     pub tag: String,
     pub kind: SharedDirKind,
+    pub ugid: (Option<u32>, Option<u32>),
     pub uid_map: String,
     pub gid_map: String,
     pub fs_cfg: passthrough::Config,
@@ -424,6 +423,7 @@ impl Default for SharedDir {
             src: Default::default(),
             tag: Default::default(),
             kind: Default::default(),
+            ugid: (None, None),
             uid_map: format!("0 {} 1", unsafe { geteuid() }),
             gid_map: format!("0 {} 1", unsafe { getegid() }),
             fs_cfg: Default::default(),
@@ -452,6 +452,20 @@ impl FromStr for SharedDir {
         //   and directory contents should be considered valid (default: 5)
         // * cache=CACHE - one of "never", "always", or "auto" (default: auto)
         // * writeback=BOOL - indicates whether writeback caching should be enabled (default: false)
+        // * uid=UID - uid of the device process in the user namespace created by minijail.
+        //   (default: 0)
+        // * gid=GID - gid of the device process in the user namespace created by minijail.
+        //   (default: 0)
+        // These two options (uid/gid) are useful when the crosvm process has no
+        // CAP_SETGID/CAP_SETUID but an identity mapping of the current user/group
+        // between the VM and the host is required.
+        // Say the current user and the crosvm process has uid 5000, a user can use
+        // "uid=5000" and "uidmap=5000 5000 1" such that files owned by user 5000
+        // still appear to be owned by user 5000 in the VM. These 2 options are
+        // useful only when there is 1 user in the VM accessing shared files.
+        // If multiple users want to access the shared file, gid/uid options are
+        // useless. It'd be better to create a new user namespace and give
+        // CAP_SETUID/CAP_SETGID to the crosvm.
         let mut components = param.split(':');
         let src = PathBuf::from(
             components
@@ -488,6 +502,12 @@ impl FromStr for SharedDir {
                 }
                 "uidmap" => shared_dir.uid_map = value.into(),
                 "gidmap" => shared_dir.gid_map = value.into(),
+                "uid" => {
+                    shared_dir.ugid.0 = Some(value.parse().map_err(|_| "`uid` must be an integer")?)
+                }
+                "gid" => {
+                    shared_dir.ugid.1 = Some(value.parse().map_err(|_| "`gid` must be an integer")?)
+                }
                 _ => type_opts.push(opt),
             }
         }
@@ -1055,7 +1075,6 @@ pub struct Config {
     pub host_cpu_topology: bool,
     #[cfg(windows)]
     pub host_guid: Option<String>,
-    pub host_ip: Option<net::Ipv4Addr>,
     pub hugepages: bool,
     pub hypervisor: Option<HypervisorKind>,
     pub init_memory: Option<u64>,
@@ -1072,7 +1091,6 @@ pub struct Config {
     pub log_file: Option<String>,
     #[cfg(windows)]
     pub logs_directory: Option<String>,
-    pub mac_address: Option<net_util::MacAddress>,
     pub memory: Option<u64>,
     pub memory_file: Option<PathBuf>,
     pub mmio_address_ranges: Vec<AddressRange>,
@@ -1081,8 +1099,6 @@ pub struct Config {
     pub net: Vec<NetParameters>,
     #[cfg(windows)]
     pub net_vhost_user_tube: Option<Tube>,
-    pub net_vq_pairs: Option<u16>,
-    pub netmask: Option<net::Ipv4Addr>,
     pub no_i8042: bool,
     pub no_rtc: bool,
     pub no_smt: bool,
@@ -1145,9 +1161,6 @@ pub struct Config {
     pub swiotlb: Option<u64>,
     #[cfg(windows)]
     pub syslog_tag: Option<String>,
-    #[cfg(unix)]
-    pub tap_fd: Vec<RawDescriptor>,
-    pub tap_name: Vec<String>,
     #[cfg(target_os = "android")]
     pub task_profiles: Vec<String>,
     #[cfg(unix)]
@@ -1163,7 +1176,6 @@ pub struct Config {
     pub vfio: Vec<super::sys::config::VfioOption>,
     #[cfg(unix)]
     pub vfio_isolate_hotplug: bool,
-    pub vhost_net: bool,
     #[cfg(unix)]
     pub vhost_net_device_path: PathBuf,
     pub vhost_user_blk: Vec<VhostUserOption>,
@@ -1274,7 +1286,6 @@ impl Default for Config {
             host_cpu_topology: false,
             #[cfg(windows)]
             host_guid: None,
-            host_ip: None,
             #[cfg(windows)]
             product_version: None,
             #[cfg(windows)]
@@ -1299,7 +1310,6 @@ impl Default for Config {
             log_file: None,
             #[cfg(windows)]
             logs_directory: None,
-            mac_address: None,
             memory: None,
             memory_file: None,
             mmio_address_ranges: Vec::new(),
@@ -1308,8 +1318,6 @@ impl Default for Config {
             net: Vec::new(),
             #[cfg(windows)]
             net_vhost_user_tube: None,
-            net_vq_pairs: None,
-            netmask: None,
             no_i8042: false,
             no_rtc: false,
             no_smt: false,
@@ -1365,9 +1373,6 @@ impl Default for Config {
             swiotlb: None,
             #[cfg(windows)]
             syslog_tag: None,
-            #[cfg(unix)]
-            tap_fd: Vec::new(),
-            tap_name: Vec::new(),
             #[cfg(target_os = "android")]
             task_profiles: Vec::new(),
             #[cfg(unix)]
@@ -1383,7 +1388,6 @@ impl Default for Config {
             vfio: Vec::new(),
             #[cfg(unix)]
             vfio_isolate_hotplug: false,
-            vhost_net: false,
             #[cfg(unix)]
             vhost_net_device_path: PathBuf::from(VHOST_NET_PATH),
             vhost_user_blk: Vec::new(),
@@ -2255,6 +2259,7 @@ mod tests {
         assert_eq!(shared_dir.fs_cfg.rewrite_security_xattrs, true);
         assert_eq!(shared_dir.fs_cfg.use_dax, false);
         assert_eq!(shared_dir.fs_cfg.posix_acl, true);
+        assert_eq!(shared_dir.ugid, (None, None));
     }
 
     #[cfg(unix)]
@@ -2277,5 +2282,21 @@ mod tests {
         assert_eq!(shared_dir.fs_cfg.rewrite_security_xattrs, true);
         assert_eq!(shared_dir.fs_cfg.use_dax, false);
         assert_eq!(shared_dir.fs_cfg.posix_acl, true);
+        assert_eq!(shared_dir.ugid, (None, None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_shared_dir_ugid_set() {
+        let shared_dir: SharedDir =
+            "/:hostRoot:type=fs:uidmap=40417 40417 1:gidmap=5000 5000 1:uid=40417:gid=5000"
+                .parse()
+                .unwrap();
+        assert_eq!(shared_dir.src, Path::new("/").to_path_buf());
+        assert_eq!(shared_dir.tag, "hostRoot");
+        assert!(shared_dir.kind == SharedDirKind::FS);
+        assert_eq!(shared_dir.uid_map, "40417 40417 1");
+        assert_eq!(shared_dir.gid_map, "5000 5000 1");
+        assert_eq!(shared_dir.ugid, (Some(40417), Some(5000)));
     }
 }

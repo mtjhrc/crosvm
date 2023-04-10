@@ -46,6 +46,8 @@ use devices::virtio::GpuDisplayParameters;
 use devices::virtio::GpuParameters;
 #[cfg(unix)]
 use devices::virtio::NetParameters;
+#[cfg(unix)]
+use devices::virtio::NetParametersMode;
 #[cfg(feature = "audio")]
 use devices::Ac97Parameters;
 use devices::PflashParameters;
@@ -1391,7 +1393,7 @@ pub struct RunCommand {
     #[cfg(unix)]
     #[argh(
         option,
-        arg_name = "(tap-name=TAP_NAME,mac=MAC_ADDRESS|tap-fd=TAP_FD,mac=MAC_ADDRESS|host-ip=IP,netmask=NETMASK,mac=MAC_ADDRESS),vhost-net=VHOST_NET"
+        arg_name = "(tap-name=TAP_NAME,mac=MAC_ADDRESS|tap-fd=TAP_FD,mac=MAC_ADDRESS|host-ip=IP,netmask=NETMASK,mac=MAC_ADDRESS),vhost-net=VHOST_NET,vq-pairs=N"
     )]
     #[serde(default)]
     #[merge(strategy = append)]
@@ -1419,6 +1421,8 @@ pub struct RunCommand {
     /// AND
     ///   vhost-net=BOOL  - whether enable vhost_net or not.
     ///                       Default: false.  [Optional]
+    ///   vq-pairs=N      - number of rx/tx queue pairs.
+    ///                       Default: 1.      [Optional]
     ///
     /// Either one tap_name, one tap_fd or a triplet of host_ip,
     /// netmask and mac must be specified.
@@ -1426,7 +1430,7 @@ pub struct RunCommand {
 
     #[cfg(unix)]
     #[argh(option, arg_name = "N")]
-    #[serde(skip)] // TODO(b/255223604)
+    #[serde(skip)] // Deprecated - use `net` instead.
     #[merge(strategy = overwrite_option)]
     /// virtio net virtual queue pairs. (default: 1)
     pub net_vq_pairs: Option<u16>,
@@ -1846,6 +1850,22 @@ pub struct RunCommand {
     ///        supports POSIX ACLs.  This should only be enabled
     ///        when the underlying file system supports POSIX ACLs.
     ///        The default value for this option is "true".
+    ///     uid=UID - uid of the device process in the user
+    ///        namespace created by minijail. (default: 0)
+    ///     gid=GID - gid of the device process in the user
+    ///        namespace created by minijail. (default: 0)
+    ///     Options uid and gid are useful when the crosvm process
+    ///     has no CAP_SETGID/CAP_SETUID but an identity mapping of
+    ///     the current user/group between the VM and the host is
+    ///     required. Say the current user and the crosvm process
+    ///     has uid 5000, a user can use "uid=5000" and
+    ///     "uidmap=5000 5000 1" such that files owned by user
+    ///     5000 still appear to be owned by user 5000 in the VM.
+    ///     These 2 options are useful only when there is 1 user
+    ///     in the VM accessing shared files. If multiple users
+    ///     want to access the shared file, gid/uid options are
+    ///     useless. It'd be better to create a new user namespace
+    ///     and give CAP_SETUID/CAP_SETGID to the crosvm.
     pub shared_dir: Vec<SharedDir>,
 
     #[argh(option, arg_name = "PATH:WIDTH:HEIGHT")]
@@ -2039,8 +2059,9 @@ pub struct RunCommand {
     /// path to sysfs of platform pass through
     pub vfio_platform: Vec<VfioOption>,
 
+    #[cfg(unix)]
     #[argh(switch)]
-    #[serde(skip)] // TODO(b/255223604)
+    #[serde(skip)] // Deprecated - use `net` instead.
     #[merge(strategy = overwrite_false)]
     /// use vhost for networking
     pub vhost_net: bool,
@@ -2651,8 +2672,6 @@ impl TryFrom<RunCommand> for super::config::Config {
             }
         }
 
-        cfg.vhost_net = cmd.vhost_net;
-
         #[cfg(feature = "tpm")]
         {
             cfg.software_tpm = cmd.software_tpm;
@@ -2747,12 +2766,79 @@ impl TryFrom<RunCommand> for super::config::Config {
             cfg.shared_dirs = cmd.shared_dir;
 
             cfg.net = cmd.net;
-            cfg.host_ip = cmd.host_ip;
-            cfg.netmask = cmd.netmask;
-            cfg.mac_address = cmd.mac_address;
 
-            cfg.tap_name = cmd.tap_name;
-            cfg.tap_fd = cmd.tap_fd;
+            let vhost_net_msg = match cmd.vhost_net {
+                true => ",vhost-net=true",
+                false => "",
+            };
+            let vq_pairs_msg = match cmd.net_vq_pairs {
+                Some(n) => format!(",vq-pairs={}", n),
+                None => "".to_string(),
+            };
+
+            for tap_name in cmd.tap_name {
+                log::warn!(
+                    "`--tap-name` is deprecated; please use \
+                    `--net tap-name={tap_name}{vhost_net_msg}{vq_pairs_msg}`"
+                );
+                cfg.net.push(NetParameters {
+                    mode: NetParametersMode::TapName {
+                        tap_name,
+                        mac: None,
+                    },
+                    vhost_net: cmd.vhost_net,
+                    vq_pairs: cmd.net_vq_pairs,
+                });
+            }
+
+            for tap_fd in cmd.tap_fd {
+                log::warn!(
+                    "`--tap-fd` is deprecated; please use \
+                    `--net tap-fd={tap_fd}{vhost_net_msg}{vq_pairs_msg}`"
+                );
+                cfg.net.push(NetParameters {
+                    mode: NetParametersMode::TapFd { tap_fd, mac: None },
+                    vhost_net: cmd.vhost_net,
+                    vq_pairs: cmd.net_vq_pairs,
+                });
+            }
+
+            if cmd.host_ip.is_some() || cmd.netmask.is_some() || cmd.mac_address.is_some() {
+                let host_ip = match cmd.host_ip {
+                    Some(host_ip) => host_ip,
+                    None => return Err("`host-ip` missing from network config".to_string()),
+                };
+                let netmask = match cmd.netmask {
+                    Some(netmask) => netmask,
+                    None => return Err("`netmask` missing from network config".to_string()),
+                };
+                let mac = match cmd.mac_address {
+                    Some(mac) => mac,
+                    None => return Err("`mac` missing from network config".to_string()),
+                };
+
+                if !cmd.vhost_user_net.is_empty() {
+                    return Err(
+                        "vhost-user-net cannot be used with any of --host-ip, --netmask or --mac"
+                            .to_string(),
+                    );
+                }
+
+                log::warn!(
+                    "`--host-ip`, `--netmask`, and `--mac` are deprecated; please use \
+                    `--net host-ip={host_ip},netmask={netmask},mac={mac}{vhost_net_msg}{vq_pairs_msg}`"
+                );
+
+                cfg.net.push(NetParameters {
+                    mode: NetParametersMode::RawConfig {
+                        host_ip,
+                        netmask,
+                        mac,
+                    },
+                    vhost_net: cmd.vhost_net,
+                    vq_pairs: cmd.net_vq_pairs,
+                });
+            }
 
             cfg.coiommu_param = cmd.coiommu;
 
@@ -2778,8 +2864,6 @@ impl TryFrom<RunCommand> for super::config::Config {
                     .get_or_insert_with(Default::default)
                     .pivot_root = p;
             }
-
-            cfg.net_vq_pairs = cmd.net_vq_pairs;
         }
 
         let protection_flags = [
