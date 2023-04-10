@@ -202,6 +202,8 @@ const KVM_PATH: &str = "/dev/kvm";
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 #[cfg(feature = "geniezone")]
 const GENIEZONE_PATH: &str = "/dev/gzvm";
+#[cfg(all(any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah"))]
+static GUNYAH_PATH: &str = "/dev/gunyah";
 
 fn create_virtio_devices(
     cfg: &Config,
@@ -209,6 +211,7 @@ fn create_virtio_devices(
     resources: &mut SystemAllocator,
     #[cfg_attr(not(feature = "gpu"), allow(unused_variables))] vm_evt_wrtube: &SendTube,
     #[cfg(feature = "balloon")] balloon_device_tube: Option<Tube>,
+    #[cfg(feature = "balloon")] balloon_wss_device_tube: Option<Tube>,
     #[cfg(feature = "balloon")] balloon_inflate_tube: Option<Tube>,
     #[cfg(feature = "balloon")] init_balloon_size: u64,
     disk_device_tubes: &mut Vec<Tube>,
@@ -482,8 +485,9 @@ fn create_virtio_devices(
 
     #[cfg(feature = "balloon")]
     if let Some(balloon_device_tube) = balloon_device_tube {
-        let balloon_features =
-            (cfg.balloon_page_reporting as u64) << BalloonFeatures::PageReporting as u64;
+        let balloon_features = (cfg.balloon_page_reporting as u64)
+            << BalloonFeatures::PageReporting as u64
+            | (cfg.balloon_wss_reporting as u64) << BalloonFeatures::WSSReporting as u64;
         devs.push(create_balloon_device(
             cfg.protection_type,
             &cfg.jail_config,
@@ -493,6 +497,7 @@ fn create_virtio_devices(
                 BalloonMode::Relaxed
             },
             balloon_device_tube,
+            balloon_wss_device_tube,
             balloon_inflate_tube,
             init_balloon_size,
             balloon_features,
@@ -710,6 +715,7 @@ fn create_devices(
     irq_control_tubes: &mut Vec<Tube>,
     control_tubes: &mut Vec<TaggedControlTube>,
     #[cfg(feature = "balloon")] balloon_device_tube: Option<Tube>,
+    #[cfg(feature = "balloon")] balloon_wss_device_tube: Option<Tube>,
     #[cfg(feature = "balloon")] init_balloon_size: u64,
     disk_device_tubes: &mut Vec<Tube>,
     pmem_device_tubes: &mut Vec<Tube>,
@@ -838,6 +844,7 @@ fn create_devices(
         vm_evt_wrtube,
         #[cfg(feature = "balloon")]
         balloon_device_tube,
+        balloon_wss_device_tube,
         #[cfg(feature = "balloon")]
         balloon_inflate_tube,
         #[cfg(feature = "balloon")]
@@ -1479,6 +1486,51 @@ fn run_kvm(device_path: Option<&Path>, cfg: Config, components: VmComponents) ->
     )
 }
 
+#[cfg(all(any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah"))]
+fn run_gunyah(
+    device_path: Option<&Path>,
+    cfg: Config,
+    components: VmComponents,
+) -> Result<ExitState> {
+    use devices::GunyahIrqChip;
+    use hypervisor::gunyah::{Gunyah, GunyahVcpu, GunyahVm};
+
+    let device_path = device_path.unwrap_or(Path::new(GUNYAH_PATH));
+    let gunyah = Gunyah::new_with_path(device_path)
+        .with_context(|| format!("failed to open Gunyah device {}", device_path.display()))?;
+
+    let guest_mem = create_guest_memory(&cfg, &components, &gunyah)?;
+
+    #[cfg(feature = "swap")]
+    let swap_controller = if let Some(swap_dir) = cfg.swap_dir.as_ref() {
+        Some(
+            SwapController::launch(guest_mem.clone(), swap_dir, &cfg.jail_config)
+                .context("launch vmm-swap monitor process")?,
+        )
+    } else {
+        None
+    };
+
+    let vm = GunyahVm::new(&gunyah, guest_mem, components.hv_cfg).context("failed to create vm")?;
+
+    // Check that the VM was actually created in protected mode as expected.
+    if cfg.protection_type.isolates_memory() && !vm.check_capability(VmCap::Protected) {
+        bail!("Failed to create protected VM");
+    }
+
+    let vm_clone = vm.try_clone()?;
+
+    run_vm::<GunyahVcpu, GunyahVm>(
+        cfg,
+        components,
+        vm,
+        &mut GunyahIrqChip::new(vm_clone)?,
+        None,
+        #[cfg(feature = "swap")]
+        swap_controller,
+    )
+}
+
 /// Choose a default hypervisor if no `--hypervisor` option was specified.
 fn get_default_hypervisor() -> Option<HypervisorKind> {
     let kvm_path = Path::new(KVM_PATH);
@@ -1495,6 +1547,20 @@ fn get_default_hypervisor() -> Option<HypervisorKind> {
         if gz_path.exists() {
             return Some(HypervisorKind::Geniezone {
                 device: Some(gz_path.to_path_buf()),
+            });
+        }
+    }
+
+    #[cfg(all(
+        unix,
+        any(target_arch = "arm", target_arch = "aarch64"),
+        feature = "gunyah"
+    ))]
+    {
+        let gunyah_path = Path::new(GUNYAH_PATH);
+        if gunyah_path.exists() {
+            return Some(HypervisorKind::Gunyah {
+                device: Some(gunyah_path.to_path_buf()),
             });
         }
     }
@@ -1523,6 +1589,12 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
         #[cfg(feature = "geniezone")]
         HypervisorKind::Geniezone { device } => run_gz(device.as_deref(), cfg, components),
+        #[cfg(all(
+            unix,
+            any(target_arch = "arm", target_arch = "aarch64"),
+            feature = "gunyah"
+        ))]
+        HypervisorKind::Gunyah { device } => run_gunyah(device.as_deref(), cfg, components),
     }
 }
 
@@ -1600,6 +1672,16 @@ where
                 .context("failed to set timeout")?;
             (Some(host), Some(device))
         }
+    } else {
+        (None, None)
+    };
+
+    #[cfg(feature = "balloon")]
+    let (balloon_wss_host_tube, balloon_wss_device_tube) = if cfg.balloon_wss_reporting {
+        let (host, device) = Tube::pair().context("failed to create tube")?;
+        host.set_recv_timeout(Some(Duration::from_millis(100)))
+            .context("failed to set timeout")?;
+        (Some(host), Some(device))
     } else {
         (None, None)
     };
@@ -1805,6 +1887,8 @@ where
         #[cfg(feature = "balloon")]
         balloon_device_tube,
         #[cfg(feature = "balloon")]
+        balloon_wss_device_tube,
+        #[cfg(feature = "balloon")]
         init_balloon_size,
         &mut disk_device_tubes,
         &mut pmem_device_tubes,
@@ -2006,6 +2090,8 @@ where
         control_tubes,
         #[cfg(feature = "balloon")]
         balloon_host_tube,
+        #[cfg(feature = "balloon")]
+        balloon_wss_host_tube,
         &disk_host_tubes,
         #[cfg(feature = "gpu")]
         gpu_control_host_tube,
@@ -2450,6 +2536,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     irq_control_tubes: Vec<Tube>,
     mut control_tubes: Vec<TaggedControlTube>,
     #[cfg(feature = "balloon")] balloon_host_tube: Option<Tube>,
+    #[cfg(feature = "balloon")] balloon_wss_host_tube: Option<Tube>,
     disk_host_tubes: &[Tube],
     #[cfg(feature = "gpu")] gpu_control_tube: Tube,
     #[cfg(feature = "usb")] usb_control_tube: Tube,
@@ -2819,6 +2906,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     let mut pvpanic_code = PvPanicCode::Unknown;
     #[cfg(feature = "balloon")]
     let mut balloon_stats_id: u64 = 0;
+    let mut balloon_wss_id: u64 = 0;
     let mut registered_evt_tubes: HashMap<RegisteredEvent, HashSet<AddressedTube>> = HashMap::new();
 
     'wait: loop {
@@ -3054,7 +3142,11 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                                 #[cfg(feature = "balloon")]
                                                 balloon_host_tube.as_ref(),
                                                 #[cfg(feature = "balloon")]
+                                                balloon_wss_host_tube.as_ref(),
+                                                #[cfg(feature = "balloon")]
                                                 &mut balloon_stats_id,
+                                                #[cfg(feature = "balloon")]
+                                                &mut balloon_wss_id,
                                                 disk_host_tubes,
                                                 &mut linux.pm,
                                                 #[cfg(feature = "gpu")]
