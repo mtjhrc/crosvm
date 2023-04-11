@@ -3,7 +3,6 @@
 // found in the LICENSE file.
 
 use std::arch::x86_64::CpuidResult;
-use std::mem::size_of;
 
 use base::errno_result;
 use base::error;
@@ -694,18 +693,18 @@ impl VcpuX86_64 for KvmVcpu {
         if size < 0 {
             return errno_result();
         }
-        // Size / sizeof(u32) = len of vec.
-        let mut xsave: Vec<u32> = vec![0u32; size as usize / size_of::<u32>()];
+        let mut xsave = Xsave::new(size as usize);
         let ioctl_nr = if size > KVM_XSAVE_MAX_SIZE {
             KVM_GET_XSAVE2()
         } else {
             KVM_GET_XSAVE()
         };
+
         // Safe because we know that our file is a VCPU fd, we know the kernel will only write the
         // correct amount of memory to our pointer, and we verify the return result.
         let ret = unsafe { ioctl_with_mut_ptr(self, ioctl_nr, xsave.as_mut_ptr()) };
         if ret == 0 {
-            Ok(Xsave::from(xsave))
+            Ok(xsave)
         } else {
             errno_result()
         }
@@ -724,7 +723,7 @@ impl VcpuX86_64 for KvmVcpu {
         }
         // Ensure xsave is the same size as used in get_xsave.
         // Return err if sizes don't match => not the same extensions are enabled for CPU.
-        if xsave.0.len() != size as usize / size_of::<u32>() {
+        if xsave.len() != size as usize {
             return Err(Error::new(EIO));
         }
 
@@ -732,7 +731,7 @@ impl VcpuX86_64 for KvmVcpu {
         // correct amount of memory to our pointer, and we verify the return result.
         // Because of the len check above, and because the layout of `struct kvm_xsave` is
         // compatible with a slice of `u32`, we can pass the pointer to `xsave` directly.
-        let ret = unsafe { ioctl_with_ptr(self, KVM_SET_XSAVE(), xsave.0.as_ptr()) };
+        let ret = unsafe { ioctl_with_ptr(self, KVM_SET_XSAVE(), xsave.as_ptr()) };
         if ret == 0 {
             Ok(())
         } else {
@@ -1542,12 +1541,6 @@ impl From<&Fpu> for kvm_fpu {
             mxcsr: r.mxcsr,
             ..Default::default()
         }
-    }
-}
-
-impl Xsave {
-    fn from(r: Vec<u32>) -> Self {
-        Xsave(r)
     }
 }
 

@@ -12,6 +12,7 @@ use base::error;
 use base::Result;
 use bit_field::*;
 use downcast_rs::impl_downcast;
+use libc::c_void;
 use serde::Deserialize;
 use serde::Serialize;
 use vm_memory::GuestAddress;
@@ -962,4 +963,35 @@ pub enum CpuHybridType {
 /// State of the VCPU's x87 FPU, MMX, XMM, YMM registers.
 /// May contain more state depending on enabled extensions.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Xsave(pub Vec<u32>);
+pub struct Xsave {
+    data: Vec<u32>,
+
+    // Actual length in bytes. May be smaller than data if a non-u32 multiple of bytes is requested.
+    len: usize,
+}
+
+impl Xsave {
+    /// Create a new buffer to store Xsave data.
+    ///
+    /// # Argments
+    /// * `len` size in bytes.
+    pub fn new(len: usize) -> Self {
+        Xsave {
+            data: vec![0; (len + 3) / 4],
+            len,
+        }
+    }
+
+    pub fn as_ptr(&self) -> *const c_void {
+        self.data.as_ptr() as *const c_void
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut c_void {
+        self.data.as_mut_ptr() as *mut c_void
+    }
+
+    /// Length in bytes of the XSAVE data.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+}
