@@ -2503,7 +2503,6 @@ dependencies = [
  "gdbstub_arch",
  "hypervisor",
  "libc",
- "once_cell",
  "remain",
  "resources",
  "rutabaga_gfx",
