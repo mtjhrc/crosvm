@@ -15,6 +15,7 @@ use base::Error;
 use base::Result;
 use libc::EBUSY;
 use libc::EINVAL;
+use libc::EIO;
 use libc::ENOENT;
 use libc::ENXIO;
 use libc::EOPNOTSUPP;
@@ -37,7 +38,6 @@ use crate::Register;
 use crate::Regs;
 use crate::Sregs;
 use crate::Vcpu;
-use crate::VcpuEvents;
 use crate::VcpuExit;
 use crate::VcpuRunHandle;
 use crate::VcpuX86_64;
@@ -1069,7 +1069,7 @@ impl VcpuX86_64 for WhpxVcpu {
         if res != WHV_E_INSUFFICIENT_BUFFER.0 {
             // This should always work, so if it doesn't, we'll return unsupported.
             error!("failed to get size of vcpu xsave");
-            return Err(Error::new(EOPNOTSUPP));
+            return Err(Error::new(EIO));
         }
 
         let mut xsave = Xsave::new(needed_buf_size as usize);
@@ -1101,15 +1101,13 @@ impl VcpuX86_64 for WhpxVcpu {
         })
     }
 
-    /// Gets the VCPU EVENTS.
     // TODO: b/270734340 implement
-    fn get_vcpu_events(&self) -> Result<VcpuEvents> {
+    fn get_interrupt_state(&self) -> Result<serde_json::Value> {
         Err(Error::new(EOPNOTSUPP))
     }
 
-    /// Sets the VCPU EVENTS.
     // TODO: b/270734340 implement
-    fn set_vcpu_events(&self, _vcpu_events: &VcpuEvents) -> Result<()> {
+    fn set_interrupt_state(&self, _data: serde_json::Value) -> Result<()> {
         Err(Error::new(EOPNOTSUPP))
     }
 
