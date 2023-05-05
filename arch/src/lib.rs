@@ -54,7 +54,7 @@ use devices::ProxyDevice;
 use devices::SerialHardware;
 use devices::SerialParameters;
 use devices::VirtioMmioDevice;
-#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "gdb"))]
+#[cfg(feature = "gdb")]
 use gdbstub::arch::Arch;
 use hypervisor::IoEventAddress;
 use hypervisor::Vm;
@@ -98,6 +98,8 @@ cfg_if::cfg_if! {
         pub use hypervisor::VmAArch64 as VmArch;
     } else if #[cfg(target_arch = "riscv64")] {
         pub use devices::IrqChipRiscv64 as IrqChipArch;
+        #[cfg(feature = "gdb")]
+        pub use gdbstub_arch::riscv::Riscv64 as GdbArch;
         pub use hypervisor::CpuConfigRiscv64 as CpuConfigArch;
         pub use hypervisor::Hypervisor as HypervisorArch;
         pub use hypervisor::VcpuInitRiscv64 as VcpuInitArch;
@@ -318,10 +320,11 @@ pub struct VmComponents {
     #[cfg(feature = "direct")]
     pub direct_gpe: Vec<u32>,
     pub dmi_path: Option<PathBuf>,
+    pub dynamic_power_coefficient: BTreeMap<usize, u32>,
     pub extra_kernel_params: Vec<String>,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     pub force_s2idle: bool,
-    #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "gdb"))]
+    #[cfg(feature = "gdb")]
     pub gdb: Option<(u32, Tube)>, // port and control tube.
     pub host_cpu_topology: bool,
     pub hugepages: bool,
@@ -357,7 +360,7 @@ pub struct RunnableLinuxVm<V: VmArch, Vcpu: VcpuArch> {
     pub bat_control: Option<BatControl>,
     pub delay_rt: bool,
     pub devices_thread: Option<std::thread::JoinHandle<()>>,
-    #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "gdb"))]
+    #[cfg(feature = "gdb")]
     pub gdb: Option<(u32, Tube)>,
     pub has_bios: bool,
     pub hotplug_bus: BTreeMap<u8, Arc<Mutex<dyn HotPlugBus>>>,
@@ -492,7 +495,7 @@ pub trait LinuxArch {
     ) -> Result<PciAddress, Self::Error>;
 }
 
-#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "gdb"))]
+#[cfg(feature = "gdb")]
 pub trait GdbOps<T: VcpuArch> {
     type Error: StdError;
 
