@@ -4,22 +4,13 @@
 
 // Defines Windows-specific submodules of sys_util
 
-// Modules ported to windows
-pub mod syslog;
-
 mod platform_timer_utils;
 pub use platform_timer_utils::*;
 
-mod file_util;
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::path::Path;
 use std::ptr::null_mut;
 
-pub use file_util::*;
 use serde::Deserialize;
 use serde::Serialize;
-use winapi::shared::minwindef::DWORD;
 use winapi::shared::winerror::WAIT_TIMEOUT;
 use winapi::um::handleapi::INVALID_HANDLE_VALUE;
 use winapi::um::synchapi::CreateMutexA;
@@ -28,9 +19,7 @@ use winapi::um::synchapi::WaitForSingleObject;
 use winapi::um::winbase::INFINITE;
 use winapi::um::winbase::WAIT_ABANDONED;
 use winapi::um::winbase::WAIT_OBJECT_0;
-use winapi::um::winuser::AllowSetForegroundWindow;
 
-use super::errno_result;
 use super::Error;
 use super::Result;
 use crate::descriptor::AsRawDescriptor;
@@ -112,26 +101,5 @@ impl<'a> Drop for MultiProcessMutexGuard<'a> {
         if unsafe { ReleaseMutex(self.lock.as_raw_descriptor()) } == 0 {
             panic!("Failed to unlock mutex: {:?}.", Error::last())
         }
-    }
-}
-
-/// Open the file with the given path.
-///
-/// Note that on POSIX< this wrapper handles opening existing FDs via /proc/self/fd/N. On Windows,
-/// this functionality doesn't exist, but we preserve this seemingly not very useful function to
-/// simplify cross platform code.
-pub fn open_file<P: AsRef<Path>>(path: P, options: &OpenOptions) -> Result<File> {
-    Ok(options.open(path)?)
-}
-
-/// Grants the given process id temporary permission to foreground another window. This succeeds
-/// only when the emulator is in the foreground, and will persist only until the next user
-/// interaction with the window
-pub fn give_foregrounding_permission(process_id: DWORD) -> Result<()> {
-    // Safe because this API does not modify memory, and process_id remains in scope for
-    // the duration of the call.
-    match unsafe { AllowSetForegroundWindow(process_id) } {
-        0 => errno_result(),
-        _ => Ok(()),
     }
 }
