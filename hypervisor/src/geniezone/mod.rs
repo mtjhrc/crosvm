@@ -193,10 +193,19 @@ impl VmAArch64 for GeniezoneVm {
     fn init_arch(
         &self,
         _payload_entry_address: GuestAddress,
-        _fdt_address: GuestAddress,
-        _fdt_size: usize,
+        fdt_address: GuestAddress,
+        fdt_size: usize,
     ) -> Result<()> {
-        Ok(())
+        let dtb_config = gzvm_dtb_config {
+            dtb_addr: fdt_address.offset(),
+            dtb_size: fdt_size.try_into().unwrap(),
+        };
+        let ret = unsafe { ioctl_with_ref(self, GZVM_SET_DTB_CONFIG(), &dtb_config) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            errno_result()
+        }
     }
 }
 
@@ -574,10 +583,14 @@ impl Hypervisor for Geniezone {
     }
 
     fn check_capability(&self, cap: HypervisorCap) -> bool {
-        matches!(
-            cap,
-            HypervisorCap::UserMemory | HypervisorCap::ImmediateExit
-        )
+        match cap {
+            HypervisorCap::UserMemory => true,
+            HypervisorCap::ArmPmuV3 => false,
+            HypervisorCap::ImmediateExit => true,
+            HypervisorCap::StaticSwiotlbAllocationRequired => true,
+            HypervisorCap::HypervisorInitializedBootContext => false,
+            HypervisorCap::S390UserSigp | HypervisorCap::TscDeadlineTimer => false,
+        }
     }
 }
 
