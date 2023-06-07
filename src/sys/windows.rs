@@ -923,6 +923,8 @@ fn handle_readable_event<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                     #[cfg(feature = "balloon")]
                                     let mut balloon_wss_id = 0;
                                     let vcpu_size = vcpu_boxes.lock().len();
+                                    let mut irqchip_for_restore =
+                                        guest_os.irq_chip.try_box_clone()?;
                                     let response = request.execute(
                                         &mut run_mode_opt,
                                         #[cfg(feature = "balloon")]
@@ -964,12 +966,8 @@ fn handle_readable_event<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                         device_ctrl_tube,
                                         vcpu_size,
                                         irq_handler_control,
-                                        || {
-                                            unimplemented!("todo: implement snapshot_irqchip");
-                                        },
-                                        |msg| {
-                                            unimplemented!("todo: implement restore_irqchip");
-                                        },
+                                        || guest_os.irq_chip.as_ref().snapshot(vcpu_size),
+                                        |snapshot| irqchip_for_restore.restore(snapshot, vcpu_size),
                                     );
 
                                     response
@@ -1169,6 +1167,12 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
 
     let vcpu_boxes: Arc<Mutex<Vec<Box<dyn VcpuArch>>>> = Arc::new(Mutex::new(Vec::new()));
     let run_mode_arc = Arc::new(VcpuRunMode::default());
+
+    // If we are restoring from a snapshot, then start suspended.
+    if restore_path.is_some() {
+        run_mode_arc.set_and_notify(VmRunMode::Suspending);
+    }
+
     let (vcpu_threads, vcpu_control_channels) = run_all_vcpus(
         vcpus,
         vcpu_boxes.clone(),
@@ -1186,8 +1190,51 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
 
     // Restore VM (if applicable).
     if let Some(path) = restore_path {
-        // TODO(b/273992211): Port the unix --restore code to Windows.
-        todo!();
+        vm_control::do_restore(
+            path,
+            |msg| {
+                kick_all_vcpus(
+                    run_mode_arc.as_ref(),
+                    &vcpu_control_channels,
+                    vcpu_boxes.as_ref(),
+                    guest_os.irq_chip.as_ref(),
+                    &pvclock_host_tube,
+                    msg,
+                )
+            },
+            |msg, index| {
+                kick_vcpu(
+                    run_mode_arc.as_ref(),
+                    &vcpu_control_channels,
+                    vcpu_boxes.as_ref(),
+                    guest_os.irq_chip.as_ref(),
+                    &pvclock_host_tube,
+                    index,
+                    msg,
+                )
+            },
+            &irq_handler_control,
+            &device_ctrl_tube,
+            guest_os.vcpu_count,
+            |image| {
+                guest_os
+                    .irq_chip
+                    .try_box_clone()?
+                    .restore(image, guest_os.vcpu_count)
+            },
+        )?;
+        // Allow the vCPUs to start for real.
+        kick_all_vcpus(
+            run_mode_arc.as_ref(),
+            &vcpu_control_channels,
+            vcpu_boxes.as_ref(),
+            guest_os.irq_chip.as_ref(),
+            &pvclock_host_tube,
+            // Other platforms (unix) have multiple modes they could start in (e.g. starting for
+            // guest kernel debugging, etc). If/when we support those modes on Windows, we'll need
+            // to enter that mode here rather than VmRunMode::Running.
+            VcpuControl::RunState(VmRunMode::Running),
+        );
     }
 
     let mut exit_state = ExitState::Stop;
