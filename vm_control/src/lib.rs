@@ -20,6 +20,8 @@ pub mod gpu;
 use base::MemoryMappingBuilderUnix;
 #[cfg(windows)]
 use base::MemoryMappingBuilderWindows;
+use hypervisor::BalloonEvent;
+use hypervisor::MemRegion;
 
 pub mod client;
 pub mod display;
@@ -523,6 +525,8 @@ pub enum VmMemoryRequest {
         guest_address: GuestAddress,
         size: u64,
     },
+    /// Balloon allocation/deallocation target reached.
+    BalloonTargetReached { size: u64 },
     /// Unregister the given memory slot that was previously registered with `RegisterMemory`.
     UnregisterMemory(VmMemoryRegionId),
     /// Register an ioeventfd by looking up using Alloc info.
@@ -752,17 +756,29 @@ impl VmMemoryRequest {
             DynamicallyFreeMemoryRange {
                 guest_address,
                 size,
-            } => match vm.handle_inflate(guest_address, size) {
+            } => match vm.handle_balloon_event(BalloonEvent::Inflate(MemRegion {
+                guest_address,
+                size,
+            })) {
                 Ok(_) => VmMemoryResponse::Ok,
                 Err(e) => VmMemoryResponse::Err(e),
             },
             DynamicallyReclaimMemoryRange {
                 guest_address,
                 size,
-            } => match vm.handle_deflate(guest_address, size) {
+            } => match vm.handle_balloon_event(BalloonEvent::Deflate(MemRegion {
+                guest_address,
+                size,
+            })) {
                 Ok(_) => VmMemoryResponse::Ok,
                 Err(e) => VmMemoryResponse::Err(e),
             },
+            BalloonTargetReached { size } => {
+                match vm.handle_balloon_event(BalloonEvent::BalloonTargetReached(size)) {
+                    Ok(_) => VmMemoryResponse::Ok,
+                    Err(e) => VmMemoryResponse::Err(e),
+                }
+            }
             IoEventWithAlloc {
                 evt,
                 allocation,
