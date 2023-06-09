@@ -515,30 +515,7 @@ fn create_virtio_devices(
     }
 
     for opt in &cfg.net {
-        let vq_pairs = opt.vq_pairs.unwrap_or(1);
-        let vcpu_count = cfg.vcpu_count.unwrap_or(1);
-        let multi_vq = vq_pairs > 1 && !opt.vhost_net;
-        let (tap, mac) = create_tap_for_net_device(&opt.mode, multi_vq)?;
-        let dev = if opt.vhost_net {
-            create_virtio_vhost_net_device_from_tap(
-                cfg.protection_type,
-                &cfg.jail_config,
-                vq_pairs,
-                vcpu_count,
-                cfg.vhost_net_device_path.clone(),
-                tap,
-                mac,
-            )
-        } else {
-            create_virtio_net_device_from_tap(
-                cfg.protection_type,
-                &cfg.jail_config,
-                vq_pairs,
-                vcpu_count,
-                tap,
-                mac,
-            )
-        }?;
+        let dev = opt.create_virtio_device_and_jail(cfg.protection_type, &cfg.jail_config)?;
         devs.push(dev);
     }
 
@@ -4016,6 +3993,11 @@ pub fn start_devices(opts: DevicesCommand) -> anyhow::Result<()> {
 
     // Create vsock devices.
     for (i, params) in opts.vsock.iter().enumerate() {
+        add_device(i, &params.device, &params.vhost, &jail, &mut devices_jails)?;
+    }
+
+    // Create network devices.
+    for (i, params) in opts.net.iter().enumerate() {
         add_device(i, &params.device, &params.vhost, &jail, &mut devices_jails)?;
     }
 
