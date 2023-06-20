@@ -22,7 +22,6 @@ use crate::pci::PciBarConfiguration;
 use crate::pci::PciBarIndex;
 use crate::pci::PciCapability;
 use crate::virtio::ipc_memory_mapper::IpcMemoryMapper;
-use crate::Suspendable;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VirtioTransportType {
@@ -58,7 +57,7 @@ pub trait SharedMemoryMapper: Send {
 /// and all the events, memory, and queues for device operation will be moved into the device.
 /// Optionally, a virtio device can implement device reset in which it returns said resources and
 /// resets its internal.
-pub trait VirtioDevice: Send + Suspendable {
+pub trait VirtioDevice: Send {
     /// Returns a label suitable for debug output.
     fn debug_label(&self) -> String {
         format!("virtio-{}", self.device_type())
@@ -233,7 +232,13 @@ pub trait VirtioDevice: Send + Suspendable {
     }
 
     /// Restore device state from a snapshot.
+    /// TODO(b/280607404): Vhost user will need fds passed to the device process.
     fn virtio_restore(&mut self, _data: serde_json::Value) -> anyhow::Result<()> {
         anyhow::bail!("virtio_restore not implemented for {}", self.debug_label());
+    }
+
+    /// Returns true if the device uses the vhost user protocol.
+    fn is_vhost_user(&self) -> bool {
+        false
     }
 }

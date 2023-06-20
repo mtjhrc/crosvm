@@ -89,28 +89,29 @@ fn is_a_fatal_input_error(e: &io::Error) -> bool {
 pub(in crate::virtio::console) fn spawn_input_thread(
     mut rx: Box<named_pipes::PipeConnection>,
     in_avail_evt: &Event,
+    input_buffer: VecDeque<u8>,
 ) -> (Arc<Mutex<VecDeque<u8>>>, WorkerThread<()>) {
-    let buffer = Arc::new(Mutex::new(VecDeque::<u8>::new()));
+    let buffer = Arc::new(Mutex::new(input_buffer));
     let buffer_cloned = buffer.clone();
 
     let thread_in_avail_evt = in_avail_evt
         .try_clone()
         .expect("failed to clone in_avail_evt");
 
+    let buffer_max_size = 1 << 12;
+    let mut rx_buf = Vec::with_capacity(buffer_max_size);
     let res = WorkerThread::start("v_console_input", move |kill_evt| {
         let mut read_overlapped =
             named_pipes::OverlappedWrapper::new(true).expect("failed to create OverlappedWrapper");
-        let size = rx
-            .get_available_byte_count()
-            .expect("failed to get available byte count");
-
         loop {
-            let buffer_max_size = 1 << 12;
-            let mut rx_buf = vec![];
+            let size = rx
+                .get_available_byte_count()
+                .expect("failed to get available byte count") as usize;
+
             if size < buffer_max_size {
-                rx_buf.resize(size as usize, Default::default());
+                rx_buf.resize(size, Default::default());
             } else {
-                rx_buf.resize(buffer_max_size as usize, Default::default());
+                rx_buf.resize(buffer_max_size, Default::default());
             };
             let res = rx.read_overlapped_blocking(&mut rx_buf, &mut read_overlapped, &kill_evt);
 

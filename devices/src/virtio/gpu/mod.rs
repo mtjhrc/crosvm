@@ -80,7 +80,6 @@ use super::SharedMemoryRegion;
 use super::SignalableInterrupt;
 use super::VirtioDevice;
 use super::Writer;
-use crate::Suspendable;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GpuMode {
@@ -108,6 +107,13 @@ impl Default for GpuMode {
         )))]
         return GpuMode::Mode2D;
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GpuWsi {
+    #[serde(alias = "vk")]
+    Vulkan,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1117,6 +1123,11 @@ impl Gpu {
         let use_render_server = rutabaga_server_descriptor.is_some()
             || gpu_parameters.allow_implicit_render_server_exec;
 
+        let rutabaga_wsi = match gpu_parameters.wsi {
+            Some(GpuWsi::Vulkan) => RutabagaWsi::VulkanSwapchain,
+            _ => RutabagaWsi::Surfaceless,
+        };
+
         let rutabaga_builder = RutabagaBuilder::new(component, gpu_parameters.capset_mask)
             .set_display_width(display_width)
             .set_display_height(display_height)
@@ -1126,7 +1137,7 @@ impl Gpu {
             .set_use_glx(gpu_parameters.renderer_use_glx)
             .set_use_surfaceless(gpu_parameters.renderer_use_surfaceless)
             .set_use_vulkan(gpu_parameters.use_vulkan.unwrap_or_default())
-            .set_wsi(gpu_parameters.wsi.as_ref())
+            .set_wsi(rutabaga_wsi)
             .set_use_external_blob(gpu_parameters.external_blob)
             .set_use_system_blob(gpu_parameters.system_blob)
             .set_use_render_server(use_render_server);
@@ -1445,8 +1456,6 @@ impl VirtioDevice for Gpu {
         true
     }
 }
-
-impl Suspendable for Gpu {}
 
 /// This struct takes the ownership of resource bridges and tracks which ones should be processed.
 struct ResourceBridges {

@@ -58,8 +58,9 @@ fn is_a_fatal_input_error(e: &io::Error) -> bool {
 pub(in crate::virtio::console) fn spawn_input_thread(
     mut rx: crate::serial::sys::InStreamType,
     in_avail_evt: &Event,
+    input_buffer: VecDeque<u8>,
 ) -> (Arc<Mutex<VecDeque<u8>>>, WorkerThread<()>) {
-    let buffer = Arc::new(Mutex::new(VecDeque::<u8>::new()));
+    let buffer = Arc::new(Mutex::new(input_buffer));
     let buffer_cloned = buffer.clone();
 
     let thread_in_avail_evt = in_avail_evt
@@ -85,7 +86,7 @@ pub(in crate::virtio::console) fn spawn_input_thread(
         };
 
         let mut rx_buf = [0u8; 1 << 12];
-        loop {
+        'wait: loop {
             let events = match wait_ctx.wait() {
                 Ok(events) => events,
                 Err(e) => {
@@ -96,7 +97,20 @@ pub(in crate::virtio::console) fn spawn_input_thread(
             for event in events {
                 match event.token {
                     Token::Kill => {
-                        return;
+                        // on kill, read all remaining data.
+                        loop {
+                            match rx.read(&mut rx_buf) {
+                                Ok(size) => {
+                                    buffer.lock().extend(&rx_buf[0..size]);
+                                }
+                                Err(e) => {
+                                    if e.kind() == io::ErrorKind::WouldBlock {
+                                        break 'wait;
+                                    }
+                                    error!("failed to read remaining data on exit: {:?}", e);
+                                }
+                            }
+                        }
                     }
                     Token::ConsoleEvent => {
                         match rx.read(&mut rx_buf) {
