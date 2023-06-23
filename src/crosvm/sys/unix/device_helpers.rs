@@ -577,7 +577,7 @@ pub fn create_single_touch_device(
         .context("failed configuring virtio single touch")?;
 
     let (width, height) = single_touch_spec.get_size();
-    let dev = virtio::new_single_touch(
+    let dev = virtio::input::new_single_touch(
         idx,
         socket,
         width,
@@ -603,7 +603,7 @@ pub fn create_multi_touch_device(
         .context("failed configuring virtio multi touch")?;
 
     let (width, height) = multi_touch_spec.get_size();
-    let dev = virtio::new_multi_touch(
+    let dev = virtio::input::new_multi_touch(
         idx,
         socket,
         width,
@@ -630,7 +630,7 @@ pub fn create_trackpad_device(
         .context("failed configuring virtio trackpad")?;
 
     let (width, height) = trackpad_spec.get_size();
-    let dev = virtio::new_trackpad(
+    let dev = virtio::input::new_trackpad(
         idx,
         socket,
         width,
@@ -655,7 +655,7 @@ pub fn create_mouse_device<T: IntoUnixStream>(
         .into_unix_stream()
         .context("failed configuring virtio mouse")?;
 
-    let dev = virtio::new_mouse(idx, socket, virtio::base_features(protection_type))
+    let dev = virtio::input::new_mouse(idx, socket, virtio::base_features(protection_type))
         .context("failed to set up input device")?;
 
     Ok(VirtioDeviceStub {
@@ -674,7 +674,7 @@ pub fn create_keyboard_device<T: IntoUnixStream>(
         .into_unix_stream()
         .context("failed configuring virtio keyboard")?;
 
-    let dev = virtio::new_keyboard(idx, socket, virtio::base_features(protection_type))
+    let dev = virtio::input::new_keyboard(idx, socket, virtio::base_features(protection_type))
         .context("failed to set up input device")?;
 
     Ok(VirtioDeviceStub {
@@ -693,7 +693,7 @@ pub fn create_switches_device<T: IntoUnixStream>(
         .into_unix_stream()
         .context("failed configuring virtio switches")?;
 
-    let dev = virtio::new_switches(idx, socket, virtio::base_features(protection_type))
+    let dev = virtio::input::new_switches(idx, socket, virtio::base_features(protection_type))
         .context("failed to set up input device")?;
 
     Ok(VirtioDeviceStub {
@@ -712,7 +712,7 @@ pub fn create_rotary_device<T: IntoUnixStream>(
         .into_unix_stream()
         .context("failed configuring virtio rotary")?;
 
-    let dev = virtio::new_rotary(idx, socket, virtio::base_features(protection_type))
+    let dev = virtio::input::new_rotary(idx, socket, virtio::base_features(protection_type))
         .context("failed to set up input device")?;
 
     Ok(VirtioDeviceStub {
@@ -732,7 +732,7 @@ pub fn create_vinput_device(
         .open(dev_path)
         .with_context(|| format!("failed to open vinput device {}", dev_path.display()))?;
 
-    let dev = virtio::new_evdev(dev_file, virtio::base_features(protection_type))
+    let dev = virtio::input::new_evdev(dev_file, virtio::base_features(protection_type))
         .context("failed to set up input device")?;
 
     Ok(VirtioDeviceStub {
@@ -1096,6 +1096,23 @@ impl VirtioDeviceBuilder for &VsockConfig {
 
         Ok(Box::new(vsock_device))
     }
+}
+
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+pub fn create_vhost_scmi_device(
+    protected_vm: ProtectionType,
+    jail_config: &Option<JailConfig>,
+    vhost_scmi_dev_path: PathBuf,
+) -> DeviceResult {
+    let features = virtio::base_features(protected_vm);
+
+    let dev = virtio::vhost::Scmi::new(&vhost_scmi_dev_path, features)
+        .context("failed to set up vhost scmi device")?;
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        jail: simple_jail(jail_config, "vhost_scmi_device")?,
+    })
 }
 
 pub fn create_fs_device(
