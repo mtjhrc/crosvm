@@ -2784,7 +2784,22 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     android::set_process_profiles(&cfg.task_profiles)?;
 
     #[allow(unused_mut)]
-    let mut run_mode = VmRunMode::Running;
+    let mut run_mode = if cfg.suspended {
+        // Sleep devices before creating vcpus.
+        device_ctrl_tube
+            .send(&DeviceControlCommand::SleepDevices)
+            .context("send command to devices control socket")?;
+        match device_ctrl_tube
+            .recv()
+            .context("receive from devices control socket")?
+        {
+            VmResponse::Ok => (),
+            resp => bail!("device sleep failed: {}", resp),
+        }
+        VmRunMode::Suspending
+    } else {
+        VmRunMode::Running
+    };
     #[cfg(feature = "gdb")]
     if to_gdb_channel.is_some() {
         // Wait until a GDB client attaches
@@ -3281,7 +3296,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                             );
 
                                             // For non s2idle guest suspension we are done
-                                            if let VmRequest::Suspend = request {
+                                            if let VmRequest::SuspendVcpus = request {
                                                 if cfg.force_s2idle {
                                                     suspend_requested = true;
 
@@ -3449,6 +3464,11 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         if let Err(e) = handle.join() {
             error!("failed to join vcpu thread: {:?}", e);
         }
+    }
+
+    // After joining all vcpu threads, unregister the process-wide signal handler.
+    if let Err(e) = vcpu::remove_vcpu_signal_handler() {
+        error!("failed to remove vcpu thread signal handler: {:#}", e);
     }
 
     #[cfg(feature = "swap")]
