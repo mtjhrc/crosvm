@@ -9,8 +9,8 @@ cfg_if::cfg_if! {
         use base::RawDescriptor;
         use devices::virtio::vhost::user::device::parse_wayland_sock;
 
-        use super::sys::config::VfioOption;
-        use super::config::SharedDir;
+        use crate::crosvm::sys::config::VfioOption;
+        use crate::crosvm::sys::config::SharedDir;
     }
 }
 
@@ -356,6 +356,9 @@ pub struct SwapDisableCommand {
     #[argh(positional, arg_name = "VM_SOCKET")]
     /// VM Socket path
     pub socket_path: String,
+    #[argh(switch)]
+    /// clean up the swap file in the background.
+    pub slow_file_cleanup: bool,
 }
 
 #[derive(FromArgs)]
