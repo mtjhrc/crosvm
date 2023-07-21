@@ -183,6 +183,8 @@ use tube_transporter::TubeToken;
 use tube_transporter::TubeTransporterReader;
 use vm_control::api::VmMemoryClient;
 use vm_control::BalloonControlCommand;
+#[cfg(feature = "balloon")]
+use vm_control::BalloonTube;
 use vm_control::DeviceControlCommand;
 use vm_control::IrqHandlerRequest;
 use vm_control::PvClockCommand;
@@ -782,19 +784,20 @@ struct PvClockError(String);
 
 fn handle_readable_event<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     event: &TriggeredEvent<Token>,
-    vm_control_indices_to_remove: &mut Vec<usize>,
+    vm_control_ids_to_remove: &mut Vec<usize>,
+    next_control_id: &mut usize,
     service_vm_state: &mut ServiceVmState,
     ac97_host_tubes: &[Tube],
     disk_host_tubes: &[Tube],
     ipc_main_loop_tube: Option<&Tube>,
     vm_evt_rdtube: &RecvTube,
-    control_tubes: &mut Vec<TaggedControlTube>,
+    control_tubes: &mut BTreeMap<usize, TaggedControlTube>,
     guest_os: &mut RunnableLinuxVm<V, Vcpu>,
     sys_allocator_mutex: &Arc<Mutex<SystemAllocator>>,
     virtio_snd_host_mute_tube: &mut Option<Tube>,
     proto_main_loop_tube: Option<&ProtoTube>,
     anti_tamper_main_thread_tube: &Option<ProtoTube>,
-    balloon_host_tube: &Option<Tube>,
+    #[cfg(feature = "balloon")] mut balloon_tube: Option<&mut BalloonTube>,
     memory_size_mb: u64,
     vcpu_boxes: &Mutex<Vec<Box<dyn VcpuArch>>>,
     pvclock_host_tube: &Option<Tube>,
@@ -846,33 +849,25 @@ fn handle_readable_event<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             let server =
                 vm_control_server.expect("control server must exist if this event triggers");
             let client = server.accept();
+            let id = *next_control_id;
+            *next_control_id += 1;
             wait_ctx
-                .add(
-                    client.0.get_read_notifier(),
-                    Token::VmControl {
-                        index: control_tubes.len(),
-                    },
-                )
+                .add(client.0.get_read_notifier(), Token::VmControl { id })
                 .exit_context(
                     Exit::WaitContextAdd,
                     "failed to add trigger to wait context",
                 )?;
             wait_ctx
-                .add(
-                    client.0.get_close_notifier(),
-                    Token::VmControl {
-                        index: control_tubes.len(),
-                    },
-                )
+                .add(client.0.get_close_notifier(), Token::VmControl { id })
                 .exit_context(
                     Exit::WaitContextAdd,
                     "failed to add trigger to wait context",
                 )?;
-            control_tubes.push(TaggedControlTube::Vm(client));
+            control_tubes.insert(id, TaggedControlTube::Vm(client));
         }
         #[allow(clippy::collapsible_match)]
-        Token::VmControl { index } => {
-            if let Some(tube) = control_tubes.get(index) {
+        Token::VmControl { id } => {
+            if let Some(tube) = control_tubes.get(&id) {
                 #[allow(clippy::single_match)]
                 match tube {
                     TaggedControlTube::Product(product_tube) => {
@@ -905,20 +900,19 @@ fn handle_readable_event<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                 VmRequest::Unregister { socket_addr } => {
                                     unimplemented!("not implemented on Windows");
                                 }
+                                #[cfg(feature = "balloon")]
+                                VmRequest::BalloonCommand(cmd) => {
+                                    if let Some(balloon_tube) = balloon_tube {
+                                        balloon_tube.send_cmd(cmd, id)
+                                    } else {
+                                        error!("balloon not enabled");
+                                        None
+                                    }
+                                }
                                 _ => {
-                                    #[cfg(feature = "balloon")]
-                                    let mut balloon_stats_id = 0;
-                                    #[cfg(feature = "balloon")]
-                                    let mut balloon_wss_id = 0;
                                     let vcpu_size = vcpu_boxes.lock().len();
                                     let response = request.execute(
                                         &mut run_mode_opt,
-                                        #[cfg(feature = "balloon")]
-                                        balloon_host_tube.as_ref(),
-                                        #[cfg(feature = "balloon")]
-                                        &mut balloon_stats_id,
-                                        #[cfg(feature = "balloon")]
-                                        &mut balloon_wss_id,
                                         disk_host_tubes,
                                         &mut guest_os.pm,
                                         #[cfg(feature = "gpu")]
@@ -961,12 +955,14 @@ fn handle_readable_event<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                         },
                                     );
 
-                                    response
+                                    Some(response)
                                 }
                             };
 
-                            if let Err(e) = tube.0.send(&response) {
-                                error!("failed to send VmResponse: {}", e);
+                            if let Some(response) = response {
+                                if let Err(e) = tube.0.send(&response) {
+                                    error!("failed to send VmResponse: {}", e);
+                                }
                             }
 
                             if let Some(run_mode) = run_mode_opt {
@@ -987,7 +983,7 @@ fn handle_readable_event<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                         }
                         Err(e) => {
                             if let TubeError::Disconnected = e {
-                                vm_control_indices_to_remove.push(index);
+                                vm_control_ids_to_remove.push(id);
                             } else {
                                 error!("failed to recv VmRequest: {}", e);
                             }
@@ -996,12 +992,30 @@ fn handle_readable_event<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                 }
             }
         }
+        #[cfg(feature = "balloon")]
+        Token::BalloonTube => match balloon_tube.as_mut().expect("missing balloon tube").recv() {
+            Ok(resp) => {
+                for (resp, idx) in resp {
+                    if let Some(TaggedControlTube::Vm(tube)) = control_tubes.get(&idx) {
+                        if let Err(e) = tube.0.send(&resp) {
+                            error!("failed to send VmResponse: {}", e);
+                        }
+                    } else {
+                        error!("Bad tube index {}", idx);
+                    }
+                }
+            }
+            Err(err) => {
+                error!("Error processing balloon tube {:?}", err)
+            }
+        },
+        #[cfg(not(feature = "balloon"))]
+        Token::BalloonTube => unreachable!("balloon tube not registered"),
         #[allow(unreachable_patterns)]
         _ => product::handle_received_token(
             &event.token,
             ac97_host_tubes,
             anti_tamper_main_thread_tube,
-            balloon_host_tube,
             control_tubes,
             guest_os,
             ipc_main_loop_tube,
@@ -1025,7 +1039,7 @@ pub enum VmMemoryHandlerRequest {
 }
 
 fn vm_memory_handler_thread(
-    mut control_tubes: Vec<Tube>,
+    control_tubes: Vec<Tube>,
     mut vm: impl Vm,
     sys_allocator_mutex: Arc<Mutex<SystemAllocator>>,
     mut gralloc: RutabagaGralloc,
@@ -1033,16 +1047,17 @@ fn vm_memory_handler_thread(
 ) -> anyhow::Result<()> {
     #[derive(EventToken)]
     enum Token {
-        VmControl { index: usize },
+        VmControl { id: usize },
         HandlerControl,
     }
 
     let wait_ctx =
         WaitContext::build_with(&[(handler_control.get_read_notifier(), Token::HandlerControl)])
             .context("failed to build wait context")?;
-    for (index, socket) in control_tubes.iter().enumerate() {
+    let mut control_tubes = BTreeMap::from_iter(control_tubes.into_iter().enumerate());
+    for (id, socket) in control_tubes.iter() {
         wait_ctx
-            .add(socket.get_read_notifier(), Token::VmControl { index })
+            .add(socket.get_read_notifier(), Token::VmControl { id: *id })
             .context("failed to add descriptor to wait context")?;
     }
 
@@ -1059,7 +1074,7 @@ fn vm_memory_handler_thread(
             }
         };
 
-        let mut vm_control_indices_to_remove = Vec::new();
+        let mut vm_control_ids_to_remove = Vec::new();
         for event in events.iter().filter(|e| e.is_readable) {
             match event.token {
                 Token::HandlerControl => match handler_control.recv::<VmMemoryHandlerRequest>() {
@@ -1075,8 +1090,8 @@ fn vm_memory_handler_thread(
                     }
                 },
 
-                Token::VmControl { index } => {
-                    if let Some(tube) = control_tubes.get(index) {
+                Token::VmControl { id } => {
+                    if let Some(tube) = control_tubes.get(&id) {
                         match tube.recv::<VmMemoryRequest>() {
                             Ok(request) => {
                                 let response = request.execute(
@@ -1092,7 +1107,7 @@ fn vm_memory_handler_thread(
                             }
                             Err(e) => {
                                 if let TubeError::Disconnected = e {
-                                    vm_control_indices_to_remove.push(index);
+                                    vm_control_ids_to_remove.push(id);
                                 } else {
                                     error!("failed to recv VmMemoryControlRequest: {}", e);
                                 }
@@ -1103,12 +1118,7 @@ fn vm_memory_handler_thread(
             }
         }
 
-        remove_closed_tubes(
-            &wait_ctx,
-            &mut control_tubes,
-            vm_control_indices_to_remove,
-            |index| Token::VmControl { index },
-        )?;
+        remove_closed_tubes(&wait_ctx, &mut control_tubes, vm_control_ids_to_remove)?;
         if events
             .iter()
             .any(|e| e.is_hungup && !e.is_readable && matches!(e.token, Token::HandlerControl))
@@ -1148,7 +1158,7 @@ fn create_control_server(
 fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     mut guest_os: RunnableLinuxVm<V, Vcpu>,
     sys_allocator: SystemAllocator,
-    mut control_tubes: Vec<TaggedControlTube>,
+    control_tubes: Vec<TaggedControlTube>,
     irq_control_tubes: Vec<Tube>,
     vm_memory_control_tubes: Vec<Tube>,
     vm_evt_rdtube: RecvTube,
@@ -1198,6 +1208,24 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         sys_allocator_mutex.clone(),
     );
 
+    let mut triggers = vec![(vm_evt_rdtube.get_read_notifier(), Token::VmEvent)];
+    product::push_triggers(&mut triggers, &ipc_main_loop_tube, &proto_main_loop_tube);
+    let wait_ctx = WaitContext::build_with(&triggers).exit_context(
+        Exit::WaitContextAdd,
+        "failed to add trigger to wait context",
+    )?;
+
+    #[cfg(feature = "balloon")]
+    let mut balloon_tube = balloon_host_tube
+        .map(|tube| -> Result<BalloonTube> {
+            wait_ctx
+                .add(&tube, Token::BalloonTube)
+                .context("failed to add trigger to wait context")?;
+            Ok(BalloonTube::new(tube))
+        })
+        .transpose()
+        .context("failed to create balloon tube")?;
+
     let (vm_memory_handler_control, vm_memory_handler_control_for_thread) = Tube::pair()?;
     let vm_memory_handler_thread_join_handle = std::thread::Builder::new()
         .name("vm_memory_handler_thread".into())
@@ -1216,13 +1244,6 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         })
         .unwrap();
 
-    let mut triggers = vec![(vm_evt_rdtube.get_read_notifier(), Token::VmEvent)];
-    product::push_triggers(&mut triggers, &ipc_main_loop_tube, &proto_main_loop_tube);
-    let wait_ctx = WaitContext::build_with(&triggers).exit_context(
-        Exit::WaitContextAdd,
-        "failed to add trigger to wait context",
-    )?;
-
     if let Some(evt) = broker_shutdown_evt.as_ref() {
         wait_ctx.add(evt, Token::BrokerShutdown).exit_context(
             Exit::WaitContextAdd,
@@ -1230,11 +1251,16 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         )?;
     }
 
-    for (index, control_tube) in control_tubes.iter().enumerate() {
+    let mut control_tubes = BTreeMap::from_iter(control_tubes.into_iter().enumerate());
+    let mut next_control_id = control_tubes.len();
+    for (id, control_tube) in control_tubes.iter() {
         #[allow(clippy::single_match)]
         match control_tube {
             TaggedControlTube::Product(product_tube) => wait_ctx
-                .add(product_tube.get_read_notifier(), Token::VmControl { index })
+                .add(
+                    product_tube.get_read_notifier(),
+                    Token::VmControl { id: *id },
+                )
                 .exit_context(
                     Exit::WaitContextAdd,
                     "failed to add trigger to wait context",
@@ -1374,11 +1400,12 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             }
         };
 
-        let mut vm_control_indices_to_remove = Vec::new();
+        let mut vm_control_ids_to_remove = Vec::new();
         for event in events.iter().filter(|e| e.is_readable) {
             let (break_poll, state) = handle_readable_event(
                 event,
-                &mut vm_control_indices_to_remove,
+                &mut vm_control_ids_to_remove,
+                &mut next_control_id,
                 &mut service_vm_state,
                 disk_host_tubes.as_slice(),
                 &ac97_host_tubes,
@@ -1390,7 +1417,8 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                 &mut virtio_snd_host_mute_tube,
                 proto_main_loop_tube.as_ref(),
                 &anti_tamper_main_thread_tube,
-                &balloon_host_tube,
+                #[cfg(feature = "balloon")]
+                balloon_tube.as_mut(),
                 memory_size_mb,
                 vcpu_boxes.as_ref(),
                 &pvclock_host_tube,
@@ -1411,12 +1439,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             }
         }
 
-        remove_closed_tubes(
-            &wait_ctx,
-            &mut control_tubes,
-            vm_control_indices_to_remove,
-            |index| Token::VmControl { index },
-        )?;
+        remove_closed_tubes(&wait_ctx, &mut control_tubes, vm_control_ids_to_remove)?;
     }
 
     info!("run_control poll loop completed, forcing vCPUs to exit...");
@@ -1519,40 +1542,18 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
 /// Remove Tubes that have been closed from the WaitContext.
 fn remove_closed_tubes<T, U>(
     wait_ctx: &WaitContext<T>,
-    tubes: &mut Vec<U>,
-    mut tube_indices_to_remove: Vec<usize>,
-    make_token_for_tube: fn(usize) -> T,
+    tubes: &mut BTreeMap<usize, U>,
+    mut tube_ids_to_remove: Vec<usize>,
 ) -> anyhow::Result<()>
 where
     T: EventToken,
     U: ReadNotifier,
 {
-    // Sort in reverse so the highest indexes are removed first. This removal algorithm
-    // preserves correct indexes as each element is removed. (Consider the input [0, 10], with 10
-    // being the last item in the `tubes` list. If we remove 0 first, 10 is swapped to 0, and then
-    // index 10 is dropped. Then we would attempt to remove item 10 and go out of range. If we
-    // remove the largest first, this problem does not occur.)
-    tube_indices_to_remove.sort_unstable_by_key(|&k| Reverse(k));
-    tube_indices_to_remove.dedup();
-    for index in tube_indices_to_remove {
-        if let Some(socket) = tubes.get(index) {
+    tube_ids_to_remove.dedup();
+    for id in tube_ids_to_remove {
+        if let Some(socket) = tubes.remove(&id) {
             wait_ctx
                 .delete(socket.get_read_notifier())
-                .context("failed to remove descriptor from wait context")?;
-        }
-
-        // This line implicitly drops the socket at `index` when it gets returned by
-        // `swap_remove`. After this line, the socket at `index` is not the one from
-        // `tube_indices_to_remove`. Because of this socket's change in index, we need to
-        // use `wait_ctx.modify` to change the associated index in its `Token::VmControl`.
-        tubes.swap_remove(index);
-        if let Some(tube) = tubes.get(index) {
-            wait_ctx
-                .modify(
-                    tube.get_read_notifier(),
-                    EventType::Read,
-                    make_token_for_tube(index),
-                )
                 .context("failed to remove descriptor from wait context")?;
         }
     }
