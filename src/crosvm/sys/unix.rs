@@ -9,6 +9,10 @@ pub mod config;
 mod device_helpers;
 #[cfg(feature = "gpu")]
 pub(crate) mod gpu;
+#[cfg(feature = "pci-hotplug")]
+pub(crate) mod jail_warden;
+#[cfg(feature = "pci-hotplug")]
+pub(crate) mod pci_hotplug_helpers;
 mod vcpu;
 
 use std::cmp::max;
@@ -94,9 +98,9 @@ use devices::GeniezoneKernelIrqChip;
 #[cfg(feature = "usb")]
 use devices::HostBackendDeviceProvider;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use devices::HostHotPlugKey;
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use devices::HotPlugBus;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use devices::HotPlugKey;
 use devices::IommuDevType;
 use devices::IrqEventIndex;
 use devices::IrqEventSource;
@@ -1091,7 +1095,7 @@ fn create_pcie_root_port(
 fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
     let initrd_image = if let Some(initrd_path) = &cfg.initrd_path {
         Some(
-            open_file(initrd_path, OpenOptions::new().read(true))
+            open_file_or_duplicate(initrd_path, OpenOptions::new().read(true))
                 .with_context(|| format!("failed to open initrd {}", initrd_path.display()))?,
         )
     } else {
@@ -1099,7 +1103,7 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
     };
     let pvm_fw_image = if let Some(pvm_fw_path) = &cfg.pvm_fw {
         Some(
-            open_file(pvm_fw_path, OpenOptions::new().read(true))
+            open_file_or_duplicate(pvm_fw_path, OpenOptions::new().read(true))
                 .with_context(|| format!("failed to open pvm_fw {}", pvm_fw_path.display()))?,
         )
     } else {
@@ -1108,12 +1112,12 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
 
     let vm_image = match cfg.executable_path {
         Some(Executable::Kernel(ref kernel_path)) => VmImage::Kernel(
-            open_file(kernel_path, OpenOptions::new().read(true)).with_context(|| {
-                format!("failed to open kernel image {}", kernel_path.display())
-            })?,
+            open_file_or_duplicate(kernel_path, OpenOptions::new().read(true)).with_context(
+                || format!("failed to open kernel image {}", kernel_path.display()),
+            )?,
         ),
         Some(Executable::Bios(ref bios_path)) => VmImage::Bios(
-            open_file(bios_path, OpenOptions::new().read(true))
+            open_file_or_duplicate(bios_path, OpenOptions::new().read(true))
                 .with_context(|| format!("failed to open bios {}", bios_path.display()))?,
         ),
         _ => panic!("Did not receive a bios or kernel, should be impossible."),
@@ -1134,7 +1138,7 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
     {
         (
             Some(
-                open_file(
+                open_file_or_duplicate(
                     &pflash_parameters.path,
                     OpenOptions::new().read(true).write(true),
                 )
@@ -2130,16 +2134,16 @@ fn add_hotplug_device<V: VmArch, Vcpu: VcpuArch>(
         .context("failed to parse hotplug device's PCI address")?;
     let hp_bus = get_hp_bus(linux, host_addr)?;
 
-    let (host_key, pci_address) = match device.device_type {
+    let (hotplug_key, pci_address) = match device.device_type {
         HotPlugDeviceType::UpstreamPort | HotPlugDeviceType::DownstreamPort => {
             let (vm_host_tube, vm_device_tube) = Tube::pair().context("failed to create tube")?;
             control_tubes.push(TaggedControlTube::Vm(vm_host_tube));
             let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
             irq_control_tubes.push(msi_host_tube);
             let pcie_host = PcieHostPort::new(device.path.as_path(), vm_device_tube)?;
-            let (host_key, pci_bridge) = match device.device_type {
+            let (hotplug_key, pci_bridge) = match device.device_type {
                 HotPlugDeviceType::UpstreamPort => {
-                    let host_key = HostHotPlugKey::UpstreamPort { host_addr };
+                    let hotplug_key = HotPlugKey::HostUpstreamPort { host_addr };
                     let pcie_upstream_port = Arc::new(Mutex::new(PcieUpstreamPort::new_from_host(
                         pcie_host, true,
                     )?));
@@ -2148,10 +2152,10 @@ fn add_hotplug_device<V: VmArch, Vcpu: VcpuArch>(
                     linux
                         .hotplug_bus
                         .insert(pci_bridge.get_secondary_num(), pcie_upstream_port);
-                    (host_key, pci_bridge)
+                    (hotplug_key, pci_bridge)
                 }
                 HotPlugDeviceType::DownstreamPort => {
-                    let host_key = HostHotPlugKey::DownstreamPort { host_addr };
+                    let hotplug_key = HotPlugKey::HostDownstreamPort { host_addr };
                     let pcie_downstream_port = Arc::new(Mutex::new(
                         PcieDownstreamPort::new_from_host(pcie_host, true)?,
                     ));
@@ -2162,7 +2166,7 @@ fn add_hotplug_device<V: VmArch, Vcpu: VcpuArch>(
                     linux
                         .hotplug_bus
                         .insert(pci_bridge.get_secondary_num(), pcie_downstream_port);
-                    (host_key, pci_bridge)
+                    (hotplug_key, pci_bridge)
                 }
                 _ => {
                     bail!("Impossible to reach here")
@@ -2178,10 +2182,10 @@ fn add_hotplug_device<V: VmArch, Vcpu: VcpuArch>(
                 swap_controller,
             )?;
 
-            (host_key, pci_address)
+            (hotplug_key, pci_address)
         }
         HotPlugDeviceType::EndPoint => {
-            let host_key = HostHotPlugKey::Vfio { host_addr };
+            let hotplug_key = HotPlugKey::HostVfio { host_addr };
             let (vfio_device, jail, viommu_mapper) = create_vfio_device(
                 &cfg.jail_config,
                 &linux.vm,
@@ -2236,10 +2240,10 @@ fn add_hotplug_device<V: VmArch, Vcpu: VcpuArch>(
                 }
             }
 
-            (host_key, pci_address)
+            (hotplug_key, pci_address)
         }
     };
-    hp_bus.lock().add_hotplug_device(host_key, pci_address);
+    hp_bus.lock().add_hotplug_device(hotplug_key, pci_address);
     if device.hp_interrupt {
         hp_bus.lock().hot_plug(pci_address);
     }
@@ -2251,12 +2255,12 @@ fn remove_hotplug_bridge<V: VmArch, Vcpu: VcpuArch>(
     linux: &RunnableLinuxVm<V, Vcpu>,
     sys_allocator: &mut SystemAllocator,
     buses_to_remove: &mut Vec<u8>,
-    host_key: HostHotPlugKey,
+    hotplug_key: HotPlugKey,
     child_bus: u8,
 ) -> Result<()> {
     for (bus_num, hp_bus) in linux.hotplug_bus.iter() {
         let mut hp_bus_lock = hp_bus.lock();
-        if let Some(pci_addr) = hp_bus_lock.get_hotplug_device(host_key) {
+        if let Some(pci_addr) = hp_bus_lock.get_hotplug_device(hotplug_key) {
             sys_allocator.release_pci(pci_addr.bus, pci_addr.dev, pci_addr.func);
             hp_bus_lock.hot_unplug(pci_addr);
             buses_to_remove.push(child_bus);
@@ -2277,7 +2281,7 @@ fn remove_hotplug_bridge<V: VmArch, Vcpu: VcpuArch>(
 
     Err(anyhow!(
         "Can not find device {:?} on hotplug buses",
-        host_key
+        hotplug_key
     ))
 }
 
@@ -2289,10 +2293,10 @@ fn remove_hotplug_device<V: VmArch, Vcpu: VcpuArch>(
     device: &HotPlugDeviceInfo,
 ) -> Result<()> {
     let host_addr = PciAddress::from_path(&device.path)?;
-    let host_key = match device.device_type {
-        HotPlugDeviceType::UpstreamPort => HostHotPlugKey::UpstreamPort { host_addr },
-        HotPlugDeviceType::DownstreamPort => HostHotPlugKey::DownstreamPort { host_addr },
-        HotPlugDeviceType::EndPoint => HostHotPlugKey::Vfio { host_addr },
+    let hotplug_key = match device.device_type {
+        HotPlugDeviceType::UpstreamPort => HotPlugKey::HostUpstreamPort { host_addr },
+        HotPlugDeviceType::DownstreamPort => HotPlugKey::HostDownstreamPort { host_addr },
+        HotPlugDeviceType::EndPoint => HotPlugKey::HostVfio { host_addr },
     };
 
     let hp_bus = linux
@@ -2300,7 +2304,7 @@ fn remove_hotplug_device<V: VmArch, Vcpu: VcpuArch>(
         .iter()
         .find(|(_, hp_bus)| {
             let hp_bus = hp_bus.lock();
-            hp_bus.get_hotplug_device(host_key).is_some()
+            hp_bus.get_hotplug_device(hotplug_key).is_some()
         })
         .map(|(bus_num, hp_bus)| (*bus_num, hp_bus.clone()));
 
@@ -2308,7 +2312,7 @@ fn remove_hotplug_device<V: VmArch, Vcpu: VcpuArch>(
         let mut buses_to_remove = Vec::new();
         let mut removed_key = None;
         let mut hp_bus_lock = hp_bus.lock();
-        if let Some(pci_addr) = hp_bus_lock.get_hotplug_device(host_key) {
+        if let Some(pci_addr) = hp_bus_lock.get_hotplug_device(hotplug_key) {
             if let Some(iommu_host_tube) = iommu_host_tube {
                 let request =
                     VirtioIOMMURequest::VfioCommand(VirtioIOMMUVfioCommand::VfioDeviceDel {
@@ -2322,7 +2326,7 @@ fn remove_hotplug_device<V: VmArch, Vcpu: VcpuArch>(
                 }
             }
             let mut empty_simbling = true;
-            if let Some(HostHotPlugKey::DownstreamPort { host_addr }) =
+            if let Some(HotPlugKey::HostDownstreamPort { host_addr }) =
                 hp_bus_lock.get_hotplug_key()
             {
                 let addr_alias = host_addr;
@@ -2330,7 +2334,7 @@ fn remove_hotplug_device<V: VmArch, Vcpu: VcpuArch>(
                     if *simbling_bus_num != bus_num {
                         let hp_bus_lock = hp_bus.lock();
                         let hotplug_key = hp_bus_lock.get_hotplug_key();
-                        if let Some(HostHotPlugKey::DownstreamPort { host_addr }) = hotplug_key {
+                        if let Some(HotPlugKey::HostDownstreamPort { host_addr }) = hotplug_key {
                             if addr_alias.bus == host_addr.bus && !hp_bus_lock.is_empty() {
                                 empty_simbling = false;
                                 break;
@@ -2366,13 +2370,13 @@ fn remove_hotplug_device<V: VmArch, Vcpu: VcpuArch>(
         // of these ports won't be removed since no vfio device is connected to our emulated
         // bridges. So we explicitly check all simbling bridges of the removed bridge here,
         // and remove them if bridge has no child device connected.
-        if let Some(HostHotPlugKey::DownstreamPort { host_addr }) = removed_key {
+        if let Some(HotPlugKey::HostDownstreamPort { host_addr }) = removed_key {
             let addr_alias = host_addr;
             for (simbling_bus_num, hp_bus) in linux.hotplug_bus.iter() {
                 if *simbling_bus_num != bus_num {
                     let hp_bus_lock = hp_bus.lock();
                     let hotplug_key = hp_bus_lock.get_hotplug_key();
-                    if let Some(HostHotPlugKey::DownstreamPort { host_addr }) = hotplug_key {
+                    if let Some(HotPlugKey::HostDownstreamPort { host_addr }) = hotplug_key {
                         if addr_alias.bus == host_addr.bus && hp_bus_lock.is_empty() {
                             remove_hotplug_bridge(
                                 linux,
@@ -2394,7 +2398,7 @@ fn remove_hotplug_device<V: VmArch, Vcpu: VcpuArch>(
 
     Err(anyhow!(
         "Can not find device {:?} on hotplug buses",
-        host_key
+        hotplug_key
     ))
 }
 
