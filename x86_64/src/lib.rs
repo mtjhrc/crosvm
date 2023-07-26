@@ -100,6 +100,9 @@ use devices::SerialHardware;
 use devices::SerialParameters;
 #[cfg(unix)]
 use devices::VirtualPmc;
+use devices::FW_CFG_BASE_PORT;
+use devices::FW_CFG_MAX_FILE_SLOTS;
+use devices::FW_CFG_WIDTH;
 #[cfg(feature = "gdb")]
 use gdbstub_arch::x86::reg::id::X86_64CoreRegId;
 #[cfg(feature = "gdb")]
@@ -187,6 +190,8 @@ pub enum Error {
     CreateEvent(base::Error),
     #[error("failed to create fdt: {0}")]
     CreateFdt(cros_fdt::Error),
+    #[error("failed to create fw_cfg device: {0}")]
+    CreateFwCfgDevice(devices::FwCfgError),
     #[error("failed to create IOAPIC device: {0}")]
     CreateIoapicDevice(base::Error),
     #[error("failed to create a PCI root hub: {0}")]
@@ -208,9 +213,6 @@ pub enum Error {
     CreateVirtioMmioBus(arch::DeviceRegistrationError),
     #[error("invalid e820 setup params")]
     E820Configuration,
-    #[cfg(feature = "direct")]
-    #[error("failed to enable ACPI event forwarding: {0}")]
-    EnableAcpiEvent(devices::DirectIrqError),
     #[error("failed to enable singlestep execution: {0}")]
     EnableSinglestep(base::Error),
     #[error("failed to enable split irqchip: {0}")]
@@ -879,10 +881,6 @@ impl arch::LinuxArch for X8664arch {
             suspend_evt.try_clone().map_err(Error::CloneEvent)?,
             vm_evt_wrtube.try_clone().map_err(Error::CloneTube)?,
             components.acpi_sdts,
-            #[cfg(feature = "direct")]
-            &components.direct_gpe,
-            #[cfg(feature = "direct")]
-            &components.direct_fixed_evts,
             irq_chip.as_irq_chip_mut(),
             sci_irq,
             battery,
@@ -1714,10 +1712,15 @@ impl X8664arch {
         io_bus: &devices::Bus,
         fw_cfg_parameters: Vec<FwCfgParameters>,
     ) -> Result<()> {
-        // Create fw_cfg device w/ 0 file slots.
-        let fw_cfg = Arc::new(Mutex::new(devices::FwCfgDevice::new(0, fw_cfg_parameters)));
-        io_bus.insert(fw_cfg, 0x510, 0x4).unwrap();
-        Ok(())
+        match devices::FwCfgDevice::new(FW_CFG_MAX_FILE_SLOTS, fw_cfg_parameters) {
+            Ok(device) => {
+                io_bus
+                    .insert(Arc::new(Mutex::new(device)), FW_CFG_BASE_PORT, FW_CFG_WIDTH)
+                    .unwrap();
+                Ok(())
+            }
+            Err(err) => Err(Error::CreateFwCfgDevice(err)),
+        }
     }
 
     /// Sets up the legacy x86 i8042/KBD platform device
@@ -1815,8 +1818,6 @@ impl X8664arch {
         suspend_evt: Event,
         vm_evt_wrtube: SendTube,
         sdts: Vec<SDT>,
-        #[cfg(feature = "direct")] direct_gpe: &[u32],
-        #[cfg(feature = "direct")] direct_fixed_evts: &[devices::ACPIPMFixedEvent],
         irq_chip: &mut dyn IrqChip,
         sci_irq: u32,
         battery: (Option<BatteryType>, Option<Minijail>),
@@ -1879,33 +1880,6 @@ impl X8664arch {
         );
         pcie_vcfg.to_aml_bytes(&mut amls);
 
-        #[cfg(feature = "direct")]
-        let direct_evt_info = if direct_gpe.is_empty() && direct_fixed_evts.is_empty() {
-            None
-        } else {
-            let direct_sci_evt = devices::IrqLevelEvent::new().map_err(Error::CreateEvent)?;
-            let mut sci_devirq =
-                devices::DirectIrq::new_level(&direct_sci_evt).map_err(Error::EnableAcpiEvent)?;
-
-            sci_devirq
-                .sci_irq_prepare()
-                .map_err(Error::EnableAcpiEvent)?;
-
-            for gpe in direct_gpe {
-                sci_devirq
-                    .gpe_enable_forwarding(*gpe)
-                    .map_err(Error::EnableAcpiEvent)?;
-            }
-
-            for evt in direct_fixed_evts {
-                sci_devirq
-                    .fixed_event_enable_forwarding(*evt)
-                    .map_err(Error::EnableAcpiEvent)?;
-            }
-
-            Some((direct_sci_evt, direct_gpe, direct_fixed_evts))
-        };
-
         let pm_sci_evt = devices::IrqLevelEvent::new().map_err(Error::CreateEvent)?;
 
         #[cfg(unix)]
@@ -1967,8 +1941,6 @@ impl X8664arch {
 
         let mut pmresource = devices::ACPIPMResource::new(
             pm_sci_evt.try_clone().map_err(Error::CloneEvent)?,
-            #[cfg(feature = "direct")]
-            direct_evt_info,
             suspend_evt,
             vm_evt_wrtube,
             acdc,

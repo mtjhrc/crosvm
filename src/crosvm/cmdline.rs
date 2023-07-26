@@ -78,15 +78,11 @@ use crate::crosvm::config::parse_ac97_options;
 use crate::crosvm::config::parse_bus_id_addr;
 use crate::crosvm::config::parse_cpu_affinity;
 use crate::crosvm::config::parse_cpu_capacity;
-#[cfg(feature = "direct")]
-use crate::crosvm::config::parse_direct_io_options;
 use crate::crosvm::config::parse_dynamic_power_coefficient;
 use crate::crosvm::config::parse_fw_cfg_options;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::crosvm::config::parse_memory_region;
 use crate::crosvm::config::parse_mmio_address_range;
-#[cfg(feature = "direct")]
-use crate::crosvm::config::parse_pcie_root_port_params;
 use crate::crosvm::config::parse_pflash_parameters;
 #[cfg(feature = "plugin")]
 use crate::crosvm::config::parse_plugin_mount_option;
@@ -97,14 +93,10 @@ use crate::crosvm::config::BatteryConfig;
 #[cfg(feature = "plugin")]
 use crate::crosvm::config::BindMount;
 use crate::crosvm::config::CpuOptions;
-#[cfg(feature = "direct")]
-use crate::crosvm::config::DirectIoOption;
 use crate::crosvm::config::Executable;
 use crate::crosvm::config::FileBackedMappingParameters;
 #[cfg(feature = "plugin")]
 use crate::crosvm::config::GidMap;
-#[cfg(feature = "direct")]
-use crate::crosvm::config::HostPcieRootPortParameters;
 use crate::crosvm::config::HypervisorKind;
 use crate::crosvm::config::IrqChipKind;
 use crate::crosvm::config::MemOptions;
@@ -141,7 +133,7 @@ pub enum CrossPlatformCommands {
     #[cfg(feature = "balloon")]
     BalloonStats(BalloonStatsCommand),
     #[cfg(feature = "balloon")]
-    BalloonWss(BalloonWssCommand),
+    BalloonWs(BalloonWsCommand),
     Battery(BatteryCommand),
     #[cfg(feature = "composite-disk")]
     CreateComposite(CreateCompositeCommand),
@@ -195,9 +187,9 @@ pub struct BalloonStatsCommand {
 }
 
 #[derive(argh::FromArgs)]
-#[argh(subcommand, name = "balloon_wss")]
-/// Prints virtio balloon working set size for a `VM_SOCKET`
-pub struct BalloonWssCommand {
+#[argh(subcommand, name = "balloon_ws")]
+/// Prints virtio balloon working set for a `VM_SOCKET`
+pub struct BalloonWsCommand {
     #[argh(positional, arg_name = "VM_SOOCKET")]
     /// VM control socket path.
     pub socket_path: String,
@@ -917,14 +909,14 @@ pub struct RunCommand {
     #[argh(option)]
     #[serde(skip)] // TODO(b/255223604)
     #[merge(strategy = overwrite_option)]
-    /// set number of WSS bins to use (default = 4).
-    pub balloon_wss_num_bins: Option<u8>,
+    /// set number of WS bins to use (default = 4).
+    pub balloon_ws_num_bins: Option<u8>,
 
     #[argh(switch)]
     #[serde(skip)] // TODO(b/255223604)
     #[merge(strategy = overwrite_option)]
-    /// enable working set size reporting in balloon.
-    pub balloon_wss_reporting: Option<bool>,
+    /// enable working set reporting in balloon.
+    pub balloon_ws_reporting: Option<bool>,
 
     #[argh(option)]
     /// comma separated key=value pairs for setting up battery
@@ -1085,42 +1077,6 @@ pub struct RunCommand {
     #[merge(strategy = overwrite_option)]
     /// don't set VCPUs real-time until make-rt command is run
     pub delay_rt: Option<bool>,
-
-    #[cfg(feature = "direct")]
-    #[argh(option, arg_name = "event=gbllock|powerbtn|sleepbtn|rtc")]
-    #[serde(skip)] // TODO(b/255223604)
-    #[merge(strategy = overwrite)]
-    /// enable ACPI fixed event interrupt and register access passthrough
-    pub direct_fixed_event: Vec<devices::ACPIPMFixedEvent>,
-
-    #[cfg(feature = "direct")]
-    #[argh(option, arg_name = "gpe")]
-    #[serde(skip)] // TODO(b/255223604)
-    #[merge(strategy = overwrite)]
-    /// enable GPE interrupt and register access passthrough
-    pub direct_gpe: Vec<u32>,
-
-    #[cfg(feature = "direct")]
-    #[argh(
-        option,
-        arg_name = "PATH@RANGE[,RANGE[,...]]",
-        from_str_fn(parse_direct_io_options)
-    )]
-    #[serde(skip)] // TODO(b/255223604)
-    #[merge(strategy = overwrite_option)]
-    /// path and ranges for direct memory mapped I/O access. RANGE may be decimal or hex (starting with 0x)
-    pub direct_mmio: Option<DirectIoOption>,
-
-    #[cfg(feature = "direct")]
-    #[argh(
-        option,
-        arg_name = "PATH@RANGE[,RANGE[,...]]",
-        from_str_fn(parse_direct_io_options)
-    )]
-    #[serde(skip)] // TODO(b/255223604)
-    #[merge(strategy = overwrite_option)]
-    /// path and ranges for direct port mapped I/O access. RANGE may be decimal or hex (starting with 0x)
-    pub direct_pmio: Option<DirectIoOption>,
 
     #[argh(switch)]
     #[serde(skip)] // TODO(b/255223604)
@@ -1626,17 +1582,6 @@ pub struct RunCommand {
     #[merge(strategy = overwrite_option)]
     /// region for PCIe Enhanced Configuration Access Mechanism
     pub pcie_ecam: Option<AddressRange>,
-
-    #[cfg(feature = "direct")]
-    #[argh(
-        option,
-        arg_name = "PATH[,hp_gpe=NUM]",
-        from_str_fn(parse_pcie_root_port_params)
-    )]
-    #[serde(skip)] // TODO(b/255223604)
-    #[merge(strategy = overwrite)]
-    /// path to sysfs of host pcie root port and host pcie root port hotplug gpe number
-    pub pcie_root_port: Vec<HostPcieRootPortParameters>,
 
     #[argh(switch)]
     #[serde(skip)] // TODO(b/255223604)
@@ -2880,8 +2825,8 @@ impl TryFrom<RunCommand> for super::config::Config {
         cfg.rng = !cmd.no_rng.unwrap_or_default();
         cfg.balloon = !cmd.no_balloon.unwrap_or_default();
         cfg.balloon_page_reporting = cmd.balloon_page_reporting.unwrap_or_default();
-        cfg.balloon_wss_num_bins = cmd.balloon_wss_num_bins.unwrap_or(4);
-        cfg.balloon_wss_reporting = cmd.balloon_wss_reporting.unwrap_or_default();
+        cfg.balloon_ws_num_bins = cmd.balloon_ws_num_bins.unwrap_or(4);
+        cfg.balloon_ws_reporting = cmd.balloon_ws_reporting.unwrap_or_default();
         #[cfg(feature = "audio")]
         {
             cfg.virtio_snds = cmd.virtio_snd;
@@ -3142,16 +3087,6 @@ impl TryFrom<RunCommand> for super::config::Config {
         cfg.vhost_user_video_dec = cmd.vhost_user_video_decoder;
         cfg.vhost_user_vsock = cmd.vhost_user_vsock;
         cfg.vhost_user_wl = cmd.vhost_user_wl;
-
-        #[cfg(feature = "direct")]
-        {
-            cfg.direct_pmio = cmd.direct_pmio;
-            cfg.direct_mmio = cmd.direct_mmio;
-            cfg.direct_gpe = cmd.direct_gpe;
-            cfg.direct_fixed_evts = cmd.direct_fixed_event;
-            cfg.pcie_rp = cmd.pcie_root_port;
-            cfg.mmio_address_ranges = cmd.mmio_address_range.unwrap_or_default();
-        }
 
         cfg.disable_virtio_intx = cmd.disable_virtio_intx.unwrap_or_default();
 
