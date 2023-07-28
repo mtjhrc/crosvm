@@ -12,8 +12,8 @@ use anyhow::Result;
 pub use balloon_control::BalloonStats;
 use balloon_control::BalloonTubeCommand;
 pub use balloon_control::BalloonTubeResult;
-pub use balloon_control::BalloonWS;
-pub use balloon_control::WSBucket;
+pub use balloon_control::BalloonWSS;
+pub use balloon_control::WSSBucket;
 pub use balloon_control::VIRTIO_BALLOON_WS_MAX_NUM_BINS;
 pub use balloon_control::VIRTIO_BALLOON_WS_MIN_NUM_BINS;
 use base::Error as SysError;
@@ -31,8 +31,8 @@ pub enum BalloonControlCommand {
         num_bytes: u64,
     },
     Stats,
-    WorkingSet,
-    WorkingSetConfig {
+    WorkingSetSize,
+    WorkingSetSizeConfig {
         bins: Vec<u64>,
         refresh_threshold: u64,
         report_threshold: u64,
@@ -50,12 +50,12 @@ fn do_send(tube: &Tube, cmd: &BalloonControlCommand) -> Option<VmResponse> {
                 Err(_) => Some(VmResponse::Err(SysError::last())),
             }
         }
-        BalloonControlCommand::WorkingSetConfig {
+        BalloonControlCommand::WorkingSetSizeConfig {
             ref bins,
             refresh_threshold,
             report_threshold,
         } => {
-            match tube.send(&BalloonTubeCommand::WorkingSetConfig {
+            match tube.send(&BalloonTubeCommand::WorkingSetSizeConfig {
                 bins: bins.clone(),
                 refresh_threshold,
                 report_threshold,
@@ -68,10 +68,12 @@ fn do_send(tube: &Tube, cmd: &BalloonControlCommand) -> Option<VmResponse> {
             Ok(_) => None,
             Err(_) => Some(VmResponse::Err(SysError::last())),
         },
-        BalloonControlCommand::WorkingSet => match tube.send(&BalloonTubeCommand::WorkingSet) {
-            Ok(_) => None,
-            Err(_) => Some(VmResponse::Err(SysError::last())),
-        },
+        BalloonControlCommand::WorkingSetSize => {
+            match tube.send(&BalloonTubeCommand::WorkingSetSize) {
+                Ok(_) => None,
+                Err(_) => Some(VmResponse::Err(SysError::last())),
+            }
+        }
     }
 }
 
@@ -93,14 +95,18 @@ impl BalloonTube {
 
     /// Sends or queues the given command to this tube. Associates the
     /// response with the given key.
-    pub fn send_cmd(&mut self, cmd: BalloonControlCommand, key: usize) -> Option<VmResponse> {
+    pub fn send_cmd(
+        &mut self,
+        cmd: BalloonControlCommand,
+        key: Option<usize>,
+    ) -> Option<VmResponse> {
         if !self.pending_queue.is_empty() {
-            self.pending_queue.push_back((cmd, Some(key)));
+            self.pending_queue.push_back((cmd, key));
             return None;
         }
         let resp = do_send(&self.tube, &cmd);
         if resp.is_none() {
-            self.pending_queue.push_back((cmd, Some(key)));
+            self.pending_queue.push_back((cmd, key));
         }
         resp
     }
@@ -131,9 +137,15 @@ impl BalloonTube {
                 balloon_actual,
             },
             (
-                BalloonControlCommand::WorkingSet,
-                BalloonTubeResult::WorkingSet { ws, balloon_actual },
-            ) => VmResponse::BalloonWS { ws, balloon_actual },
+                BalloonControlCommand::WorkingSetSize,
+                BalloonTubeResult::WorkingSetSize {
+                    wss,
+                    balloon_actual,
+                },
+            ) => VmResponse::BalloonWSS {
+                wss,
+                balloon_actual,
+            },
             (_, resp) => {
                 bail!("Unexpected balloon tube result {:?}", resp);
             }
@@ -179,7 +191,7 @@ mod tests {
         let (host, device) = Tube::pair().unwrap();
         let mut balloon_tube = BalloonTube::new(host);
 
-        let resp = balloon_tube.send_cmd(BalloonControlCommand::Stats, 0xc0ffee);
+        let resp = balloon_tube.send_cmd(BalloonControlCommand::Stats, Some(0xc0ffee));
         assert!(resp.is_none());
 
         balloon_device_respond_stats(&device);
@@ -195,9 +207,9 @@ mod tests {
         let (host, device) = Tube::pair().unwrap();
         let mut balloon_tube = BalloonTube::new(host);
 
-        let resp = balloon_tube.send_cmd(BalloonControlCommand::Stats, 0xc0ffee);
+        let resp = balloon_tube.send_cmd(BalloonControlCommand::Stats, Some(0xc0ffee));
         assert!(resp.is_none());
-        let resp = balloon_tube.send_cmd(BalloonControlCommand::Stats, 0xbadcafe);
+        let resp = balloon_tube.send_cmd(BalloonControlCommand::Stats, Some(0xbadcafe));
         assert!(resp.is_none());
 
         balloon_device_respond_stats(&device);
@@ -220,9 +232,12 @@ mod tests {
         let (host, device) = Tube::pair().unwrap();
         let mut balloon_tube = BalloonTube::new(host);
 
-        let resp = balloon_tube.send_cmd(BalloonControlCommand::Stats, 0xc0ffee);
+        let resp = balloon_tube.send_cmd(BalloonControlCommand::Stats, Some(0xc0ffee));
         assert!(resp.is_none());
-        let resp = balloon_tube.send_cmd(BalloonControlCommand::Adjust { num_bytes: 0 }, 0xbadcafe);
+        let resp = balloon_tube.send_cmd(
+            BalloonControlCommand::Adjust { num_bytes: 0 },
+            Some(0xbadcafe),
+        );
         assert!(resp.is_none());
 
         balloon_device_respond_stats(&device);
