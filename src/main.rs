@@ -57,6 +57,8 @@ use vm_control::client::do_gpu_display_list;
 #[cfg(feature = "gpu")]
 use vm_control::client::do_gpu_display_remove;
 use vm_control::client::do_modify_battery;
+#[cfg(feature = "pci-hotplug")]
+use vm_control::client::do_net_add;
 use vm_control::client::do_swap_status;
 use vm_control::client::do_usb_attach;
 use vm_control::client::do_usb_detach;
@@ -72,6 +74,8 @@ use vm_control::BalloonControlCommand;
 use vm_control::DiskControlCommand;
 use vm_control::HotPlugDeviceInfo;
 use vm_control::HotPlugDeviceType;
+#[cfg(feature = "pci-hotplug")]
+use vm_control::NetControlCommand;
 use vm_control::RestoreCommand;
 use vm_control::SnapshotCommand;
 use vm_control::SwapCommand;
@@ -249,8 +253,8 @@ fn balloon_stats(cmd: cmdline::BalloonStatsCommand) -> std::result::Result<(), (
 }
 
 #[cfg(feature = "balloon")]
-fn balloon_wss(cmd: cmdline::BalloonWssCommand) -> std::result::Result<(), ()> {
-    let command = BalloonControlCommand::WorkingSetSize {};
+fn balloon_ws(cmd: cmdline::BalloonWsCommand) -> std::result::Result<(), ()> {
+    let command = BalloonControlCommand::WorkingSet {};
     let request = &VmRequest::BalloonCommand(command);
     let response = handle_request(request, cmd.socket_path)?;
     match serde_json::to_string_pretty(&response) {
@@ -261,7 +265,7 @@ fn balloon_wss(cmd: cmdline::BalloonWssCommand) -> std::result::Result<(), ()> {
         }
     }
     match response {
-        VmResponse::BalloonWSS { .. } => Ok(()),
+        VmResponse::BalloonWS { .. } => Ok(()),
         _ => Err(()),
     }
 }
@@ -278,7 +282,7 @@ fn modify_battery(cmd: cmdline::BatteryCommand) -> std::result::Result<(), ()> {
 fn modify_vfio(cmd: cmdline::VfioCrosvmCommand) -> std::result::Result<(), ()> {
     let (request, socket_path, vfio_path) = match cmd.command {
         cmdline::VfioSubCommand::Add(c) => {
-            let request = VmRequest::HotPlugCommand {
+            let request = VmRequest::HotPlugVfioCommand {
                 device: HotPlugDeviceInfo {
                     device_type: HotPlugDeviceType::EndPoint,
                     path: c.vfio_path.clone(),
@@ -289,7 +293,7 @@ fn modify_vfio(cmd: cmdline::VfioCrosvmCommand) -> std::result::Result<(), ()> {
             (request, c.socket_path, c.vfio_path)
         }
         cmdline::VfioSubCommand::Remove(c) => {
-            let request = VmRequest::HotPlugCommand {
+            let request = VmRequest::HotPlugVfioCommand {
                 device: HotPlugDeviceInfo {
                     device_type: HotPlugDeviceType::EndPoint,
                     path: c.vfio_path.clone(),
@@ -306,6 +310,24 @@ fn modify_vfio(cmd: cmdline::VfioCrosvmCommand) -> std::result::Result<(), ()> {
     }
 
     vms_request(&request, socket_path)?;
+    Ok(())
+}
+
+#[cfg(feature = "pci-hotplug")]
+fn modify_virtio_net(cmd: cmdline::VirtioNetCommand) -> std::result::Result<(), ()> {
+    match cmd.command {
+        cmdline::VirtioNetSubCommand::AddTap(c) => {
+            let bus_num = do_net_add(&c.tap_name, c.socket_path).map_err(|e| {
+                error!("{}", &e);
+            })?;
+            info!("Tap device {} plugged to PCI bus {}", &c.tap_name, bus_num);
+        }
+        cmdline::VirtioNetSubCommand::RemoveTap(c) => {
+            let request = VmRequest::HotPlugNetCommand(NetControlCommand::RemoveTap(c.bus));
+            vms_request(&request, c.socket_path)?;
+        }
+    };
+
     Ok(())
 }
 
@@ -709,8 +731,8 @@ fn crosvm_main<I: IntoIterator<Item = String>>(args: I) -> Result<CommandStatus>
                         balloon_stats(cmd).map_err(|_| anyhow!("balloon_stats subcommand failed"))
                     }
                     #[cfg(feature = "balloon")]
-                    CrossPlatformCommands::BalloonWss(cmd) => {
-                        balloon_wss(cmd).map_err(|_| anyhow!("balloon_wss subcommand failed"))
+                    CrossPlatformCommands::BalloonWs(cmd) => {
+                        balloon_ws(cmd).map_err(|_| anyhow!("balloon_ws subcommand failed"))
                     }
                     CrossPlatformCommands::Battery(cmd) => {
                         modify_battery(cmd).map_err(|_| anyhow!("battery subcommand failed"))
@@ -763,6 +785,10 @@ fn crosvm_main<I: IntoIterator<Item = String>>(args: I) -> Result<CommandStatus>
                     }
                     CrossPlatformCommands::Vfio(cmd) => {
                         modify_vfio(cmd).map_err(|_| anyhow!("vfio subcommand failed"))
+                    }
+                    #[cfg(feature = "pci-hotplug")]
+                    CrossPlatformCommands::VirtioNet(cmd) => {
+                        modify_virtio_net(cmd).map_err(|_| anyhow!("virtio subcommand failed"))
                     }
                     CrossPlatformCommands::Snapshot(cmd) => {
                         snapshot_vm(cmd).map_err(|_| anyhow!("snapshot subcommand failed"))

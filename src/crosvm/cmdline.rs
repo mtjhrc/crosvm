@@ -133,7 +133,7 @@ pub enum CrossPlatformCommands {
     #[cfg(feature = "balloon")]
     BalloonStats(BalloonStatsCommand),
     #[cfg(feature = "balloon")]
-    BalloonWss(BalloonWssCommand),
+    BalloonWs(BalloonWsCommand),
     Battery(BatteryCommand),
     #[cfg(feature = "composite-disk")]
     CreateComposite(CreateCompositeCommand),
@@ -155,6 +155,8 @@ pub enum CrossPlatformCommands {
     Usb(UsbCommand),
     Version(VersionCommand),
     Vfio(VfioCrosvmCommand),
+    #[cfg(feature = "pci-hotplug")]
+    VirtioNet(VirtioNetCommand),
     Snapshot(SnapshotCommand),
 }
 
@@ -187,9 +189,9 @@ pub struct BalloonStatsCommand {
 }
 
 #[derive(argh::FromArgs)]
-#[argh(subcommand, name = "balloon_wss")]
-/// Prints virtio balloon working set size for a `VM_SOCKET`
-pub struct BalloonWssCommand {
+#[argh(subcommand, name = "balloon_ws")]
+/// Prints virtio balloon working set for a `VM_SOCKET`
+pub struct BalloonWsCommand {
     #[argh(positional, arg_name = "VM_SOOCKET")]
     /// VM control socket path.
     pub socket_path: String,
@@ -471,6 +473,49 @@ pub enum VfioSubCommand {
 pub struct VfioCrosvmCommand {
     #[argh(subcommand)]
     pub command: VfioSubCommand,
+}
+
+#[cfg(feature = "pci-hotplug")]
+#[derive(FromArgs)]
+#[argh(subcommand)]
+pub enum VirtioNetSubCommand {
+    AddTap(VirtioNetAddSubCommand),
+    RemoveTap(VirtioNetRemoveSubCommand),
+}
+
+#[cfg(feature = "pci-hotplug")]
+#[derive(FromArgs)]
+#[argh(subcommand, name = "add")]
+/// Add by Tap name.
+pub struct VirtioNetAddSubCommand {
+    #[argh(positional)]
+    /// tap name
+    pub tap_name: String,
+    #[argh(positional, arg_name = "VM_SOCKET")]
+    /// VM Socket path
+    pub socket_path: String,
+}
+
+#[cfg(feature = "pci-hotplug")]
+#[derive(FromArgs)]
+#[argh(subcommand, name = "remove")]
+/// Remove tap by bus number.
+pub struct VirtioNetRemoveSubCommand {
+    #[argh(positional)]
+    /// bus number for device to remove
+    pub bus: u8,
+    #[argh(positional, arg_name = "VM_SOCKET")]
+    /// VM socket path
+    pub socket_path: String,
+}
+
+#[cfg(feature = "pci-hotplug")]
+#[derive(FromArgs)]
+#[argh(subcommand, name = "virtio-net")]
+/// add network device as virtio into guest.
+pub struct VirtioNetCommand {
+    #[argh(subcommand)]
+    pub command: VirtioNetSubCommand,
 }
 
 #[derive(FromArgs)]
@@ -909,14 +954,14 @@ pub struct RunCommand {
     #[argh(option)]
     #[serde(skip)] // TODO(b/255223604)
     #[merge(strategy = overwrite_option)]
-    /// set number of WSS bins to use (default = 4).
-    pub balloon_wss_num_bins: Option<u8>,
+    /// set number of WS bins to use (default = 4).
+    pub balloon_ws_num_bins: Option<u8>,
 
     #[argh(switch)]
     #[serde(skip)] // TODO(b/255223604)
     #[merge(strategy = overwrite_option)]
-    /// enable working set size reporting in balloon.
-    pub balloon_wss_reporting: Option<bool>,
+    /// enable working set reporting in balloon.
+    pub balloon_ws_reporting: Option<bool>,
 
     #[argh(option)]
     /// comma separated key=value pairs for setting up battery
@@ -1495,6 +1540,10 @@ pub struct RunCommand {
     ///                       Default: false.  [Optional]
     ///   vq-pairs=N      - number of rx/tx queue pairs.
     ///                       Default: 1.      [Optional]
+    ///   packed-queue    - use packed queue.
+    ///                       If not set or set to false, it will
+    ///                       use split virtqueue.
+    ///                       Default: false.  [Optional]
     ///
     /// Either one tap_name, one tap_fd or a triplet of host_ip,
     /// netmask and mac must be specified.
@@ -1564,6 +1613,13 @@ pub struct RunCommand {
     #[merge(strategy = append)]
     /// extra kernel or plugin command line arguments. Can be given more than once
     pub params: Vec<String>,
+
+    #[cfg(unix)]
+    #[argh(option, arg_name = "pci_hotplug_slots")]
+    #[serde(default)]
+    #[merge(strategy = overwrite_option)]
+    /// number of hotplug slot count (default: None)
+    pub pci_hotplug_slots: Option<u8>,
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[argh(option, arg_name = "pci_low_mmio_start")]
@@ -2825,8 +2881,8 @@ impl TryFrom<RunCommand> for super::config::Config {
         cfg.rng = !cmd.no_rng.unwrap_or_default();
         cfg.balloon = !cmd.no_balloon.unwrap_or_default();
         cfg.balloon_page_reporting = cmd.balloon_page_reporting.unwrap_or_default();
-        cfg.balloon_wss_num_bins = cmd.balloon_wss_num_bins.unwrap_or(4);
-        cfg.balloon_wss_reporting = cmd.balloon_wss_reporting.unwrap_or_default();
+        cfg.balloon_ws_num_bins = cmd.balloon_ws_num_bins.unwrap_or(4);
+        cfg.balloon_ws_reporting = cmd.balloon_ws_reporting.unwrap_or_default();
         #[cfg(feature = "audio")]
         {
             cfg.virtio_snds = cmd.virtio_snd;
@@ -2912,6 +2968,7 @@ impl TryFrom<RunCommand> for super::config::Config {
                     },
                     vhost_net: vhost_net_config.clone(),
                     vq_pairs: cmd.net_vq_pairs,
+                    packed_queue: false,
                 });
             }
 
@@ -2924,6 +2981,7 @@ impl TryFrom<RunCommand> for super::config::Config {
                     mode: NetParametersMode::TapFd { tap_fd, mac: None },
                     vhost_net: vhost_net_config.clone(),
                     vq_pairs: cmd.net_vq_pairs,
+                    packed_queue: false,
                 });
             }
 
@@ -2961,6 +3019,7 @@ impl TryFrom<RunCommand> for super::config::Config {
                     },
                     vhost_net: vhost_net_config,
                     vq_pairs: cmd.net_vq_pairs,
+                    packed_queue: false,
                 });
             }
 
@@ -3071,6 +3130,11 @@ impl TryFrom<RunCommand> for super::config::Config {
                     return Err(String::from("msr must be unique"));
                 }
             }
+        }
+
+        #[cfg(feature = "pci-hotplug")]
+        {
+            cfg.pci_hotplug_slots = cmd.pci_hotplug_slots;
         }
 
         // cfg.balloon_bias is in bytes.

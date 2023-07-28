@@ -835,8 +835,8 @@ pub struct Config {
     pub balloon_bias: i64,
     pub balloon_control: Option<PathBuf>,
     pub balloon_page_reporting: bool,
-    pub balloon_wss_num_bins: u8,
-    pub balloon_wss_reporting: bool,
+    pub balloon_ws_num_bins: u8,
+    pub balloon_ws_reporting: bool,
     pub battery_config: Option<BatteryConfig>,
     #[cfg(windows)]
     pub block_control_tube: Vec<Tube>,
@@ -917,6 +917,8 @@ pub struct Config {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     pub oem_strings: Vec<String>,
     pub params: Vec<String>,
+    #[cfg(feature = "pci-hotplug")]
+    pub pci_hotplug_slots: Option<u8>,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     pub pci_low_start: Option<u64>,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1038,8 +1040,8 @@ impl Default for Config {
             balloon_bias: 0,
             balloon_control: None,
             balloon_page_reporting: false,
-            balloon_wss_num_bins: VIRTIO_BALLOON_WS_DEFAULT_NUM_BINS,
-            balloon_wss_reporting: false,
+            balloon_ws_num_bins: VIRTIO_BALLOON_WS_DEFAULT_NUM_BINS,
+            balloon_ws_reporting: false,
             battery_config: None,
             #[cfg(windows)]
             block_control_tube: Vec::new(),
@@ -1128,6 +1130,8 @@ impl Default for Config {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             oem_strings: Vec::new(),
             params: Vec::new(),
+            #[cfg(feature = "pci-hotplug")]
+            pci_hotplug_slots: None,
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             pci_low_start: None,
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

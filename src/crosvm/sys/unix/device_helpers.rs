@@ -755,7 +755,7 @@ pub fn create_balloon_device(
     init_balloon_size: u64,
     enabled_features: u64,
     #[cfg(feature = "registered_events")] registered_evt_q: Option<SendTube>,
-    wss_num_bins: u8,
+    ws_num_bins: u8,
 ) -> DeviceResult {
     let dev = virtio::Balloon::new(
         virtio::base_features(protection_type),
@@ -766,7 +766,7 @@ pub fn create_balloon_device(
         enabled_features,
         #[cfg(feature = "registered_events")]
         registered_evt_q,
-        wss_num_bins,
+        ws_num_bins,
     )
     .context("failed to create balloon")?;
 
@@ -785,17 +785,24 @@ impl VirtioDeviceBuilder for &NetParameters {
     ) -> anyhow::Result<Box<dyn VirtioDevice>> {
         let vq_pairs = self.vq_pairs.unwrap_or(1);
         let multi_vq = vq_pairs > 1 && self.vhost_net.is_none();
+
         let features = virtio::base_features(protection_type);
         let (tap, mac) = create_tap_for_net_device(&self.mode, multi_vq)?;
 
         Ok(if let Some(vhost_net) = &self.vhost_net {
             Box::new(
-                virtio::vhost::Net::<_, vhost::Net<_>>::new(&vhost_net.device, features, tap, mac)
-                    .context("failed to set up virtio-vhost networking")?,
+                virtio::vhost::Net::<_, vhost::Net<_>>::new(
+                    &vhost_net.device,
+                    features,
+                    tap,
+                    mac,
+                    self.packed_queue,
+                )
+                .context("failed to set up virtio-vhost networking")?,
             ) as Box<dyn VirtioDevice>
         } else {
             Box::new(
-                virtio::Net::new(features, tap, vq_pairs, mac)
+                virtio::Net::new(features, tap, vq_pairs, mac, self.packed_queue)
                     .context("failed to set up virtio networking")?,
             ) as Box<dyn VirtioDevice>
         })
