@@ -271,7 +271,7 @@ pub fn create_fence_handler<Q>(
 where
     Q: QueueReader + Send + Clone + 'static,
 {
-    RutabagaClosure::new(Box::new(move |completed_fence: RutabagaFence| {
+    RutabagaFenceHandler::new(move |completed_fence: RutabagaFence| {
         let mut signal = false;
 
         if let Some(ref fence_handler_resources) = *fence_handler_resources.lock() {
@@ -312,7 +312,7 @@ where
                 fence_handler_resources.ctrl_queue.signal_used();
             }
         }
-    }))
+    })
 }
 
 pub struct ReturnDescriptor {
@@ -1501,7 +1501,7 @@ impl VirtioDevice for Gpu {
         &mut self,
         mem: GuestMemory,
         interrupt: Interrupt,
-        mut queues: BTreeMap<usize, (Queue, Event)>,
+        mut queues: BTreeMap<usize, Queue>,
     ) -> anyhow::Result<()> {
         if queues.len() != QUEUE_SIZES.len() {
             return Err(anyhow!(
@@ -1511,9 +1511,17 @@ impl VirtioDevice for Gpu {
             ));
         }
 
-        let (ctrl_queue, ctrl_evt) = queues.remove(&0).unwrap();
+        let ctrl_queue = queues.remove(&0).unwrap();
+        let ctrl_evt = ctrl_queue
+            .event()
+            .try_clone()
+            .context("failed to clone queue event")?;
         let ctrl_queue = SharedQueueReader::new(ctrl_queue, interrupt.clone());
-        let (cursor_queue, cursor_evt) = queues.remove(&1).unwrap();
+        let cursor_queue = queues.remove(&1).unwrap();
+        let cursor_evt = cursor_queue
+            .event()
+            .try_clone()
+            .context("failed to clone queue event")?;
         let cursor_queue = LocalQueueReader::new(cursor_queue, interrupt.clone());
 
         self.worker_thread
