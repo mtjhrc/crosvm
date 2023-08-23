@@ -287,15 +287,8 @@ fn create_block_device(cfg: &Config, disk: &DiskOption, disk_device_tube: Tube) 
     let dev = virtio::BlockAsync::new(
         features,
         disk.open()?,
-        disk.read_only,
-        disk.sparse,
-        disk.packed_queue,
-        disk.block_size,
-        disk.multiple_workers,
-        disk.id,
+        disk,
         Some(disk_device_tube),
-        None,
-        disk.async_executor,
         None,
         None,
     )
@@ -2459,6 +2452,7 @@ where
         &mut vcpu_ids,
         cfg.dump_device_tree_blob.clone(),
         /*debugcon_jail=*/ None,
+        None,
         None,
     )
     .exit_context(Exit::BuildVm, "the architecture failed to build the vm")?;
