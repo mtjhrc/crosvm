@@ -365,7 +365,6 @@ pub struct RunnableLinuxVm<V: VmArch, Vcpu: VcpuArch> {
     pub devices_thread: Option<std::thread::JoinHandle<()>>,
     #[cfg(feature = "gdb")]
     pub gdb: Option<(u32, Tube)>,
-    pub has_bios: bool,
     pub hotplug_bus: BTreeMap<u8, Arc<Mutex<dyn HotPlugBus>>>,
     pub io_bus: Arc<Bus>,
     pub irq_chip: Box<dyn IrqChipArch>,
@@ -476,7 +475,6 @@ pub trait LinuxArch {
     /// * `vcpu_init` - The data required to initialize VCPU registers and other state.
     /// * `vcpu_id` - The id of the given `vcpu`.
     /// * `num_cpus` - Number of virtual CPUs the guest will have.
-    /// * `has_bios` - Whether the `VmImage` is a `Bios` image
     /// * `cpu_config` - CPU feature configurations.
     fn configure_vcpu<V: Vm>(
         vm: &V,
@@ -486,7 +484,6 @@ pub trait LinuxArch {
         vcpu_init: VcpuInitArch,
         vcpu_id: usize,
         num_cpus: usize,
-        has_bios: bool,
         cpu_config: Option<CpuConfigArch>,
     ) -> Result<(), Self::Error>;
 
@@ -1278,82 +1275,6 @@ where
         .map_err(LoadImageError::ReadToMemory)?;
 
     Ok((guest_addr, size))
-}
-
-/// Read and write permissions setting
-///
-/// Wrap read_allow and write_allow to store them in MsrHandlers level.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub enum MsrRWType {
-    #[serde(rename = "r")]
-    ReadOnly,
-    #[serde(rename = "w")]
-    WriteOnly,
-    #[serde(rename = "rw", alias = "wr")]
-    ReadWrite,
-}
-
-/// Handler types for userspace-msr
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub enum MsrAction {
-    /// Read and write from host directly, and the control of MSR will
-    /// take effect on host.
-    #[serde(rename = "pass")]
-    MsrPassthrough,
-    /// Store the dummy value for msr (copy from host or custom values),
-    /// and the control(WRMSR) of MSR won't take effect on host.
-    #[serde(rename = "emu")]
-    MsrEmulate,
-}
-
-/// Source CPU of MSR value
-///
-/// Indicate which CPU that user get/set MSRs from/to.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub enum MsrValueFrom {
-    /// Read/write MSR value from/into CPU 0.
-    /// The MSR source CPU always be CPU 0.
-    #[serde(rename = "cpu0")]
-    RWFromCPU0,
-    /// Read/write MSR value from/into the running CPU.
-    /// If vCPU migrates to another pcpu, the MSR source CPU will also change.
-    #[serde(skip)]
-    RWFromRunningCPU,
-}
-
-/// Whether to force KVM-filtered MSRs.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub enum MsrFilter {
-    /// Leave it to hypervisor (KVM) default.
-    #[serde(rename = "no")]
-    Default,
-    /// Don't let KVM do the default thing and use our userspace MSR
-    /// implementation.
-    #[serde(rename = "yes")]
-    Override,
-}
-
-/// Config option for userspace-msr handing
-///
-/// MsrConfig will be collected with its corresponding MSR's index.
-/// eg, (msr_index, msr_config)
-#[derive(Clone, Serialize, Deserialize)]
-pub struct MsrConfig {
-    /// If support RDMSR/WRMSR emulation in crosvm?
-    pub rw_type: MsrRWType,
-    /// Handlers should be used to handling MSR.
-    pub action: MsrAction,
-    /// MSR source CPU.
-    pub from: MsrValueFrom,
-    /// Whether to override KVM MSR emulation.
-    pub filter: MsrFilter,
-}
-
-#[sorted]
-#[derive(Error, Debug)]
-pub enum MsrExitHandlerError {
-    #[error("Fail to create MSR handler")]
-    HandlerCreateFailed,
 }
 
 /// SMBIOS table configuration
