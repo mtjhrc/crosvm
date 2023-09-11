@@ -17,7 +17,6 @@ pub(crate) mod pci_hotplug_helpers;
 pub(crate) mod pci_hotplug_manager;
 mod vcpu;
 
-use devices::virtio::VirtioDevice;
 use std::cmp::max;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -94,6 +93,7 @@ use devices::virtio::BalloonMode;
 use devices::virtio::NetParameters;
 #[cfg(feature = "pci-hotplug")]
 use devices::virtio::NetParametersMode;
+use devices::virtio::VirtioDevice;
 use devices::virtio::VirtioDeviceType;
 use devices::virtio::VirtioTransportType;
 use devices::Bus;
@@ -852,7 +852,10 @@ fn create_devices(
     #[cfg(feature = "usb")]
     if cfg.usb {
         // Create xhci controller.
-        let usb_controller = Box::new(XhciController::new(vm.get_memory().clone(), usb_provider));
+        let usb_controller = Box::new(XhciController::new(
+            vm.get_memory().clone(),
+            Box::new(usb_provider),
+        ));
         devices.push((
             usb_controller,
             simple_jail(&cfg.jail_config, "xhci_device")?,
@@ -1431,7 +1434,9 @@ fn run_gunyah(
     components: VmComponents,
 ) -> Result<ExitState> {
     use devices::GunyahIrqChip;
-    use hypervisor::gunyah::{Gunyah, GunyahVcpu, GunyahVm};
+    use hypervisor::gunyah::Gunyah;
+    use hypervisor::gunyah::GunyahVcpu;
+    use hypervisor::gunyah::GunyahVm;
 
     let device_path = device_path.unwrap_or(Path::new(GUNYAH_PATH));
     let gunyah = Gunyah::new_with_path(device_path)
@@ -3251,11 +3256,14 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                         #[cfg(feature = "balloon")]
                                         VmRequest::BalloonCommand(cmd) => {
                                             if let Some(tube) = balloon_tube.as_mut() {
-                                                let Some((r, key)) = tube.send_cmd(cmd, Some(id)) else {
+                                                let Some((r, key)) = tube.send_cmd(cmd, Some(id))
+                                                else {
                                                     continue;
                                                 };
                                                 if key != id {
-                                                    let Some(TaggedControlTube::Vm(tube)) = control_tubes.get(&key) else {
+                                                    let Some(TaggedControlTube::Vm(tube)) =
+                                                        control_tubes.get(&key)
+                                                    else {
                                                         continue;
                                                     };
                                                     if let Err(e) = tube.send(&r) {
