@@ -94,13 +94,11 @@ use devices::virtio::BalloonMode;
 use devices::virtio::NetParameters;
 #[cfg(feature = "pci-hotplug")]
 use devices::virtio::NetParametersMode;
+use devices::virtio::VirtioDeviceType;
 use devices::virtio::VirtioTransportType;
 use devices::Bus;
 use devices::BusDeviceObj;
 use devices::CoIommuDev;
-#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-#[cfg(feature = "geniezone")]
-use devices::GeniezoneKernelIrqChip;
 #[cfg(feature = "usb")]
 use devices::HostBackendDeviceProvider;
 #[cfg(target_arch = "x86_64")]
@@ -110,9 +108,6 @@ use devices::HotPlugKey;
 use devices::IommuDevType;
 use devices::IrqEventIndex;
 use devices::IrqEventSource;
-use devices::KvmKernelIrqChip;
-#[cfg(target_arch = "x86_64")]
-use devices::KvmSplitIrqChip;
 #[cfg(feature = "pci-hotplug")]
 use devices::NetResourceCarrier;
 #[cfg(target_arch = "x86_64")]
@@ -143,18 +138,6 @@ use devices::VirtioPciDevice;
 use devices::XhciController;
 #[cfg(feature = "gpu")]
 use gpu::*;
-#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-#[cfg(feature = "geniezone")]
-use hypervisor::geniezone::Geniezone;
-#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-#[cfg(feature = "geniezone")]
-use hypervisor::geniezone::GeniezoneVcpu;
-#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-#[cfg(feature = "geniezone")]
-use hypervisor::geniezone::GeniezoneVm;
-use hypervisor::kvm::Kvm;
-use hypervisor::kvm::KvmVcpu;
-use hypervisor::kvm::KvmVm;
 #[cfg(target_arch = "riscv64")]
 use hypervisor::CpuConfigRiscv64;
 #[cfg(target_arch = "x86_64")]
@@ -233,24 +216,12 @@ fn create_virtio_devices(
     fs_device_tubes: &mut Vec<Tube>,
     #[cfg(feature = "gpu")] gpu_control_tube: Tube,
     #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
-    vvu_proxy_device_tubes: &mut Vec<Tube>,
-    vvu_proxy_max_sibling_mem_size: u64,
     #[cfg(feature = "registered_events")] registered_evt_q: &SendTube,
 ) -> DeviceResult<Vec<VirtioDeviceStub>> {
     let mut devs = Vec::new();
 
     for opt in &cfg.vhost_user_gpu {
         devs.push(create_vhost_user_gpu_device(cfg.protection_type, opt)?);
-    }
-
-    for opt in &cfg.vvu_proxy {
-        devs.push(create_vvu_proxy_device(
-            cfg.protection_type,
-            &cfg.jail_config,
-            opt,
-            vvu_proxy_device_tubes.remove(0),
-            vvu_proxy_max_sibling_mem_size,
-        )?);
     }
 
     #[cfg(any(feature = "gpu", feature = "video-decoder", feature = "video-encoder"))]
@@ -699,8 +670,6 @@ fn create_devices(
     #[cfg(feature = "usb")] usb_provider: HostBackendDeviceProvider,
     #[cfg(feature = "gpu")] gpu_control_tube: Tube,
     #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
-    vvu_proxy_device_tubes: &mut Vec<Tube>,
-    vvu_proxy_max_sibling_mem_size: u64,
     iova_max_addr: &mut Option<u64>,
     #[cfg(feature = "registered_events")] registered_evt_q: &SendTube,
 ) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
@@ -830,8 +799,6 @@ fn create_devices(
         gpu_control_tube,
         #[cfg(feature = "gpu")]
         render_server_fd,
-        vvu_proxy_device_tubes,
-        vvu_proxy_max_sibling_mem_size,
         #[cfg(feature = "registered_events")]
         registered_evt_q,
     )?;
@@ -845,7 +812,7 @@ fn create_devices(
 
                 let shared_memory_tube = if stub.dev.get_shared_memory_region().is_some() {
                     let (host_tube, device_tube) =
-                        Tube::pair().context("failed to create VVU proxy tube")?;
+                        Tube::pair().context("failed to create shared memory tube")?;
                     vm_memory_control_tubes.push(VmMemoryTube {
                         tube: host_tube,
                         expose_with_viommu: stub.dev.expose_shmem_descriptors_with_viommu(),
@@ -1307,6 +1274,11 @@ fn create_guest_memory(
 
 #[cfg(all(target_arch = "aarch64", feature = "geniezone"))]
 fn run_gz(device_path: Option<&Path>, cfg: Config, components: VmComponents) -> Result<ExitState> {
+    use devices::GeniezoneKernelIrqChip;
+    use hypervisor::geniezone::Geniezone;
+    use hypervisor::geniezone::GeniezoneVcpu;
+    use hypervisor::geniezone::GeniezoneVm;
+
     let device_path = device_path.unwrap_or(Path::new(GENIEZONE_PATH));
     let gzvm = Geniezone::new_with_path(device_path)
         .with_context(|| format!("failed to open GenieZone device {}", device_path.display()))?;
@@ -1355,6 +1327,13 @@ fn run_gz(device_path: Option<&Path>, cfg: Config, components: VmComponents) -> 
 }
 
 fn run_kvm(device_path: Option<&Path>, cfg: Config, components: VmComponents) -> Result<ExitState> {
+    use devices::KvmKernelIrqChip;
+    #[cfg(target_arch = "x86_64")]
+    use devices::KvmSplitIrqChip;
+    use hypervisor::kvm::Kvm;
+    use hypervisor::kvm::KvmVcpu;
+    use hypervisor::kvm::KvmVm;
+
     let device_path = device_path.unwrap_or(Path::new(KVM_PATH));
     let kvm = Kvm::new_with_path(device_path)
         .with_context(|| format!("failed to open KVM device {}", device_path.display()))?;
@@ -1712,17 +1691,6 @@ where
         fs_device_tubes.push(fs_device_tube);
     }
 
-    let mut vvu_proxy_device_tubes = Vec::new();
-    for _ in 0..cfg.vvu_proxy.len() {
-        let (vvu_proxy_host_tube, vvu_proxy_device_tube) =
-            Tube::pair().context("failed to create VVU proxy tube")?;
-        vm_memory_control_tubes.push(VmMemoryTube {
-            tube: vvu_proxy_host_tube,
-            expose_with_viommu: false,
-        });
-        vvu_proxy_device_tubes.push(vvu_proxy_device_tube);
-    }
-
     let (vm_evt_wrtube, vm_evt_rdtube) =
         Tube::directional_pair().context("failed to create vm event tube")?;
 
@@ -1796,8 +1764,6 @@ where
         gpu_control_device_tube,
         #[cfg(feature = "gpu")]
         render_server_fd,
-        &mut vvu_proxy_device_tubes,
-        components.memory_size,
         &mut iova_max_addr,
         #[cfg(feature = "registered_events")]
         &reg_evt_wrtube,
@@ -4040,7 +4006,7 @@ fn jail_and_start_vu_device<T: VirtioDeviceBuilder>(
     base::syslog::push_descriptors(&mut keep_rds);
     cros_tracing::push_descriptors!(&mut keep_rds);
 
-    let jail_type = VhostUserListener::get_virtio_transport_type(vhost);
+    let jail_type = VirtioDeviceType::VhostUser;
 
     // Create a jail from the configuration. If the configuration is `None`, `create_jail` will also
     // return `None` so fall back to an empty (i.e. non-constrained) Minijail.
