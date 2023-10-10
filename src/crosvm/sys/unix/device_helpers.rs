@@ -299,7 +299,7 @@ impl<'a> VirtioDeviceBuilder for &'a ScsiOption {
         info!("Trying to attach scsi device: {}", self.path.display());
         let disk_image = self.open()?;
         Ok(Box::new(
-            virtio::ScsiDevice::new(disk_image, base_features, self.block_size)
+            virtio::ScsiDevice::new(disk_image, base_features, self.block_size, self.read_only)
                 .context("failed to create scsi device")?,
         ))
     }
@@ -526,11 +526,13 @@ pub fn create_single_touch_device(
         .context("failed configuring virtio single touch")?;
 
     let (width, height) = single_touch_spec.get_size();
+    let name = single_touch_spec.get_name();
     let dev = virtio::input::new_single_touch(
         idx,
         socket,
         width,
         height,
+        name,
         virtio::base_features(protection_type),
     )
     .context("failed to set up input device")?;
@@ -552,11 +554,13 @@ pub fn create_multi_touch_device(
         .context("failed configuring virtio multi touch")?;
 
     let (width, height) = multi_touch_spec.get_size();
+    let name = multi_touch_spec.get_name();
     let dev = virtio::input::new_multi_touch(
         idx,
         socket,
         width,
         height,
+        name,
         virtio::base_features(protection_type),
     )
     .context("failed to set up input device")?;
@@ -579,11 +583,13 @@ pub fn create_trackpad_device(
         .context("failed configuring virtio trackpad")?;
 
     let (width, height) = trackpad_spec.get_size();
+    let name = trackpad_spec.get_name();
     let dev = virtio::input::new_trackpad(
         idx,
         socket,
         width,
         height,
+        name,
         virtio::base_features(protection_type),
     )
     .context("failed to set up input device")?;
