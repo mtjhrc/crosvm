@@ -90,11 +90,11 @@ use crate::IoSource;
 ///     Ok(len)
 /// }
 ///
-/// #[cfg(unix)]
+/// #[cfg(any(target_os = "android", target_os = "linux"))]
 /// # fn do_it() -> Result<(), Box<dyn Error>> {
 ///     let ex = Executor::new()?;
 ///
-///     let (rx, tx) = base::unix::pipe(true)?;
+///     let (rx, tx) = base::linux::pipe(true)?;
 ///     let zero = File::open("/dev/zero")?;
 ///     let zero_bytes = CHUNK_SIZE * 7;
 ///     let zero_to_pipe = transfer_data(
@@ -119,7 +119,7 @@ use crate::IoSource;
 ///
 /// #     Ok(())
 /// # }
-/// #[cfg(unix)]
+/// #[cfg(any(target_os = "android", target_os = "linux"))]
 /// # do_it().unwrap();
 /// ```
 

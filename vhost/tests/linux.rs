@@ -3,13 +3,13 @@
 // found in the LICENSE file.
 
 // TODO(225193541): Enable/add tests for windows.
-#![cfg(unix)]
+#![cfg(any(target_os = "android", target_os = "linux"))]
 
 use std::path::PathBuf;
 use std::result;
 
 use base::Event;
-use net_util::sys::unix::fakes::FakeTap;
+use net_util::sys::linux::fakes::FakeTap;
 use vhost::net::fakes::FakeNet;
 use vhost::net::NetT;
 use vhost::Error;
