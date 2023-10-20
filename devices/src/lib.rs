@@ -47,6 +47,7 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use anyhow::Context;
+use base::debug;
 use base::error;
 use base::info;
 use base::Tube;
@@ -228,12 +229,13 @@ pub fn create_devices_worker_thread(
 fn sleep_devices(bus: &Bus) -> anyhow::Result<()> {
     match bus.sleep_devices() {
         Ok(_) => {
-            info!("Devices slept successfully");
+            debug!("Devices slept successfully on {:?} Bus", bus.get_bus_type());
             Ok(())
         }
         Err(e) => Err(anyhow!(
-            "Failed to sleep all devices: {}. Waking up sleeping devices.",
-            e
+            "Failed to sleep all devices: {} on {:?} Bus. Waking up sleeping devices.",
+            e,
+            bus.get_bus_type(),
         )),
     }
 }
@@ -241,15 +243,19 @@ fn sleep_devices(bus: &Bus) -> anyhow::Result<()> {
 fn wake_devices(bus: &Bus) {
     match bus.wake_devices() {
         Ok(_) => {
-            info!("Devices awoken successfully");
+            debug!(
+                "Devices awoken successfully on {:?} Bus",
+                bus.get_bus_type()
+            );
         }
         Err(e) => {
             // Some devices may have slept. Eternally.
             // Recovery - impossible.
             // Shut down VM.
             panic!(
-                "Failed to wake devices: {}. VM panicked to avoid unexpected behavior",
-                e
+                "Failed to wake devices: {} on {:?} Bus. VM panicked to avoid unexpected behavior",
+                e,
+                bus.get_bus_type(),
             )
         }
     }
@@ -296,12 +302,19 @@ fn snapshot_devices(
 ) -> anyhow::Result<()> {
     match bus.snapshot_devices(add_snapshot) {
         Ok(_) => {
-            info!("Devices snapshot successfully");
+            debug!(
+                "Devices snapshot successfully for {:?} Bus",
+                bus.get_bus_type()
+            );
             Ok(())
         }
         Err(e) => {
             // If snapshot fails, wake devices and return error
-            error!("failed to snapshot devices: {}", e);
+            error!(
+                "failed to snapshot devices: {:#} on {:?} Bus",
+                e,
+                bus.get_bus_type()
+            );
             Err(e)
         }
     }
@@ -313,12 +326,19 @@ fn restore_devices(
 ) -> anyhow::Result<()> {
     match bus.restore_devices(devices_map) {
         Ok(_) => {
-            info!("Devices restore successfully");
+            debug!(
+                "Devices restore successfully for {:?} Bus",
+                bus.get_bus_type()
+            );
             Ok(())
         }
         Err(e) => {
             // If restore fails, wake devices and return error
-            error!("failed to restore devices: {:#}", e);
+            error!(
+                "failed to restore devices: {:#} on {:?} Bus",
+                e,
+                bus.get_bus_type()
+            );
             Err(e)
         }
     }
