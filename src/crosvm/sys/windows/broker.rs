@@ -77,6 +77,16 @@ use devices::virtio::snd::parameters::Parameters as SndParameters;
 use devices::virtio::vhost::user::device::gpu::sys::windows::GpuBackendConfig;
 #[cfg(feature = "gpu")]
 use devices::virtio::vhost::user::device::gpu::sys::windows::GpuVmmConfig;
+#[cfg(feature = "gpu")]
+use devices::virtio::vhost::user::device::gpu::sys::windows::InputEventBackendConfig;
+#[cfg(feature = "gpu")]
+use devices::virtio::vhost::user::device::gpu::sys::windows::InputEventSplitConfig;
+#[cfg(feature = "gpu")]
+use devices::virtio::vhost::user::device::gpu::sys::windows::InputEventVmmConfig;
+#[cfg(feature = "gpu")]
+use devices::virtio::vhost::user::device::gpu::sys::windows::WindowProcedureThreadSplitConfig;
+#[cfg(feature = "gpu")]
+use devices::virtio::vhost::user::device::gpu::sys::windows::WindowProcedureThreadVmmConfig;
 #[cfg(feature = "audio")]
 use devices::virtio::vhost::user::device::snd::sys::windows::SndBackendConfig;
 #[cfg(feature = "audio")]
@@ -87,6 +97,10 @@ use devices::virtio::vhost::user::device::snd::sys::windows::SndVmmConfig;
 use devices::virtio::vhost::user::device::NetBackendConfig;
 #[cfg(feature = "gpu")]
 use gpu_display::EventDevice;
+#[cfg(feature = "gpu")]
+use gpu_display::WindowProcedureThread;
+#[cfg(feature = "gpu")]
+use gpu_display::WindowProcedureThreadBuilder;
 use metrics::protos::event_details::EmulatorChildProcessExitDetails;
 use metrics::protos::event_details::RecordDetails;
 use metrics::MetricEventType;
@@ -108,6 +122,8 @@ use winapi::um::processthreadsapi::TerminateProcess;
 use crate::sys::windows::get_gpu_product_configs;
 #[cfg(feature = "audio")]
 use crate::sys::windows::get_snd_product_configs;
+#[cfg(feature = "gpu")]
+use crate::sys::windows::get_window_procedure_thread_product_configs;
 #[cfg(feature = "audio")]
 use crate::sys::windows::num_input_sound_devices;
 #[cfg(feature = "audio")]
@@ -655,6 +671,13 @@ fn run_internal(mut cfg: Config, log_args: LogArgs) -> Result<()> {
         Tube::directional_pair().context("failed to create vm event tube")?;
 
     #[cfg(feature = "gpu")]
+    let mut input_event_split_config = platform_create_input_event_config(&cfg)
+        .context("create input event devices for virtio-gpu device")?;
+
+    #[cfg(feature = "gpu")]
+    let mut window_procedure_thread_builder = Some(WindowProcedureThread::builder());
+
+    #[cfg(feature = "gpu")]
     let gpu_cfg = platform_create_gpu(
         &cfg,
         &mut main_child,
@@ -675,14 +698,34 @@ fn run_internal(mut cfg: Config, log_args: LogArgs) -> Result<()> {
             &mut cfg,
             &log_args,
             gpu_cfg,
+            &mut input_event_split_config,
             &mut main_child,
             &mut children,
             &mut wait_ctx,
             &mut metric_tubes,
+            window_procedure_thread_builder
+                .take()
+                .ok_or_else(|| anyhow!("window_procedure_thread_builder is missing."))?,
             #[cfg(feature = "process-invariants")]
             &process_invariants,
         )?)
     };
+
+    #[cfg(feature = "gpu")]
+    {
+        cfg.input_event_split_config = Some(input_event_split_config);
+        if let Some(window_procedure_thread_builder) = window_procedure_thread_builder {
+            cfg.window_procedure_thread_split_config = Some(
+                platform_create_window_procedure_thread_configs(
+                    &cfg,
+                    window_procedure_thread_builder,
+                    main_child.alias_pid,
+                    main_child.alias_pid,
+                )
+                .context("Failed to create window procedure thread configs")?,
+            );
+        }
+    }
 
     // Wait until all device processes are spun up so main TubeTransporter will have all the
     // device control and Vhost tubes.
@@ -1611,6 +1654,67 @@ fn start_up_snd(
 }
 
 #[cfg(feature = "gpu")]
+fn platform_create_input_event_config(cfg: &Config) -> Result<InputEventSplitConfig> {
+    let mut event_devices = vec![];
+    let mut multi_touch_pipes = vec![];
+    let mut mouse_pipes = vec![];
+    let mut keyboard_pipes = vec![];
+
+    for _ in cfg.virtio_multi_touch.iter() {
+        let (event_device_pipe, virtio_input_pipe) =
+            StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
+                .exit_context(Exit::EventDeviceSetup, "failed to set up EventDevice")?;
+        event_devices.push(EventDevice::touchscreen(event_device_pipe));
+        multi_touch_pipes.push(virtio_input_pipe);
+    }
+
+    for _ in cfg.virtio_mice.iter() {
+        let (event_device_pipe, virtio_input_pipe) =
+            StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
+                .exit_context(Exit::EventDeviceSetup, "failed to set up EventDevice")?;
+        event_devices.push(EventDevice::mouse(event_device_pipe));
+        mouse_pipes.push(virtio_input_pipe);
+    }
+
+    // One keyboard
+    let (event_device_pipe, virtio_input_pipe) =
+        StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
+            .exit_context(Exit::EventDeviceSetup, "failed to set up EventDevice")?;
+    event_devices.push(EventDevice::keyboard(event_device_pipe));
+    keyboard_pipes.push(virtio_input_pipe);
+
+    Ok(InputEventSplitConfig {
+        backend_config: Some(InputEventBackendConfig { event_devices }),
+        vmm_config: InputEventVmmConfig {
+            multi_touch_pipes,
+            mouse_pipes,
+            keyboard_pipes,
+        },
+    })
+}
+
+#[cfg(feature = "gpu")]
+/// Create Window procedure thread configurations.
+fn platform_create_window_procedure_thread_configs(
+    cfg: &Config,
+    mut wndproc_thread_builder: WindowProcedureThreadBuilder,
+    main_alias_pid: u32,
+    device_alias_pid: u32,
+) -> Result<WindowProcedureThreadSplitConfig> {
+    let product_config = get_window_procedure_thread_product_configs(
+        cfg,
+        &mut wndproc_thread_builder,
+        main_alias_pid,
+        device_alias_pid,
+    )
+    .context("create product window procedure thread configs")?;
+    Ok(WindowProcedureThreadSplitConfig {
+        wndproc_thread_builder: Some(wndproc_thread_builder),
+        vmm_config: WindowProcedureThreadVmmConfig { product_config },
+    })
+}
+
+#[cfg(feature = "gpu")]
 /// Create backend and VMM configurations for the GPU device.
 fn platform_create_gpu(
     cfg: &Config,
@@ -1625,34 +1729,6 @@ fn platform_create_gpu(
             .exit_context(Exit::CloneEvent, "failed to clone event")?,
     );
 
-    let mut event_devices = vec![];
-    let mut input_event_multi_touch_pipes = vec![];
-    let mut input_event_mouse_pipes = vec![];
-    let mut input_event_keyboard_pipes = vec![];
-
-    for _ in cfg.virtio_multi_touch.iter() {
-        let (event_device_pipe, virtio_input_pipe) =
-            StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
-                .exit_context(Exit::EventDeviceSetup, "failed to set up EventDevice")?;
-        event_devices.push(EventDevice::touchscreen(event_device_pipe));
-        input_event_multi_touch_pipes.push(virtio_input_pipe);
-    }
-
-    for _ in cfg.virtio_mice.iter() {
-        let (event_device_pipe, virtio_input_pipe) =
-            StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
-                .exit_context(Exit::EventDeviceSetup, "failed to set up EventDevice")?;
-        event_devices.push(EventDevice::mouse(event_device_pipe));
-        input_event_mouse_pipes.push(virtio_input_pipe);
-    }
-
-    // One keyboard
-    let (event_device_pipe, virtio_input_pipe) =
-        StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
-            .exit_context(Exit::EventDeviceSetup, "failed to set up EventDevice")?;
-    event_devices.push(EventDevice::keyboard(event_device_pipe));
-    input_event_keyboard_pipes.push(virtio_input_pipe);
-
     let (backend_config_product, vmm_config_product) =
         get_gpu_product_configs(cfg, main_child.alias_pid)?;
 
@@ -1660,7 +1736,6 @@ fn platform_create_gpu(
         device_vhost_user_tube: None,
         exit_event,
         exit_evt_wrtube,
-        event_devices,
         params: cfg
             .gpu_parameters
             .as_ref()
@@ -1671,9 +1746,6 @@ fn platform_create_gpu(
 
     let vmm_config = GpuVmmConfig {
         main_vhost_user_tube: None,
-        input_event_multi_touch_pipes,
-        input_event_mouse_pipes,
-        input_event_keyboard_pipes,
         product_config: vmm_config_product,
     };
 
@@ -1686,10 +1758,12 @@ fn start_up_gpu(
     cfg: &mut Config,
     log_args: &LogArgs,
     gpu_cfg: (GpuBackendConfig, GpuVmmConfig),
+    input_event_cfg: &mut InputEventSplitConfig,
     main_child: &mut ChildProcess,
     children: &mut HashMap<u32, ChildCleanup>,
     wait_ctx: &mut WaitContext<Token>,
     metric_tubes: &mut Vec<Tube>,
+    wndproc_thread_builder: WindowProcedureThreadBuilder,
     #[cfg(feature = "process-invariants")] process_invariants: &EmulatorProcessInvariants,
 ) -> Result<ChildProcess> {
     let (mut backend_cfg, mut vmm_cfg) = gpu_cfg;
@@ -1719,6 +1793,18 @@ fn start_up_gpu(
         .serialize_and_transport(gpu_child.process_id)
         .exit_context(Exit::TubeTransporterInit, "failed to initialize tube")?;
 
+    let mut wndproc_thread_cfg = platform_create_window_procedure_thread_configs(
+        cfg,
+        wndproc_thread_builder,
+        main_child.alias_pid,
+        gpu_child.alias_pid,
+    )
+    .context("failed to create window procedure thread configs")?;
+    let wndproc_thread_builder = wndproc_thread_cfg
+        .wndproc_thread_builder
+        .take()
+        .expect("The window procedure thread builder is missing");
+    cfg.window_procedure_thread_split_config = Some(wndproc_thread_cfg);
     // Update target PIDs to new child.
     device_host_user_tube.set_target_pid(main_child.alias_pid);
     main_vhost_user_tube.set_target_pid(gpu_child.alias_pid);
@@ -1727,9 +1813,13 @@ fn start_up_gpu(
     backend_cfg.device_vhost_user_tube = Some(device_host_user_tube);
     vmm_cfg.main_vhost_user_tube = Some(main_vhost_user_tube);
 
-    // Send VMM config to main process. Note we don't set gpu_backend_config, since it is passed to
-    // the child.
+    // Send VMM config to main process. Note we don't set gpu_backend_config and
+    // input_event_backend_config, since it is passed to the child.
     cfg.gpu_vmm_config = Some(vmm_cfg);
+    let input_event_backend_config = input_event_cfg
+        .backend_config
+        .take()
+        .context("input event backend config is missing.")?;
 
     let startup_args = CommonChildStartupArgs::new(
         log_args,
@@ -1743,7 +1833,14 @@ fn start_up_gpu(
     gpu_child.bootstrap_tube.send(&startup_args).unwrap();
 
     // Send backend config to GPU child.
-    gpu_child.bootstrap_tube.send(&backend_cfg).unwrap();
+    gpu_child
+        .bootstrap_tube
+        .send(&(
+            backend_cfg,
+            input_event_backend_config,
+            wndproc_thread_builder,
+        ))
+        .unwrap();
 
     Ok(gpu_child)
 }
