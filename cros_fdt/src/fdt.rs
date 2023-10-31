@@ -5,8 +5,9 @@
 //! This module writes Flattened Devicetree blobs as defined here:
 //! <https://devicetree-specification.readthedocs.io/en/stable/flattened-format.html>
 
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
-use std::ffi::CString;
+use std::convert::TryInto;
 use std::io;
 
 use remain::sorted;
@@ -20,28 +21,74 @@ pub(crate) const SIZE_U64: usize = std::mem::size_of::<u64>();
 #[sorted]
 #[derive(ThisError, Debug)]
 pub enum Error {
+    #[error("Binary size must fit in 32 bits")]
+    BinarySizeTooLarge,
+    #[error("Duplicate node {}", .0)]
+    DuplicateNode(String),
     #[error("I/O error dumping FDT to file code={} path={}", .0, .1.display())]
     FdtDumpIoError(io::Error, std::path::PathBuf),
-    #[error("Parse error reading FDT parameters")]
-    FdtFileParseError,
     #[error("Error writing FDT to guest memory")]
     FdtGuestMemoryWriteError,
-    #[error("I/O error reading FDT parameters code={0}")]
+    #[error("I/O error code={0}")]
     FdtIoError(io::Error),
+    #[error("Parse error reading FDT parameters: {}", .0)]
+    FdtParseError(String),
+    #[error("Invalid name string: {}", .0)]
+    InvalidName(String),
     #[error("Invalid string value {}", .0)]
     InvalidString(String),
+    #[error("Property value is not valid")]
+    PropertyValueInvalid,
     #[error("Property value size must fit in 32 bits")]
     PropertyValueTooLarge,
     #[error("Total size must fit in 32 bits")]
     TotalSizeTooLarge,
 }
 
+impl From<io::Error> for Error {
+    fn from(value: io::Error) -> Self {
+        Self::FdtIoError(value)
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
+type Blob<'a> = &'a [u8];
 
 const FDT_BEGIN_NODE: u32 = 0x00000001;
 const FDT_END_NODE: u32 = 0x00000002;
 const FDT_PROP: u32 = 0x00000003;
+const FDT_NOP: u32 = 0x00000004;
 const FDT_END: u32 = 0x00000009;
+
+// Consume and return `n` bytes from the beginning of a slice.
+fn consume<'a>(bytes: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
+    let mid = n;
+    if mid > bytes.len() {
+        Err(Error::PropertyValueInvalid)
+    } else {
+        let (data_bytes, rest) = bytes.split_at(n);
+        *(bytes) = rest;
+        Ok(data_bytes)
+    }
+}
+
+// Consume a u32 from a byte slice.
+#[inline]
+fn rdu32(data: &mut Blob) -> Result<u32> {
+    Ok(u32::from_be_bytes(
+        // Unwrap won't panic because the slice length is checked in consume().
+        consume(data, SIZE_U32)?.try_into().unwrap(),
+    ))
+}
+
+// Consume a u64 from a byte slice.
+#[inline]
+fn rdu64(data: &mut Blob) -> Result<u64> {
+    Ok(u64::from_be_bytes(
+        // Unwrap won't panic because the slice length is checked in consume().
+        consume(data, SIZE_U64)?.try_into().unwrap(),
+    ))
+}
 
 // Return the number of padding bytes required to align `size` to `alignment`.
 #[inline]
@@ -55,10 +102,35 @@ fn align_data(data: &mut Vec<u8>, alignment: usize) {
     data.resize(align_pad_len(data.len(), alignment) + data.len(), 0u8);
 }
 
+// Construct a string from the start of a byte slice until the first null byte.
+pub(crate) fn c_str_to_string(input: Blob) -> Option<String> {
+    let size = input.iter().position(|&v| v == 0u8)?;
+    String::from_utf8(input[..size].to_vec()).ok()
+}
+
+// Verify FDT property name.
+fn is_valid_prop_name(name: &str) -> bool {
+    const ALLOWED_SPECIAL_CHARS: [u8; 7] = [b'.', b',', b'_', b'+', b'?', b'#', b'-'];
+    name.bytes()
+        .all(|c| c.is_ascii_alphanumeric() || ALLOWED_SPECIAL_CHARS.contains(&c))
+}
+
+// Verify FDT node name.
+fn is_valid_node_name(name: &str) -> bool {
+    const ALLOWED_SPECIAL_CHARS: [u8; 6] = [b'.', b',', b'_', b'+', b'-', b'@'];
+    const ADDR_SEP: u8 = b'@';
+    // At most one `@` separating node-name and unit-address
+    if name.bytes().filter(|&c| c == ADDR_SEP).count() > 1 {
+        return false;
+    }
+    name.bytes()
+        .all(|c| c.is_ascii_alphanumeric() || ALLOWED_SPECIAL_CHARS.contains(&c))
+}
+
 // An implementation of FDT header.
 #[derive(Default)]
 struct FdtHeader {
-    magic: u32,             // magic word FDT_MAGIC
+    magic: u32,             // magic word
     total_size: u32,        // total size of DT block
     off_dt_struct: u32,     // offset to structure
     off_dt_strings: u32,    // offset to strings
@@ -101,9 +173,9 @@ impl FdtHeader {
     }
 
     // Dump FDT header to a byte vector.
-    fn to_blob(&self) -> Vec<u8> {
-        let mut blob = Vec::with_capacity(Self::SIZE);
-        for val in &[
+    fn write_blob(&self, buffer: &mut [u8]) -> Result<()> {
+        assert_eq!(buffer.len(), Self::SIZE);
+        for (chunk, val_u32) in buffer.chunks_exact_mut(SIZE_U32).zip(&[
             self.magic,
             self.total_size,
             self.off_dt_struct,
@@ -114,12 +186,48 @@ impl FdtHeader {
             self.boot_cpuid_phys,
             self.size_dt_strings,
             self.size_dt_struct,
-        ] {
-            blob.extend(val.to_be_bytes());
+        ]) {
+            chunk.copy_from_slice(&val_u32.to_be_bytes());
         }
-        align_data(&mut blob, SIZE_U64);
-        assert_eq!(blob.len(), Self::SIZE);
-        blob
+        Ok(())
+    }
+
+    // Load FDT header from a byte slice.
+    fn from_blob(mut input: Blob) -> Result<Self> {
+        if input.len() < Self::SIZE {
+            return Err(Error::FdtParseError("invalid binary size".into()));
+        }
+        let input = &mut input;
+        let header = Self {
+            magic: rdu32(input)?,
+            total_size: rdu32(input)?,
+            off_dt_struct: rdu32(input)?,
+            off_dt_strings: rdu32(input)?,
+            off_mem_rsvmap: rdu32(input)?,
+            version: rdu32(input)?,
+            last_comp_version: rdu32(input)?,
+            boot_cpuid_phys: rdu32(input)?,
+            size_dt_strings: rdu32(input)?,
+            size_dt_struct: rdu32(input)?,
+        };
+        if header.version < Self::VERSION {
+            return Err(Error::FdtParseError("unsupported FDT version".into()));
+        }
+        if header.off_mem_rsvmap >= header.off_dt_strings
+            || header.off_mem_rsvmap < FdtHeader::SIZE as u32
+        {
+            return Err(Error::FdtParseError(
+                "invalid reserved memory offset".into(),
+            ));
+        }
+        if header.off_dt_struct >= header.off_dt_strings {
+            return Err(Error::FdtParseError("invalid DT struct offset".into()));
+        }
+        if header.magic != Self::MAGIC {
+            Err(Error::FdtParseError("invalid header magic".into()))
+        } else {
+            Ok(header)
+        }
     }
 }
 
@@ -127,25 +235,59 @@ impl FdtHeader {
 #[derive(Default)]
 struct FdtStrings {
     strings: Vec<u8>,
-    string_offsets: BTreeMap<CString, u32>,
+    string_offsets: BTreeMap<String, u32>,
 }
 
 impl FdtStrings {
+    // Load the strings block from a byte slice.
+    fn from_blob(input: Blob) -> Result<Self> {
+        if input.last().map_or(false, |i| *i != 0) {
+            return Err(Error::FdtParseError(
+                "strings block missing null terminator".into(),
+            ));
+        }
+        let mut string_offsets = BTreeMap::new();
+        let mut offset = 0u32;
+        for bytes in input.split(|&x| x == 0u8) {
+            if bytes.is_empty() {
+                break;
+            }
+            let string = String::from_utf8(bytes.to_vec())
+                .map_err(|_| Error::FdtParseError("invalid value in strings block".into()))?;
+            string_offsets.insert(string, offset);
+            offset += u32::try_from(bytes.len() + 1).map_err(|_| Error::BinarySizeTooLarge)?;
+        }
+        Ok(Self {
+            strings: input.to_vec(),
+            string_offsets,
+        })
+    }
+
     // Find an existing instance of a string `s`, or add it to the strings block.
     // Returns the offset into the strings block.
-    fn intern_string(&mut self, s: CString) -> u32 {
-        if let Some(off) = self.string_offsets.get(&s) {
+    fn intern_string(&mut self, s: &str) -> u32 {
+        if let Some(off) = self.string_offsets.get(s) {
             *off
         } else {
             let off = self.strings.len() as u32;
-            self.strings.extend_from_slice(s.to_bytes_with_nul());
-            self.string_offsets.insert(s, off);
+            self.strings.extend_from_slice(s.as_bytes());
+            self.strings.push(0u8);
+            self.string_offsets.insert(s.to_owned(), off);
             off
         }
     }
 
-    fn to_blob(&self) -> &[u8] {
-        self.strings.as_slice()
+    // Write the strings blob to a `Write` object.
+    fn write_blob(&self, mut writer: impl io::Write) -> Result<()> {
+        Ok(writer.write_all(&self.strings)?)
+    }
+
+    // Return the string at given offset or `None` if such a string doesn't exist.
+    fn at_offset(&self, off: u32) -> Option<String> {
+        self.strings
+            .get(off as usize..)
+            .and_then(c_str_to_string)
+            .filter(|s| !s.is_empty())
     }
 }
 
@@ -156,7 +298,7 @@ impl FdtStrings {
 #[derive(Debug, Clone)]
 pub struct FdtNode {
     /// Node name
-    pub name: String,
+    pub(crate) name: String,
     pub(crate) props: BTreeMap<String, Vec<u8>>,
     pub(crate) subnodes: BTreeMap<String, FdtNode>,
 }
@@ -169,6 +311,14 @@ impl FdtNode {
         props: BTreeMap<String, Vec<u8>>,
         subnodes: BTreeMap<String, FdtNode>,
     ) -> Result<Self> {
+        if !is_valid_node_name(&name) {
+            return Err(Error::InvalidName(name));
+        }
+        for pname in props.keys() {
+            if !is_valid_prop_name(pname) {
+                return Err(Error::InvalidName(pname.into()));
+            }
+        }
         Ok(Self {
             name,
             props,
@@ -181,34 +331,107 @@ impl FdtNode {
         FdtNode::new(name.into(), [].into(), [].into())
     }
 
+    fn read_token(input: &mut Blob) -> Result<u32> {
+        loop {
+            let value = rdu32(input)?;
+            if value != FDT_NOP {
+                return Ok(value);
+            }
+        }
+    }
+
+    // Parse binary content of an FDT node.
+    fn parse_node(input: &mut Blob, strings: &FdtStrings) -> Result<Self> {
+        // Node name
+        let name = c_str_to_string(input)
+            .ok_or_else(|| Error::FdtParseError("could not parse node name".into()))?;
+        let name_nbytes = name.len() + 1;
+        consume(input, name_nbytes + align_pad_len(name_nbytes, SIZE_U32))?;
+
+        // Node properties and subnodes
+        let mut props = BTreeMap::new();
+        let mut subnodes = BTreeMap::new();
+        let mut encountered_subnode = false; // Properties must appear before subnodes
+
+        loop {
+            match Self::read_token(input)? {
+                FDT_BEGIN_NODE => {
+                    encountered_subnode = true;
+                    let subnode = Self::parse_node(input, strings)?;
+                    match subnodes.entry(subnode.name.clone()) {
+                        Entry::Vacant(e) => e.insert(subnode),
+                        Entry::Occupied(_) => return Err(Error::DuplicateNode(subnode.name)),
+                    };
+                }
+                FDT_END_NODE => break,
+                FDT_PROP => {
+                    if encountered_subnode {
+                        return Err(Error::FdtParseError(
+                            "unexpected prop token after subnode".into(),
+                        ));
+                    }
+                    let prop_len = rdu32(input)? as usize;
+                    let prop_name_offset = rdu32(input)?;
+                    let prop_blob = consume(input, prop_len + align_pad_len(prop_len, SIZE_U32))?;
+                    let prop_name = strings.at_offset(prop_name_offset).ok_or_else(|| {
+                        Error::FdtParseError(format!(
+                            "invalid property name at {prop_name_offset:#x}",
+                        ))
+                    })?;
+                    // Keep the original (non-aligned) size as property value
+                    props.insert(prop_name, prop_blob[..prop_len].to_vec());
+                }
+                FDT_NOP => continue,
+                FDT_END => return Err(Error::FdtParseError("unexpected END token".into())),
+                t => return Err(Error::FdtParseError(format!("invalid FDT token {t}"))),
+            }
+        }
+        FdtNode::new(name, props, subnodes)
+    }
+
+    // Load an `FdtNode` instance from a slice of bytes.
+    fn from_blob(mut input: Blob, strings: &FdtStrings) -> Result<Self> {
+        let input = &mut input;
+        if Self::read_token(input)? != FDT_BEGIN_NODE {
+            return Err(Error::FdtParseError("expected begin node token".into()));
+        }
+        let root = Self::parse_node(input, strings)?;
+        if Self::read_token(input)? != FDT_END {
+            Err(Error::FdtParseError("expected end node token".into()))
+        } else {
+            Ok(root)
+        }
+    }
+
     // Write binary contents of a node to a vector of bytes.
-    fn to_blob(node: &FdtNode, blob: &mut Vec<u8>, strings: &mut FdtStrings) {
+    fn write_blob(&self, writer: &mut impl io::Write, strings: &mut FdtStrings) -> Result<()> {
         // Token
-        blob.extend(FDT_BEGIN_NODE.to_be_bytes());
+        writer.write_all(&FDT_BEGIN_NODE.to_be_bytes())?;
         // Name
-        blob.extend(node.name.as_bytes());
-        blob.push(0u8);
-        align_data(blob, SIZE_U32);
+        writer.write_all(self.name.as_bytes())?;
+        writer.write_all(&[0])?; // Node name terminator
+        let pad_len = align_pad_len(self.name.len() + 1, SIZE_U32);
+        writer.write_all(&vec![0; pad_len])?;
         // Properties
-        for (propname, propblob) in node.props.iter() {
+        for (propname, propblob) in self.props.iter() {
             // Prop token
-            blob.extend(FDT_PROP.to_be_bytes());
+            writer.write_all(&FDT_PROP.to_be_bytes())?;
             // Prop size
-            blob.extend((propblob.len() as u32).to_be_bytes());
+            writer.write_all(&(propblob.len() as u32).to_be_bytes())?;
             // Prop name offset
-            let propname = CString::new(propname.as_str()).expect("\\0 in property name");
-            blob.extend(strings.intern_string(propname).to_be_bytes());
+            writer.write_all(&strings.intern_string(propname).to_be_bytes())?;
             // Prop value
-            blob.extend(propblob.iter());
-            align_data(blob, SIZE_U32);
+            writer.write_all(propblob)?;
+            let pad_len = align_pad_len(propblob.len(), SIZE_U32);
+            writer.write_all(&vec![0; pad_len])?;
         }
         // Subnodes
-        for subnode in node.subnodes.values() {
-            FdtNode::to_blob(subnode, blob, strings);
+        for subnode in self.subnodes.values() {
+            subnode.write_blob(writer, strings)?;
         }
-        align_data(blob, SIZE_U32);
         // Token
-        blob.extend(FDT_END_NODE.to_be_bytes());
+        writer.write_all(&FDT_END_NODE.to_be_bytes())?;
+        Ok(())
     }
 
     /// Write a property.
@@ -221,8 +444,8 @@ impl FdtNode {
     where
         T: ToFdtPropval,
     {
-        if name.contains('\0') {
-            return Err(Error::InvalidString(name.into()));
+        if !is_valid_prop_name(name) {
+            return Err(Error::InvalidName(name.into()));
         }
         let bytes = value.to_propval()?;
         // FDT property byte size must fit into a u32.
@@ -238,9 +461,6 @@ impl FdtNode {
     ///
     /// `name` - name of the node; must be a valid node name according to DT specification.
     pub fn subnode_mut(&mut self, name: &str) -> Result<&mut FdtNode> {
-        if name.contains('\0') {
-            return Err(Error::InvalidString(name.into()));
-        }
         if !self.subnodes.contains_key(name) {
             self.subnodes.insert(name.into(), FdtNode::empty(name)?);
         }
@@ -280,7 +500,7 @@ pub struct Fdt {
 ///
 /// This represents an area of physical memory reserved by the firmware and unusable by the OS.
 /// For example, this could be used to preserve bootloader code or data used at runtime.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct FdtReserveEntry {
     /// Physical address of the beginning of the reserved region.
     pub address: u64,
@@ -302,12 +522,19 @@ impl FdtReserveEntry {
         Self { address, size }
     }
 
+    // Load a reserved memory entry from a byte slice.
+    fn from_blob(input: &mut Blob) -> Result<Self> {
+        Ok(Self {
+            address: rdu64(input)?,
+            size: rdu64(input)?,
+        })
+    }
+
     // Dump the entry as a vector of bytes.
-    fn to_blob(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(SIZE_U64 * 2);
-        bytes.extend(self.address.to_be_bytes().as_slice());
-        bytes.extend(self.size.to_be_bytes().as_slice());
-        bytes
+    fn write_blob(&self, mut writer: impl io::Write) -> Result<()> {
+        writer.write_all(&self.address.to_be_bytes())?;
+        writer.write_all(&self.size.to_be_bytes())?;
+        Ok(())
     }
 }
 
@@ -335,54 +562,93 @@ impl Fdt {
         self.boot_cpuid_phys = boot_cpuid_phys;
     }
 
-    fn dump_reserved_memory(&self) -> Vec<u8> {
-        let mut result = Vec::with_capacity(SIZE_U64 * 2 * (self.reserved_memory.len() + 1));
-        for entry in &self.reserved_memory {
-            result.extend(entry.to_blob());
+    // Parse the reserved memory block from a binary blob.
+    fn parse_reserved_memory(mut input: Blob) -> Result<Vec<FdtReserveEntry>> {
+        let mut entries = vec![];
+        let input = &mut input;
+        loop {
+            let entry = FdtReserveEntry::from_blob(input)?;
+            if entry == RESVMEM_TERMINATOR {
+                break;
+            }
+            entries.push(entry);
         }
-        result.extend(RESVMEM_TERMINATOR.to_blob());
-        result
+        Ok(entries)
     }
 
-    // Dump the structure block of the FDT
-    fn dump_struct(&mut self) -> Vec<u8> {
-        let mut blob = vec![];
-        FdtNode::to_blob(&self.root, &mut blob, &mut self.strings);
-        align_data(&mut blob, SIZE_U32);
-        blob.extend(FDT_END.to_be_bytes());
-        blob
+    // Write the reserved memory block to a buffer.
+    fn write_reserved_memory(&self, mut writer: impl io::Write) -> Result<()> {
+        for entry in &self.reserved_memory {
+            entry.write_blob(&mut writer)?;
+        }
+        RESVMEM_TERMINATOR.write_blob(writer)
+    }
+
+    /// Load a flattened device tree from a byte slice.
+    ///
+    /// # Arguments
+    ///
+    /// `input` - byte slice from which to load the FDT.
+    pub fn from_blob(input: Blob) -> Result<Self> {
+        let header = FdtHeader::from_blob(&input[..FdtHeader::SIZE])?;
+        if header.total_size as usize != input.len() {
+            return Err(Error::FdtParseError("input size doesn't match".into()));
+        }
+
+        let reserved_mem_blob = &input[header.off_mem_rsvmap as usize..];
+        let nodes_blob = &input[header.off_dt_struct as usize
+            ..(header.off_dt_struct + header.size_dt_struct) as usize];
+        let strings_blob = &input[header.off_dt_strings as usize
+            ..(header.off_dt_strings + header.size_dt_strings) as usize];
+
+        let reserved_memory = Self::parse_reserved_memory(reserved_mem_blob)?;
+        let strings = FdtStrings::from_blob(strings_blob)?;
+        let root = FdtNode::from_blob(nodes_blob, &strings)?;
+
+        Ok(Self {
+            reserved_memory,
+            root,
+            strings,
+            boot_cpuid_phys: header.boot_cpuid_phys,
+        })
+    }
+
+    // Write the structure block of the FDT
+    fn write_struct(&mut self, mut writer: impl io::Write) -> Result<()> {
+        self.root.write_blob(&mut writer, &mut self.strings)?;
+        writer.write_all(&FDT_END.to_be_bytes())?;
+        Ok(())
     }
 
     /// Finish writing the Devicetree Blob (DTB).
     ///
     /// Returns the DTB as a vector of bytes.
     pub fn finish(&mut self) -> Result<Vec<u8>> {
-        // Dump blocks
-        let resvmem_blob = self.dump_reserved_memory();
-        let node_blob = self.dump_struct();
-        let strings_blob = self.strings.to_blob();
-        let total_size =
-            resvmem_blob.len() + strings_blob.len() + node_blob.len() + FdtHeader::SIZE;
+        let mut result = vec![0u8; FdtHeader::SIZE];
+        align_data(&mut result, SIZE_U64);
 
-        // Write the header
-        let off_mem_rsvmap = FdtHeader::SIZE as u32;
-        let off_dt_struct = off_mem_rsvmap + resvmem_blob.len() as u32;
+        let off_mem_rsvmap = result.len();
+        self.write_reserved_memory(&mut result)?;
+        align_data(&mut result, SIZE_U64);
+
+        let off_dt_struct = result.len();
+        self.write_struct(&mut result)?;
+        align_data(&mut result, SIZE_U32);
+
+        let off_dt_strings = result.len();
+        self.strings.write_blob(&mut result)?;
+        let total_size = u32::try_from(result.len()).map_err(|_| Error::TotalSizeTooLarge)?;
+
         let header = FdtHeader::new(
-            u32::try_from(total_size).map_err(|_| Error::TotalSizeTooLarge)?,
-            off_dt_struct,
-            off_dt_struct + node_blob.len() as u32,
-            off_mem_rsvmap,
+            total_size,
+            off_dt_struct as u32,
+            off_dt_strings as u32,
+            off_mem_rsvmap as u32,
             self.boot_cpuid_phys,
-            strings_blob.len() as u32,
-            node_blob.len() as u32,
+            total_size - off_dt_strings as u32, // strings size
+            off_dt_strings as u32 - off_dt_struct as u32, // struct size
         );
-
-        // Return merged blocks
-        let mut result = header.to_blob();
-        result.reserve_exact(total_size - result.len()); // Allocate capacity for remaining blocks
-        result.extend(resvmem_blob);
-        result.extend(node_blob);
-        result.extend(strings_blob);
+        header.write_blob(&mut result[..FdtHeader::SIZE])?;
         Ok(result)
     }
 
@@ -395,6 +661,209 @@ impl Fdt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FDT_BLOB_HEADER_ONLY: [u8; 0x48] = [
+        0xd0, 0x0d, 0xfe, 0xed, // 0000: magic (0xd00dfeed)
+        0x00, 0x00, 0x00, 0x48, // 0004: totalsize (0x48)
+        0x00, 0x00, 0x00, 0x38, // 0008: off_dt_struct (0x38)
+        0x00, 0x00, 0x00, 0x48, // 000C: off_dt_strings (0x48)
+        0x00, 0x00, 0x00, 0x28, // 0010: off_mem_rsvmap (0x28)
+        0x00, 0x00, 0x00, 0x11, // 0014: version (0x11 = 17)
+        0x00, 0x00, 0x00, 0x10, // 0018: last_comp_version (0x10 = 16)
+        0x00, 0x00, 0x00, 0x00, // 001C: boot_cpuid_phys (0)
+        0x00, 0x00, 0x00, 0x00, // 0020: size_dt_strings (0)
+        0x00, 0x00, 0x00, 0x10, // 0024: size_dt_struct (0x10)
+        0x00, 0x00, 0x00, 0x00, // 0028: rsvmap terminator (address = 0 high)
+        0x00, 0x00, 0x00, 0x00, // 002C: rsvmap terminator (address = 0 low)
+        0x00, 0x00, 0x00, 0x00, // 0030: rsvmap terminator (size = 0 high)
+        0x00, 0x00, 0x00, 0x00, // 0034: rsvmap terminator (size = 0 low)
+        0x00, 0x00, 0x00, 0x01, // 0038: FDT_BEGIN_NODE
+        0x00, 0x00, 0x00, 0x00, // 003C: node name ("") + padding
+        0x00, 0x00, 0x00, 0x02, // 0040: FDT_END_NODE
+        0x00, 0x00, 0x00, 0x09, // 0044: FDT_END
+    ];
+
+    const FDT_BLOB_RSVMAP: [u8; 0x68] = [
+        0xd0, 0x0d, 0xfe, 0xed, // 0000: magic (0xd00dfeed)
+        0x00, 0x00, 0x00, 0x68, // 0004: totalsize (0x68)
+        0x00, 0x00, 0x00, 0x58, // 0008: off_dt_struct (0x58)
+        0x00, 0x00, 0x00, 0x68, // 000C: off_dt_strings (0x68)
+        0x00, 0x00, 0x00, 0x28, // 0010: off_mem_rsvmap (0x28)
+        0x00, 0x00, 0x00, 0x11, // 0014: version (0x11 = 17)
+        0x00, 0x00, 0x00, 0x10, // 0018: last_comp_version (0x10 = 16)
+        0x00, 0x00, 0x00, 0x00, // 001C: boot_cpuid_phys (0)
+        0x00, 0x00, 0x00, 0x00, // 0020: size_dt_strings (0)
+        0x00, 0x00, 0x00, 0x10, // 0024: size_dt_struct (0x10)
+        0x12, 0x34, 0x56, 0x78, // 0028: rsvmap entry 0 address high
+        0xAA, 0xBB, 0xCC, 0xDD, // 002C: rsvmap entry 0 address low
+        0x00, 0x00, 0x00, 0x00, // 0030: rsvmap entry 0 size high
+        0x00, 0x00, 0x12, 0x34, // 0034: rsvmap entry 0 size low
+        0x10, 0x20, 0x30, 0x40, // 0038: rsvmap entry 1 address high
+        0x50, 0x60, 0x70, 0x80, // 003C: rsvmap entry 1 address low
+        0x00, 0x00, 0x00, 0x00, // 0040: rsvmap entry 1 size high
+        0x00, 0x00, 0x56, 0x78, // 0044: rsvmap entry 1 size low
+        0x00, 0x00, 0x00, 0x00, // 0048: rsvmap terminator (address = 0 high)
+        0x00, 0x00, 0x00, 0x00, // 004C: rsvmap terminator (address = 0 low)
+        0x00, 0x00, 0x00, 0x00, // 0050: rsvmap terminator (size = 0 high)
+        0x00, 0x00, 0x00, 0x00, // 0054: rsvmap terminator (size = 0 low)
+        0x00, 0x00, 0x00, 0x01, // 0058: FDT_BEGIN_NODE
+        0x00, 0x00, 0x00, 0x00, // 005C: node name ("") + padding
+        0x00, 0x00, 0x00, 0x02, // 0060: FDT_END_NODE
+        0x00, 0x00, 0x00, 0x09, // 0064: FDT_END
+    ];
+
+    const FDT_BLOB_STRINGS: [u8; 0x26] = [
+        b'n', b'u', b'l', b'l', 0x00, b'u', b'3', b'2', 0x00, b'u', b'6', b'4', 0x00, b's', b't',
+        b'r', 0x00, b's', b't', b'r', b'l', b's', b't', 0x00, b'a', b'r', b'r', b'u', b'3', b'2',
+        0x00, b'a', b'r', b'r', b'u', b'6', b'4', 0x00,
+    ];
+
+    const EXPECTED_STRINGS: [&str; 7] = ["null", "u32", "u64", "str", "strlst", "arru32", "arru64"];
+
+    /*
+    Node structure:
+    /
+    |- nested
+    |- nested2
+       |- nested3
+     */
+    const FDT_BLOB_NESTED_NODES: [u8; 0x80] = [
+        0x00, 0x00, 0x00, 0x01, // FDT_BEGIN_NODE
+        0x00, 0x00, 0x00, 0x00, // node name ("") + padding
+        0x00, 0x00, 0x00, 0x03, // FDT_PROP
+        0x00, 0x00, 0x00, 0x04, // prop len (4)
+        0x00, 0x00, 0x00, 0x00, // prop nameoff (0x00)
+        0x13, 0x57, 0x90, 0x24, // prop u32 value (0x13579024)
+        0x00, 0x00, 0x00, 0x01, // FDT_BEGIN_NODE
+        b'n', b'e', b's', b't', // Node name ("nested")
+        b'e', b'd', 0x00, 0x00, // "ed\0" + pad
+        0x00, 0x00, 0x00, 0x03, // FDT_PROP
+        0x00, 0x00, 0x00, 0x04, // prop len (4)
+        0x00, 0x00, 0x00, 0x05, // prop nameoff (0x05)
+        0x12, 0x12, 0x12, 0x12, // prop u32 value (0x12121212)
+        0x00, 0x00, 0x00, 0x03, // FDT_PROP
+        0x00, 0x00, 0x00, 0x04, // prop len (4)
+        0x00, 0x00, 0x00, 0x18, // prop nameoff (0x18)
+        0x13, 0x57, 0x90, 0x24, // prop u32 value (0x13579024)
+        0x00, 0x00, 0x00, 0x02, // FDT_END_NODE ("nested")
+        0x00, 0x00, 0x00, 0x01, // FDT_BEGIN_NODE
+        b'n', b'e', b's', b't', // Node name ("nested2")
+        b'e', b'd', b'2', 0x00, // "ed2\0"
+        0x00, 0x00, 0x00, 0x03, // FDT_PROP
+        0x00, 0x00, 0x00, 0x04, // prop len (0)
+        0x00, 0x00, 0x00, 0x05, // prop nameoff (0x05)
+        0x12, 0x12, 0x12, 0x12, // prop u32 value (0x12121212)
+        0x00, 0x00, 0x00, 0x01, // FDT_BEGIN_NODE
+        b'n', b'e', b's', b't', // Node name ("nested3")
+        b'e', b'd', b'3', 0x00, // "ed3\0"
+        0x00, 0x00, 0x00, 0x02, // FDT_END_NODE ("nested3")
+        0x00, 0x00, 0x00, 0x02, // FDT_END_NODE ("nested2")
+        0x00, 0x00, 0x00, 0x02, // FDT_END_NODE ("")
+        0x00, 0x00, 0x00, 0x09, // FDT_END
+    ];
+
+    #[test]
+    fn fdt_load_header() {
+        let blob: &[u8] = &FDT_BLOB_HEADER_ONLY;
+        let header = FdtHeader::from_blob(blob).unwrap();
+        assert_eq!(header.magic, FdtHeader::MAGIC);
+        assert_eq!(header.total_size, 0x48);
+        assert_eq!(header.off_dt_struct, 0x38);
+        assert_eq!(header.off_dt_strings, 0x48);
+        assert_eq!(header.off_mem_rsvmap, 0x28);
+        assert_eq!(header.version, 17);
+        assert_eq!(header.last_comp_version, 16);
+        assert_eq!(header.boot_cpuid_phys, 0);
+        assert_eq!(header.size_dt_strings, 0);
+        assert_eq!(header.size_dt_struct, 0x10);
+    }
+
+    #[test]
+    fn fdt_load_resv_map() {
+        let blob: &[u8] = &FDT_BLOB_RSVMAP;
+        let fdt = Fdt::from_blob(blob).unwrap();
+        assert_eq!(fdt.reserved_memory.len(), 2);
+        assert!(
+            fdt.reserved_memory[0].address == 0x12345678AABBCCDD
+                && fdt.reserved_memory[0].size == 0x1234
+        );
+        assert!(
+            fdt.reserved_memory[1].address == 0x1020304050607080
+                && fdt.reserved_memory[1].size == 0x5678
+        );
+    }
+
+    #[test]
+    fn fdt_simple_use() {
+        let mut fdt = Fdt::new(&[]);
+        let root_node = fdt.root_mut();
+        root_node
+            .set_prop("compatible", "linux,dummy-virt")
+            .unwrap();
+        root_node.set_prop("#address-cells", 0x2u32).unwrap();
+        root_node.set_prop("#size-cells", 0x2u32).unwrap();
+        let chosen_node = root_node.subnode_mut("chosen").unwrap();
+        chosen_node.set_prop("linux,pci-probe-only", 1u32).unwrap();
+        chosen_node
+            .set_prop("bootargs", "panic=-1 console=hvc0 root=/dev/vda")
+            .unwrap();
+        fdt.finish().unwrap();
+    }
+
+    #[test]
+    fn fdt_load_strings() {
+        let blob = &FDT_BLOB_STRINGS[..];
+        let strings = FdtStrings::from_blob(blob).unwrap();
+        let mut offset = 0u32;
+
+        for s in EXPECTED_STRINGS {
+            assert_eq!(strings.at_offset(offset).unwrap(), s);
+            offset += strings.at_offset(offset).unwrap().len() as u32 + 1;
+        }
+    }
+
+    #[test]
+    fn fdt_load_strings_intern() {
+        let strings_blob = &FDT_BLOB_STRINGS[..];
+        let mut strings = FdtStrings::from_blob(strings_blob).unwrap();
+        assert_eq!(strings.intern_string("null"), 0);
+        assert_eq!(strings.intern_string("strlst"), 17);
+        assert_eq!(strings.intern_string("arru64"), 31);
+        assert_eq!(strings.intern_string("abc"), 38);
+        assert_eq!(strings.intern_string("def"), 42);
+        assert_eq!(strings.intern_string("strlst"), 17);
+    }
+
+    #[test]
+    fn fdt_load_nodes_nested() {
+        let strings_blob = &FDT_BLOB_STRINGS[..];
+        let strings = FdtStrings::from_blob(strings_blob).unwrap();
+        let blob: &[u8] = &FDT_BLOB_NESTED_NODES[..];
+        let root_node = FdtNode::from_blob(blob, &strings).unwrap();
+
+        // Check root node
+        assert_eq!(root_node.name, "");
+        assert_eq!(root_node.subnodes.len(), 2);
+        assert_eq!(root_node.props.len(), 1);
+
+        // Check first nested node
+        let nested_node = root_node.subnodes.get("nested").unwrap();
+        assert_eq!(nested_node.name, "nested");
+        assert_eq!(nested_node.subnodes.len(), 0);
+        assert_eq!(nested_node.props.len(), 2);
+
+        // Check second nested node
+        let nested2_node = root_node.subnodes.get("nested2").unwrap();
+        assert_eq!(nested2_node.name, "nested2");
+        assert_eq!(nested2_node.subnodes.len(), 1);
+        assert_eq!(nested2_node.props.len(), 1);
+
+        // Check third nested node
+        let nested3_node = nested2_node.subnodes.get("nested3").unwrap();
+        assert_eq!(nested3_node.name, "nested3");
+        assert_eq!(nested3_node.subnodes.len(), 0);
+        assert_eq!(nested3_node.props.len(), 0);
+    }
 
     #[test]
     fn minimal() {
@@ -615,6 +1084,59 @@ mod tests {
                 b'u', b'6', b'4', 0x00, // 00EA: strings + 0x22: "u64"
             ]
         );
+    }
+
+    #[test]
+    fn prop_order() {
+        let expected_bytes: &[u8] = &[
+            0xd0, 0x0d, 0xfe, 0xed, // 0000: magic (0xd00dfeed)
+            0x00, 0x00, 0x00, 0x84, // 0004: totalsize (0x84)
+            0x00, 0x00, 0x00, 0x38, // 0008: off_dt_struct (0x38)
+            0x00, 0x00, 0x00, 0x78, // 000C: off_dt_strings (0x78)
+            0x00, 0x00, 0x00, 0x28, // 0010: off_mem_rsvmap (0x28)
+            0x00, 0x00, 0x00, 0x11, // 0014: version (0x11 = 17)
+            0x00, 0x00, 0x00, 0x10, // 0018: last_comp_version (0x10 = 16)
+            0x00, 0x00, 0x00, 0x00, // 001C: boot_cpuid_phys (0)
+            0x00, 0x00, 0x00, 0x0C, // 0020: size_dt_strings (0x0C)
+            0x00, 0x00, 0x00, 0x40, // 0024: size_dt_struct (0x40)
+            0x00, 0x00, 0x00, 0x00, // 0028: rsvmap terminator (address = 0 high)
+            0x00, 0x00, 0x00, 0x00, // 002C: rsvmap terminator (address = 0 low)
+            0x00, 0x00, 0x00, 0x00, // 0030: rsvmap terminator (size = 0 high)
+            0x00, 0x00, 0x00, 0x00, // 0034: rsvmap terminator (size = 0 low)
+            0x00, 0x00, 0x00, 0x01, // 0038: FDT_BEGIN_NODE
+            0x00, 0x00, 0x00, 0x00, // 003C: node name ("") + padding
+            0x00, 0x00, 0x00, 0x03, // 0040: FDT_PROP (u32)
+            0x00, 0x00, 0x00, 0x04, // 0044: prop len (4)
+            0x00, 0x00, 0x00, 0x00, // 0048: prop nameoff (0x00)
+            0x00, 0x00, 0x00, 0x01, // 004C: prop u32 value (0x1)
+            0x00, 0x00, 0x00, 0x03, // 0050: FDT_PROP (u32)
+            0x00, 0x00, 0x00, 0x04, // 0054: prop len (4)
+            0x00, 0x00, 0x00, 0x04, // 0058: prop nameoff (0x04)
+            0x00, 0x00, 0x00, 0x02, // 005C: prop u32 high (0x2)
+            0x00, 0x00, 0x00, 0x03, // 0060: FDT_PROP (u32)
+            0x00, 0x00, 0x00, 0x04, // 0064: prop len (4)
+            0x00, 0x00, 0x00, 0x08, // 0068: prop nameoff (0x22)
+            0x76, 0x61, 0x6c, 0x00, // 006C: prop string value ("val")
+            0x00, 0x00, 0x00, 0x02, // 0070: FDT_END_NODE
+            0x00, 0x00, 0x00, 0x09, // 0074: FDT_END
+            b'a', b'b', b'c', 0x00, // 0078: strings + 0x00: "abc"
+            b'd', b'e', b'f', 0x00, // 007C: strings + 0x04: "def"
+            b'g', b'h', b'i', 0x00, // 0080: strings + 0x08: "ghi"
+        ];
+
+        let mut fdt = Fdt::new(&[]);
+        let root_node = fdt.root_mut();
+        root_node.set_prop("abc", 1u32).unwrap();
+        root_node.set_prop("def", 2u32).unwrap();
+        root_node.set_prop("ghi", "val").unwrap();
+        assert_eq!(fdt.finish().unwrap(), expected_bytes);
+
+        let mut fdt = Fdt::new(&[]);
+        let root_node = fdt.root_mut();
+        root_node.set_prop("ghi", "val").unwrap();
+        root_node.set_prop("def", 2u32).unwrap();
+        root_node.set_prop("abc", 1u32).unwrap();
+        assert_eq!(fdt.finish().unwrap(), expected_bytes);
     }
 
     #[test]
