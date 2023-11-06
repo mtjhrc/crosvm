@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use crate::sys::unix::RawDescriptor;
+
 pub use crate::descriptor_reflection::deserialize_with_descriptors;
 pub use crate::descriptor_reflection::FileSerdeWrapper;
 pub use crate::descriptor_reflection::SerializeDescriptors;
@@ -73,10 +75,6 @@ pub mod platform_timer_resolution {
     pub fn enable_high_res_timers() -> crate::Result<Box<dyn crate::EnabledHighResTimer>> {
         todo!();
     }
-}
-
-pub fn round_up_to_page_size(_v: usize) -> usize {
-    todo!();
 }
 
 #[allow(non_camel_case_types)]
@@ -155,11 +153,7 @@ pub enum MmapError {
     RemoveMappingIsUnsupported,
 }
 
-pub type RawDescriptor = std::os::unix::io::RawFd;
-
 pub struct StreamChannel {}
-
-pub const INVALID_DESCRIPTOR: RawDescriptor = -1;
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlatformEvent {}
@@ -346,36 +340,6 @@ impl PartialEq for crate::SafeDescriptor {
     }
 }
 
-impl crate::SafeDescriptor {
-    pub fn try_clone(&self) -> crate::errno::Result<crate::SafeDescriptor> {
-        todo!();
-    }
-}
-
-impl crate::IntoRawDescriptor for std::fs::File {
-    fn into_raw_descriptor(self) -> RawDescriptor {
-        todo!();
-    }
-}
-
-impl crate::AsRawDescriptor for std::fs::File {
-    fn as_raw_descriptor(&self) -> RawDescriptor {
-        todo!();
-    }
-}
-
-impl crate::FromRawDescriptor for std::fs::File {
-    unsafe fn from_raw_descriptor(_descriptor: RawDescriptor) -> Self {
-        todo!();
-    }
-}
-
-impl crate::AsRawDescriptor for std::io::Stderr {
-    fn as_raw_descriptor(&self) -> RawDescriptor {
-        todo!();
-    }
-}
-
 impl crate::shm::PlatformSharedMemory for crate::SharedMemory {
     fn new(_debug_name: &std::ffi::CStr, _size: u64) -> crate::Result<crate::SharedMemory> {
         todo!();
@@ -384,6 +348,86 @@ impl crate::shm::PlatformSharedMemory for crate::SharedMemory {
         _descriptor: crate::SafeDescriptor,
         _size: u64,
     ) -> crate::Result<crate::SharedMemory> {
+        todo!();
+    }
+}
+
+impl crate::FileReadWriteVolatile for std::fs::File {
+    fn read_volatile(&mut self, _slice: data_model::VolatileSlice) -> std::io::Result<usize> {
+        todo!();
+    }
+    fn read_vectored_volatile(
+        &mut self,
+        _bufs: &[data_model::VolatileSlice],
+    ) -> std::io::Result<usize> {
+        todo!();
+    }
+    fn write_volatile(&mut self, _slice: data_model::VolatileSlice) -> std::io::Result<usize> {
+        todo!();
+    }
+    fn write_vectored_volatile(
+        &mut self,
+        _bufs: &[data_model::VolatileSlice],
+    ) -> std::io::Result<usize> {
+        todo!();
+    }
+}
+
+impl crate::FileReadWriteAtVolatile for std::fs::File {
+    fn read_at_volatile(
+        &mut self,
+        _slice: data_model::VolatileSlice,
+        _offset: u64,
+    ) -> std::io::Result<usize> {
+        todo!();
+    }
+    fn read_vectored_at_volatile(
+        &mut self,
+        _bufs: &[data_model::VolatileSlice],
+        _offset: u64,
+    ) -> std::io::Result<usize> {
+        todo!();
+    }
+    fn write_at_volatile(
+        &mut self,
+        _slice: data_model::VolatileSlice,
+        _offset: u64,
+    ) -> std::io::Result<usize> {
+        todo!();
+    }
+    fn write_vectored_at_volatile(
+        &mut self,
+        _bufs: &[data_model::VolatileSlice],
+        _offset: u64,
+    ) -> std::io::Result<usize> {
+        todo!();
+    }
+}
+
+impl crate::Timer {
+    pub fn new() -> crate::errno::Result<crate::Timer> {
+        todo!();
+    }
+}
+
+impl crate::TimerTrait for crate::Timer {
+    fn reset(
+        &mut self,
+        _dur: std::time::Duration,
+        mut _interval: Option<std::time::Duration>,
+    ) -> crate::errno::Result<()> {
+        todo!();
+    }
+    fn wait(&mut self) -> crate::errno::Result<()> {
+        todo!();
+    }
+    fn mark_waited(&mut self) -> crate::errno::Result<bool> {
+        todo!();
+    }
+    fn clear(&mut self) -> crate::errno::Result<()> {
+        todo!();
+    }
+    fn resolution(&self) -> crate::errno::Result<std::time::Duration> {
         todo!();
     }
 }
