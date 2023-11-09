@@ -36,7 +36,6 @@ mod poll;
 mod priority;
 pub mod process;
 mod sched;
-pub mod scoped_signal_handler;
 mod shm;
 pub mod signal;
 mod signalfd;
@@ -100,7 +99,6 @@ pub use netlink::*;
 pub use poll::EventContext;
 pub use priority::*;
 pub use sched::*;
-pub use scoped_signal_handler::*;
 pub use shm::MemfdSeals;
 pub use shm::SharedMemoryLinux;
 pub use signal::*;
@@ -157,18 +155,6 @@ pub fn getppid() -> Pid {
 pub fn gettid() -> Pid {
     // Calling the gettid() sycall is always safe.
     unsafe { syscall(SYS_gettid as c_long) as Pid }
-}
-
-/// Safe wrapper for `getsid(2)`.
-pub fn getsid(pid: Option<Pid>) -> Result<Pid> {
-    // Calling the getsid() sycall is always safe.
-    syscall!(unsafe { libc::getsid(pid.unwrap_or(0)) } as Pid)
-}
-
-/// Wrapper for `setsid(2)`.
-pub fn setsid() -> Result<Pid> {
-    // Safe because the return code is checked.
-    syscall!(unsafe { libc::setsid() as Pid })
 }
 
 /// Safe wrapper for `geteuid(2)`.
