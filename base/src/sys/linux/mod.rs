@@ -15,8 +15,6 @@ mod linux;
 use linux as target_os;
 use log::warn;
 #[macro_use]
-pub mod handle_eintr;
-#[macro_use]
 pub mod ioctl;
 #[macro_use]
 pub mod syslog;
@@ -76,6 +74,7 @@ pub(crate) use event::PlatformEvent;
 pub use file::find_next_data;
 pub use file::FileDataIterator;
 pub use file_flags::*;
+pub(crate) use file_traits::lib::*;
 pub use get_filesystem_type::*;
 pub use ioctl::*;
 use libc::c_int;
@@ -119,11 +118,6 @@ pub(crate) use write_zeroes::file_write_zeroes_at;
 
 use crate::descriptor::FromRawDescriptor;
 use crate::descriptor::SafeDescriptor;
-pub use crate::descriptor_reflection::deserialize_with_descriptors;
-pub use crate::descriptor_reflection::with_as_descriptor;
-pub use crate::descriptor_reflection::with_raw_descriptor;
-pub use crate::descriptor_reflection::FileSerdeWrapper;
-pub use crate::descriptor_reflection::SerializeDescriptors;
 pub use crate::errno::Error;
 pub use crate::errno::Result;
 pub use crate::errno::*;

@@ -4,10 +4,6 @@
 
 use crate::sys::unix::RawDescriptor;
 
-pub use crate::descriptor_reflection::deserialize_with_descriptors;
-pub use crate::descriptor_reflection::FileSerdeWrapper;
-pub use crate::descriptor_reflection::SerializeDescriptors;
-
 pub mod tube {
     #[derive(serde::Serialize, serde::Deserialize)]
     pub struct Tube {}
@@ -87,9 +83,6 @@ pub fn sched_setattr(_pid: Pid, _attr: &mut sched_attr, _flags: u32) -> crate::e
 pub fn set_cpu_affinity<I: IntoIterator<Item = usize>>(_cpus: I) -> crate::errno::Result<()> {
     todo!();
 }
-
-pub use crate::descriptor_reflection::with_as_descriptor;
-pub use crate::descriptor_reflection::with_raw_descriptor;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum BlockingMode {
@@ -352,58 +345,6 @@ impl crate::shm::PlatformSharedMemory for crate::SharedMemory {
     }
 }
 
-impl crate::FileReadWriteVolatile for std::fs::File {
-    fn read_volatile(&mut self, _slice: data_model::VolatileSlice) -> std::io::Result<usize> {
-        todo!();
-    }
-    fn read_vectored_volatile(
-        &mut self,
-        _bufs: &[data_model::VolatileSlice],
-    ) -> std::io::Result<usize> {
-        todo!();
-    }
-    fn write_volatile(&mut self, _slice: data_model::VolatileSlice) -> std::io::Result<usize> {
-        todo!();
-    }
-    fn write_vectored_volatile(
-        &mut self,
-        _bufs: &[data_model::VolatileSlice],
-    ) -> std::io::Result<usize> {
-        todo!();
-    }
-}
-
-impl crate::FileReadWriteAtVolatile for std::fs::File {
-    fn read_at_volatile(
-        &mut self,
-        _slice: data_model::VolatileSlice,
-        _offset: u64,
-    ) -> std::io::Result<usize> {
-        todo!();
-    }
-    fn read_vectored_at_volatile(
-        &mut self,
-        _bufs: &[data_model::VolatileSlice],
-        _offset: u64,
-    ) -> std::io::Result<usize> {
-        todo!();
-    }
-    fn write_at_volatile(
-        &mut self,
-        _slice: data_model::VolatileSlice,
-        _offset: u64,
-    ) -> std::io::Result<usize> {
-        todo!();
-    }
-    fn write_vectored_at_volatile(
-        &mut self,
-        _bufs: &[data_model::VolatileSlice],
-        _offset: u64,
-    ) -> std::io::Result<usize> {
-        todo!();
-    }
-}
-
 impl crate::Timer {
     pub fn new() -> crate::errno::Result<crate::Timer> {
         todo!();
@@ -431,3 +372,9 @@ impl crate::TimerTrait for crate::Timer {
         todo!();
     }
 }
+
+pub(crate) use libc::off_t;
+pub(crate) use libc::pread;
+pub(crate) use libc::preadv;
+pub(crate) use libc::pwrite;
+pub(crate) use libc::pwritev;

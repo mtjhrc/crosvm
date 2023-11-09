@@ -3,5 +3,8 @@
 // found in the LICENSE file.
 
 pub mod descriptor;
+pub mod file_traits;
+#[macro_use]
+pub mod handle_eintr;
 
 pub use descriptor::*;
