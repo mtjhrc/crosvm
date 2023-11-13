@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 use crate::sys::unix::RawDescriptor;
+use crate::MmapError;
 
 pub mod tube {
     #[derive(serde::Serialize, serde::Deserialize)]
@@ -138,13 +139,6 @@ pub enum FramingMode {
 }
 
 pub struct MemoryMappingArena {}
-
-pub enum MmapError {
-    AddFdMappingIsUnsupported,
-    InvalidAddress,
-    InvalidArgument,
-    RemoveMappingIsUnsupported,
-}
 
 pub struct StreamChannel {}
 
@@ -292,9 +286,6 @@ pub mod ioctl {
         todo!();
     }
 }
-
-pub(crate) use libc::PROT_READ;
-pub(crate) use libc::PROT_WRITE;
 
 pub fn file_punch_hole(_file: &std::fs::File, _offset: u64, _length: u64) -> std::io::Result<()> {
     todo!();

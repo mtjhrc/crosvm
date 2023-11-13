@@ -135,6 +135,14 @@ pub struct CpuOptions {
     pub core_types: Option<CpuCoreType>,
 }
 
+/// Device tree overlay configuration.
+#[derive(Debug, Default, Serialize, Deserialize, FromKeyValues)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct DtboOption {
+    /// Overlay file to apply to the base device tree.
+    pub path: PathBuf,
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, FromKeyValues, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct MemOptions {
@@ -196,122 +204,6 @@ pub fn parse_vhost_user_fs_option(param: &str) -> Result<VhostUserFsOption, Stri
         })
     } else {
         from_key_values::<VhostUserFsOption>(param)
-    }
-}
-
-/// A bind mount for directories in the plugin process.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BindMount {
-    pub src: PathBuf,
-    pub dst: PathBuf,
-    pub writable: bool,
-}
-
-impl FromStr for BindMount {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let components: Vec<&str> = value.split(':').collect();
-        if components.is_empty() || components.len() > 3 || components[0].is_empty() {
-            return Err(invalid_value_err(
-                value,
-                "`plugin-mount` should be in a form of: <src>[:[<dst>][:<writable>]]",
-            ));
-        }
-
-        let src = PathBuf::from(components[0]);
-        if src.is_relative() {
-            return Err(invalid_value_err(
-                components[0],
-                "the source path for `plugin-mount` must be absolute",
-            ));
-        }
-        if !src.exists() {
-            return Err(invalid_value_err(
-                components[0],
-                "the source path for `plugin-mount` does not exist",
-            ));
-        }
-
-        let dst = PathBuf::from(match components.get(1) {
-            None | Some(&"") => components[0],
-            Some(path) => path,
-        });
-        if dst.is_relative() {
-            return Err(invalid_value_err(
-                components[1],
-                "the destination path for `plugin-mount` must be absolute",
-            ));
-        }
-
-        let writable: bool = match components.get(2) {
-            None => false,
-            Some(s) => s.parse().map_err(|_| {
-                invalid_value_err(
-                    components[2],
-                    "the <writable> component for `plugin-mount` is not valid bool",
-                )
-            })?,
-        };
-
-        Ok(BindMount { src, dst, writable })
-    }
-}
-
-/// A mapping of linux group IDs for the plugin process.
-#[cfg(feature = "plugin")]
-#[derive(Debug, Deserialize, Serialize)]
-pub struct GidMap {
-    pub inner: base::platform::Gid,
-    pub outer: base::platform::Gid,
-    pub count: u32,
-}
-
-#[cfg(feature = "plugin")]
-impl FromStr for GidMap {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let components: Vec<&str> = value.split(':').collect();
-        if components.is_empty() || components.len() > 3 || components[0].is_empty() {
-            return Err(invalid_value_err(
-                value,
-                "`plugin-gid-map` must have exactly 3 components: <inner>[:[<outer>][:<count>]]",
-            ));
-        }
-
-        let inner: base::platform::Gid = components[0].parse().map_err(|_| {
-            invalid_value_err(
-                components[0],
-                "the <inner> component for `plugin-gid-map` is not valid gid",
-            )
-        })?;
-
-        let outer: base::platform::Gid = match components.get(1) {
-            None | Some(&"") => inner,
-            Some(s) => s.parse().map_err(|_| {
-                invalid_value_err(
-                    components[1],
-                    "the <outer> component for `plugin-gid-map` is not valid gid",
-                )
-            })?,
-        };
-
-        let count: u32 = match components.get(2) {
-            None => 1,
-            Some(s) => s.parse().map_err(|_| {
-                invalid_value_err(
-                    components[2],
-                    "the <count> component for `plugin-gid-map` is not valid number",
-                )
-            })?,
-        };
-
-        Ok(GidMap {
-            inner,
-            outer,
-            count,
-        })
     }
 }
 
@@ -481,54 +373,6 @@ pub fn parse_serial_options(s: &str) -> Result<SerialParameters, String> {
     validate_serial_parameters(&params)?;
 
     Ok(params)
-}
-
-#[cfg(feature = "plugin")]
-pub fn parse_plugin_mount_option(value: &str) -> Result<BindMount, String> {
-    let components: Vec<&str> = value.split(':').collect();
-    if components.is_empty() || components.len() > 3 || components[0].is_empty() {
-        return Err(invalid_value_err(
-            value,
-            "`plugin-mount` should be in a form of: <src>[:[<dst>][:<writable>]]",
-        ));
-    }
-
-    let src = PathBuf::from(components[0]);
-    if src.is_relative() {
-        return Err(invalid_value_err(
-            components[0],
-            "the source path for `plugin-mount` must be absolute",
-        ));
-    }
-    if !src.exists() {
-        return Err(invalid_value_err(
-            components[0],
-            "the source path for `plugin-mount` does not exist",
-        ));
-    }
-
-    let dst = PathBuf::from(match components.get(1) {
-        None | Some(&"") => components[0],
-        Some(path) => path,
-    });
-    if dst.is_relative() {
-        return Err(invalid_value_err(
-            components[1],
-            "the destination path for `plugin-mount` must be absolute",
-        ));
-    }
-
-    let writable: bool = match components.get(2) {
-        None => false,
-        Some(s) => s.parse().map_err(|_| {
-            invalid_value_err(
-                components[2],
-                "the <writable> component for `plugin-mount` is not valid bool",
-            )
-        })?,
-    };
-
-    Ok(BindMount { src, dst, writable })
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -778,6 +622,7 @@ pub struct Config {
     #[cfg(feature = "crash-report")]
     pub crash_report_uuid: Option<String>,
     pub delay_rt: bool,
+    pub device_tree_overlay: Vec<DtboOption>,
     pub disable_virtio_intx: bool,
     pub disks: Vec<DiskOption>,
     pub display_window_keyboard: bool,
@@ -849,8 +694,9 @@ pub struct Config {
     pub per_vm_core_scheduling: bool,
     pub pflash_parameters: Option<PflashParameters>,
     #[cfg(feature = "plugin")]
-    pub plugin_gid_maps: Vec<GidMap>,
-    pub plugin_mounts: Vec<BindMount>,
+    pub plugin_gid_maps: Vec<crate::crosvm::plugin::GidMap>,
+    #[cfg(feature = "plugin")]
+    pub plugin_mounts: Vec<crate::crosvm::plugin::BindMount>,
     pub plugin_root: Option<PathBuf>,
     pub pmem_devices: Vec<DiskOption>,
     #[cfg(feature = "process-invariants")]
@@ -984,6 +830,7 @@ impl Default for Config {
             cpu_capacity: BTreeMap::new(),
             cpu_clusters: Vec::new(),
             delay_rt: false,
+            device_tree_overlay: Vec::new(),
             disks: Vec::new(),
             disable_virtio_intx: false,
             display_window_keyboard: false,
@@ -1064,6 +911,7 @@ impl Default for Config {
             pflash_parameters: None,
             #[cfg(feature = "plugin")]
             plugin_gid_maps: Vec::new(),
+            #[cfg(feature = "plugin")]
             plugin_mounts: Vec::new(),
             plugin_root: None,
             pmem_devices: Vec::new(),
@@ -1620,70 +1468,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_plugin_mount_invalid() {
-        "".parse::<BindMount>().expect_err("parse should fail");
-        "/dev/null:/dev/null:true:false"
-            .parse::<BindMount>()
-            .expect_err("parse should fail because too many arguments");
-
-        "null:/dev/null:true"
-            .parse::<BindMount>()
-            .expect_err("parse should fail because source is not absolute");
-        "/dev/null:null:true"
-            .parse::<BindMount>()
-            .expect_err("parse should fail because source is not absolute");
-        "/dev/null:null:blah"
-            .parse::<BindMount>()
-            .expect_err("parse should fail because flag is not boolean");
-    }
-
-    #[cfg(feature = "plugin")]
-    #[test]
-    fn parse_plugin_gid_map_valid() {
-        let opt: GidMap = "1:2:3".parse().expect("parse should succeed");
-        assert_eq!(opt.inner, 1);
-        assert_eq!(opt.outer, 2);
-        assert_eq!(opt.count, 3);
-    }
-
-    #[cfg(feature = "plugin")]
-    #[test]
-    fn parse_plugin_gid_map_valid_shorthand() {
-        let opt: GidMap = "1".parse().expect("parse should succeed");
-        assert_eq!(opt.inner, 1);
-        assert_eq!(opt.outer, 1);
-        assert_eq!(opt.count, 1);
-
-        let opt: GidMap = "1:2".parse().expect("parse should succeed");
-        assert_eq!(opt.inner, 1);
-        assert_eq!(opt.outer, 2);
-        assert_eq!(opt.count, 1);
-
-        let opt: GidMap = "1::3".parse().expect("parse should succeed");
-        assert_eq!(opt.inner, 1);
-        assert_eq!(opt.outer, 1);
-        assert_eq!(opt.count, 3);
-    }
-
-    #[cfg(feature = "plugin")]
-    #[test]
-    fn parse_plugin_gid_map_invalid() {
-        "".parse::<GidMap>().expect_err("parse should fail");
-        "1:2:3:4"
-            .parse::<GidMap>()
-            .expect_err("parse should fail because too many arguments");
-        "blah:2:3"
-            .parse::<GidMap>()
-            .expect_err("parse should fail because inner is not a number");
-        "1:blah:3"
-            .parse::<GidMap>()
-            .expect_err("parse should fail because outer is not a number");
-        "1:2:blah"
-            .parse::<GidMap>()
-            .expect_err("parse should fail because count is not a number");
-    }
-
-    #[test]
     fn parse_battery_valid() {
         let bat_config: BatteryConfig = from_key_values("type=goldfish").unwrap();
         assert_eq!(bat_config.type_, BatteryType::Goldfish);
@@ -1817,15 +1601,17 @@ mod tests {
 
     #[test]
     fn parse_file_backed_mapping_align() {
-        let mut params = from_key_values::<FileBackedMappingParameters>(
-            "addr=0x3042,size=0xff0,path=/dev/mem,align",
-        )
+        let addr = pagesize() as u64 * 3 + 42;
+        let size = pagesize() as u64 - 0xf;
+        let mut params = from_key_values::<FileBackedMappingParameters>(&format!(
+            "addr={addr},size={size},path=/dev/mem,align",
+        ))
         .unwrap();
-        assert_eq!(params.address, 0x3042);
-        assert_eq!(params.size, 0xff0);
+        assert_eq!(params.address, addr);
+        assert_eq!(params.size, size);
         validate_file_backed_mapping(&mut params).unwrap();
-        assert_eq!(params.address, 0x3000);
-        assert_eq!(params.size, 0x2000);
+        assert_eq!(params.address, pagesize() as u64 * 3);
+        assert_eq!(params.size, pagesize() as u64 * 2);
     }
 
     #[test]
@@ -1860,6 +1646,32 @@ mod tests {
         assert_eq!(cfg.fw_cfg_parameters[0].name, "bar".to_string());
         assert_eq!(cfg.fw_cfg_parameters[0].string, Some("foo".to_string()));
         assert_eq!(cfg.fw_cfg_parameters[0].path, None);
+    }
+
+    #[test]
+    fn parse_dtbo() {
+        let cfg: Config = crate::crosvm::cmdline::RunCommand::from_args(
+            &[],
+            &[
+                "--device-tree-overlay",
+                "/path/to/dtbo1",
+                "--device-tree-overlay",
+                "/path/to/dtbo2",
+                "/dev/null",
+            ],
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+        assert_eq!(cfg.device_tree_overlay.len(), 2);
+        for (opt, p) in cfg
+            .device_tree_overlay
+            .into_iter()
+            .zip(["/path/to/dtbo1", "/path/to/dtbo2"])
+        {
+            assert_eq!(opt.path, PathBuf::from(p));
+        }
     }
 
     #[test]
