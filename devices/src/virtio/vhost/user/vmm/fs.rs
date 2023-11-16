@@ -4,7 +4,6 @@
 
 use data_model::Le32;
 use virtio_sys::virtio_fs::virtio_fs_config;
-use vmm_vhost::message::VhostUserProtocolFeatures;
 use zerocopy::AsBytes;
 
 use crate::virtio::device_constants::fs::FS_MAX_TAG_LEN;
@@ -28,33 +27,21 @@ impl VhostUserVirtioDevice {
             });
         }
 
-        // The spec requires a minimum of 2 queues: one worker queue and one high priority queue
-        let default_queues = 2;
-
         let mut cfg_tag = [0u8; FS_MAX_TAG_LEN];
         cfg_tag[..tag.len()].copy_from_slice(tag.as_bytes());
 
         let cfg = virtio_fs_config {
             tag: cfg_tag,
-            // Only count the worker queues, exclude the high prio queue
-            num_request_queues: Le32::from(default_queues as u32 - 1),
+            // Only count the request queue, exclude the high prio queue
+            num_request_queues: Le32::from(1),
         };
-
-        let allow_features = 0;
-
-        let allow_protocol_features =
-            VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::CONFIG;
 
         VhostUserVirtioDevice::new(
             connection,
             DeviceType::Fs,
-            default_queues,
             max_queue_size,
-            allow_features,
-            allow_protocol_features,
             base_features,
             Some(cfg.as_bytes()),
-            false,
         )
     }
 }

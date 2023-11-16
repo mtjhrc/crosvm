@@ -13,6 +13,8 @@ use std::os::raw::c_ulong;
 use std::os::unix::prelude::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(all(target_os = "android", target_arch = "aarch64"))]
+use std::ptr::addr_of_mut;
 use std::slice;
 use std::sync::Arc;
 use std::u32;
@@ -36,6 +38,8 @@ use data_model::vec_with_array_field;
 use hypervisor::DeviceKind;
 use hypervisor::Vm;
 use once_cell::sync::OnceCell;
+use rand::seq::index::sample;
+use rand::thread_rng;
 use remain::sorted;
 use resources::address_allocator::AddressAllocator;
 use resources::AddressRange;
@@ -168,14 +172,14 @@ impl KvmVfioPviommu {
         }
     }
 
-    pub fn attach<T: AsRawDescriptor>(&self, device: &T) -> Result<()> {
+    pub fn attach<T: AsRawDescriptor>(&self, device: &T, sid_idx: u32, vsid: u32) -> Result<()> {
         cfg_if! {
             if #[cfg(all(target_os = "android", target_arch = "aarch64"))] {
-                let sid_idx = 0;
-                let vsid = 0;
                 self.ioctl_kvm_pviommu_set_config(device, sid_idx, vsid)
             } else {
                 let _ = device;
+                let _ = sid_idx;
+                let _ = vsid;
                 unimplemented!()
             }
         }
@@ -185,6 +189,20 @@ impl KvmVfioPviommu {
         let fd = self.as_raw_descriptor();
         // Guests identify pvIOMMUs to the hypervisor using the corresponding VMM FDs.
         fd.try_into().unwrap()
+    }
+
+    pub fn get_sid_count<T: AsRawDescriptor>(vm: &impl Vm, device: &T) -> Result<u32> {
+        cfg_if! {
+            if #[cfg(all(target_os = "android", target_arch = "aarch64"))] {
+                let info = Self::ioctl_kvm_dev_vfio_pviommu_get_info(vm, device)?;
+
+                Ok(info.nr_sids)
+            } else {
+                let _ = vm;
+                let _ = device;
+                unimplemented!()
+            }
+        }
     }
 
     #[cfg(all(target_os = "android", target_arch = "aarch64"))]
@@ -238,6 +256,43 @@ impl KvmVfioPviommu {
             Err(VfioError::KvmPviommuSetConfig(get_error()))
         } else {
             Ok(())
+        }
+    }
+
+    #[cfg(all(target_os = "android", target_arch = "aarch64"))]
+    fn ioctl_kvm_dev_vfio_pviommu_get_info<T: AsRawDescriptor>(
+        vm: &impl Vm,
+        device: &T,
+    ) -> Result<kvm_sys::kvm_vfio_iommu_info> {
+        let kvm_vfio_file = KVM_VFIO_FILE
+            .get_or_try_init(|| vm.create_device(DeviceKind::Vfio))
+            .map_err(VfioError::CreateVfioKvmDevice)?;
+
+        let mut info = kvm_sys::kvm_vfio_iommu_info {
+            device_fd: device.as_raw_descriptor(),
+            nr_sids: 0,
+        };
+
+        let vfio_dev_attr = kvm_sys::kvm_device_attr {
+            flags: 0,
+            group: kvm_sys::KVM_DEV_VFIO_PVIOMMU,
+            attr: kvm_sys::KVM_DEV_VFIO_PVIOMMU_GET_INFO as u64,
+            addr: addr_of_mut!(info) as usize as u64,
+        };
+
+        // Safe as we are the owner of vfio_dev_attr, which is valid.
+        let ret = unsafe {
+            ioctl_with_ref(
+                kvm_vfio_file,
+                kvm_sys::KVM_SET_DEVICE_ATTR(),
+                &vfio_dev_attr,
+            )
+        };
+
+        if ret < 0 {
+            Err(VfioError::KvmSetDeviceAttr(get_error()))
+        } else {
+            Ok(info)
         }
     }
 }
@@ -953,7 +1008,7 @@ pub struct VfioDevice {
 
     iova_alloc: Arc<Mutex<AddressAllocator>>,
     dt_symbol: Option<String>,
-    pviommu: Option<Arc<Mutex<KvmVfioPviommu>>>,
+    pviommu: Option<(Arc<Mutex<KvmVfioPviommu>>, Vec<u32>)>,
 }
 
 impl VfioDevice {
@@ -992,9 +1047,15 @@ impl VfioDevice {
             // We currently have a 1-to-1 mapping between pvIOMMUs and VFIO devices.
             let pviommu = KvmVfioPviommu::new(vm)?;
 
-            pviommu.attach(&dev)?;
+            let vsids_len = KvmVfioPviommu::get_sid_count(vm, &dev)?.try_into().unwrap();
+            let max_vsid = u32::MAX.try_into().unwrap();
+            let random_vsids = sample(&mut thread_rng(), max_vsid, vsids_len).into_iter();
+            let vsids = Vec::from_iter(random_vsids.map(|v| u32::try_from(v).unwrap()));
+            for (i, vsid) in vsids.iter().enumerate() {
+                pviommu.attach(&dev, i.try_into().unwrap(), *vsid)?;
+            }
 
-            Some(Arc::new(Mutex::new(pviommu)))
+            Some((Arc::new(Mutex::new(pviommu)), vsids))
         } else {
             None
         };
@@ -1088,6 +1149,21 @@ impl VfioDevice {
     /// Returns the DT symbol (node label) of this VFIO device.
     pub fn dt_symbol(&self) -> Option<&str> {
         self.dt_symbol.as_deref()
+    }
+
+    /// Returns the type and indentifier (if applicable) of the IOMMU used by this VFIO device and
+    /// its master IDs.
+    pub fn iommu(&self) -> Option<(IommuDevType, Option<u32>, &[u32])> {
+        // We currently only report IommuDevType::PkvmPviommu.
+        if let Some((ref pviommu, ref ids)) = self.pviommu {
+            Some((
+                IommuDevType::PkvmPviommu,
+                Some(pviommu.lock().id()),
+                ids.as_ref(),
+            ))
+        } else {
+            None
+        }
     }
 
     /// enter the device's low power state
