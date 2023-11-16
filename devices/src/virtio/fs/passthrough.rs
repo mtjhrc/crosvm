@@ -404,6 +404,10 @@ fn ebadf() -> io::Error {
     io::Error::from_raw_os_error(libc::EBADF)
 }
 
+fn eexist() -> io::Error {
+    io::Error::from_raw_os_error(libc::EEXIST)
+}
+
 fn stat<F: AsRawDescriptor + ?Sized>(f: &F) -> io::Result<libc::stat64> {
     let mut st = MaybeUninit::<libc::stat64>::zeroed();
 
@@ -770,7 +774,9 @@ impl PassthroughFs {
         Ok(unsafe { File::from_raw_descriptor(raw_descriptor) })
     }
 
-    fn open_inode(&self, inode: &InodeData, mut flags: i32) -> io::Result<File> {
+    /// Modifies the provided open flags based on the writeback caching configuration.
+    /// Return the updated open flags.
+    fn update_open_flags(&self, mut flags: i32) -> i32 {
         // When writeback caching is enabled, the kernel may send read requests even if the
         // userspace program opened the file write-only. So we need to ensure that we have opened
         // the file for reading as well as writing.
@@ -789,6 +795,13 @@ impl PassthroughFs {
         if writeback && flags & libc::O_APPEND != 0 {
             flags &= !libc::O_APPEND;
         }
+
+        flags
+    }
+
+    fn open_inode(&self, inode: &InodeData, mut flags: i32) -> io::Result<File> {
+        // handle writeback caching cases
+        flags = self.update_open_flags(flags);
 
         self.open_fd(inode.as_raw_descriptor(), flags)
     }
@@ -850,7 +863,7 @@ impl PassthroughFs {
     // Returns an actual case-sensitive file name that matches with the given `name`.
     // Returns `Ok(None)` if no file matches with the give `name`.
     // This function will panic if casefold is not enabled.
-    fn lookup_case_unfolded_name(
+    fn get_case_unfolded_name(
         &self,
         parent: &InodeData,
         name: &[u8],
@@ -864,7 +877,7 @@ impl PassthroughFs {
 
     // Performs an ascii case insensitive lookup.
     fn ascii_casefold_lookup(&self, parent: &InodeData, name: &[u8]) -> io::Result<Entry> {
-        match self.lookup_case_unfolded_name(parent, name)? {
+        match self.get_case_unfolded_name(parent, name)? {
             None => Err(io::Error::from_raw_os_error(libc::ENOENT)),
             Some(actual_name) => self.do_lookup(parent, &actual_name),
         }
@@ -954,16 +967,7 @@ impl PassthroughFs {
         Ok(self.add_entry(f, st, flags, path))
     }
 
-    fn do_open(&self, inode: Inode, flags: u32) -> io::Result<(Option<Handle>, OpenOptions)> {
-        let inode_data = self.find_inode(inode)?;
-
-        let file = Mutex::new(self.open_inode(&inode_data, flags as i32)?);
-
-        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        let data = HandleData { inode, file };
-
-        self.handles.lock().insert(handle, Arc::new(data));
-
+    fn get_cache_open_options(&self, flags: u32) -> OpenOptions {
         let mut opts = OpenOptions::empty();
         match self.cfg.cache_policy {
             // We only set the direct I/O option on files.
@@ -980,7 +984,66 @@ impl PassthroughFs {
             }
             _ => {}
         };
+        opts
+    }
 
+    // Performs lookup using original name first, if it fails and ascii_casefold is enabled,
+    // it tries to unfold the name and do lookup again.
+    fn do_lookup_with_casefold_fallback(
+        &self,
+        parent: &InodeData,
+        name: &CStr,
+    ) -> io::Result<Entry> {
+        let mut res = self.do_lookup(parent, name);
+        // If `ascii_casefold` is enabled, fallback to `ascii_casefold_lookup()`.
+        if res.is_err() && self.cfg.ascii_casefold {
+            res = self.ascii_casefold_lookup(parent, name.to_bytes());
+        }
+        res
+    }
+
+    fn do_open(&self, inode: Inode, flags: u32) -> io::Result<(Option<Handle>, OpenOptions)> {
+        let inode_data = self.find_inode(inode)?;
+
+        let file = Mutex::new(self.open_inode(&inode_data, flags as i32)?);
+
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        let data = HandleData { inode, file };
+
+        self.handles.lock().insert(handle, Arc::new(data));
+
+        let opts = self.get_cache_open_options(flags);
+
+        Ok((Some(handle), opts))
+    }
+
+    fn do_open_at(
+        &self,
+        parent_data: Arc<InodeData>,
+        name: &CStr,
+        inode: Inode,
+        flags: u32,
+    ) -> io::Result<(Option<Handle>, OpenOptions)> {
+        let open_flags = self.update_open_flags(flags as i32);
+
+        let fd_open = syscall!(unsafe {
+            libc::openat64(
+                parent_data.as_raw_descriptor(),
+                name.as_ptr(),
+                (open_flags | libc::O_CLOEXEC) & !(libc::O_NOFOLLOW | libc::O_DIRECT),
+            )
+        })?;
+
+        let file_open = unsafe { File::from_raw_descriptor(fd_open) };
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        let data = HandleData {
+            inode,
+            file: Mutex::new(file_open),
+        };
+
+        self.handles.lock().insert(handle, Arc::new(data));
+
+        let opts = self.get_cache_open_options(open_flags as u32);
         Ok((Some(handle), opts))
     }
 
@@ -1651,11 +1714,8 @@ impl FileSystem for PassthroughFs {
         );
         let _trace = fs_trace!(self.tag, "lookup", parent, path);
 
-        let mut res = self.do_lookup(&data, name);
-        // If `ascii_casefold` is enabled, fallback to `ascii_casefold_lookup()`.
-        if res.is_err() && self.cfg.ascii_casefold {
-            res = self.ascii_casefold_lookup(&data, name.to_bytes());
-        }
+        let mut res = self.do_lookup_with_casefold_fallback(&data, name);
+
         // FUSE takes a inode=0 as a request to do negative dentry cache.
         // So, if `negative_timeout` is set, return success with the timeout value and inode=0 as a
         // response.
@@ -1759,7 +1819,7 @@ impl FileSystem for PassthroughFs {
         let data = self.find_inode(parent)?;
         let casefold_cache = self.lock_casefold_lookup_caches();
         // TODO(b/278691962): If ascii_casefold is enabled, we need to call
-        // `lookup_case_unfolded_name()` to get the actual name to be unlinked.
+        // `get_case_unfolded_name()` to get the actual name to be unlinked.
         self.do_unlink(&data, name, libc::AT_REMOVEDIR)?;
         if let Some(mut c) = casefold_cache {
             c.remove(data.inode, name);
@@ -1892,7 +1952,7 @@ impl FileSystem for PassthroughFs {
             // really check `flags` because if the kernel can't handle poorly specified flags then
             // we have much bigger problems.
             // TODO(b/278691962): If ascii_casefold is enabled, we need to call
-            // `lookup_case_unfolded_name()` to get the actual name to be created.
+            // `get_case_unfolded_name()` to get the actual name to be created.
             let fd = syscall!(unsafe {
                 libc::openat64(data.as_raw_descriptor(), name.as_ptr(), create_flags, mode)
             })?;
@@ -1916,7 +1976,9 @@ impl FileSystem for PassthroughFs {
         let (handle, opts) = if self.zero_message_open.load(Ordering::Relaxed) {
             (None, OpenOptions::KEEP_CACHE)
         } else {
-            self.do_open(
+            self.do_open_at(
+                data,
+                name,
                 entry.inode,
                 flags & !((libc::O_CREAT | libc::O_EXCL | libc::O_NOCTTY) as u32),
             )
@@ -1934,7 +1996,7 @@ impl FileSystem for PassthroughFs {
         let data = self.find_inode(parent)?;
         let casefold_cache = self.lock_casefold_lookup_caches();
         // TODO(b/278691962): If ascii_casefold is enabled, we need to call
-        // `lookup_case_unfolded_name()` to get the actual name to be unlinked.
+        // `get_case_unfolded_name()` to get the actual name to be unlinked.
         self.do_unlink(&data, name, 0)?;
         if let Some(mut c) = casefold_cache {
             c.remove(data.inode, name);
@@ -2855,6 +2917,58 @@ impl FileSystem for PassthroughFs {
         }
         Ok(())
     }
+
+    fn atomic_open(
+        &self,
+        ctx: Context,
+        parent: Self::Inode,
+        name: &CStr,
+        mode: u32,
+        flags: u32,
+        umask: u32,
+    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
+        let _trace = fs_trace!(self.tag, "atomic_open", parent, name, mode, flags, umask);
+        let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
+
+        // Perform lookup but not create negative dentry
+        let data = self.find_inode(parent)?;
+
+        // This lookup serves two purposes:
+        // 1. If the O_CREATE flag is not set, it retrieves the d_entry for the file.
+        // 2. If the O_CREATE flag is set, it checks whether the file exists.
+        let res = self.do_lookup_with_casefold_fallback(&data, name);
+
+        if let Err(e) = res {
+            if e.kind() == std::io::ErrorKind::NotFound && (flags as i32 & libc::O_CREAT) != 0 {
+                // If the file did not exist & O_CREAT is set,
+                // create file & set FILE_CREATED bits in open options
+                let (entry, handler, mut opts) =
+                    self.create(ctx, parent, name, mode, flags, umask)?;
+                opts |= OpenOptions::FILE_CREATED;
+                return Ok((entry, handler, opts));
+            }
+            return Err(e);
+        }
+
+        // SAFETY: checked res is not error before
+        let entry = res.unwrap();
+
+        if entry.attr.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            return Ok((entry, None, OpenOptions::empty()));
+        }
+
+        if (flags as i32 & (libc::O_CREAT | libc::O_EXCL)) == (libc::O_CREAT | libc::O_EXCL) {
+            return Err(eexist());
+        }
+
+        let (handler, opts) = if self.zero_message_open.load(Ordering::Relaxed) {
+            (None, OpenOptions::KEEP_CACHE)
+        } else {
+            let (handler, opts) = self.do_open(entry.inode, flags)?;
+            (handler, opts)
+        };
+        Ok((entry, handler, opts))
+    }
 }
 
 #[cfg(test)]
@@ -2935,6 +3049,41 @@ mod tests {
         // Pass `u64::MAX` to ensure that the refcount goes to 0 and we forget inode.
         fs.forget(ctx, inode, u64::MAX);
         Ok(())
+    }
+
+    /// Looks up and open the given `path` in `fs`.
+    fn atomic_open(
+        fs: &PassthroughFs,
+        path: &Path,
+        mode: u32,
+        flags: u32,
+        umask: u32,
+    ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
+        let mut inode = 1;
+        let ctx = get_context();
+
+        let path_vec: Vec<_> = path.iter().collect();
+        let vec_len = path_vec.len();
+
+        // Do lookup before util (vec_len-1)-th pathname, this operation is to simulate
+        // the behavior of VFS, since when VFS call atomic_open only at last look up.
+        for name in &path_vec[0..vec_len - 1] {
+            let name = CString::new(name.to_str().unwrap()).unwrap();
+            let ent = fs.lookup(ctx, inode, &name)?;
+            inode = ent.inode;
+        }
+
+        let name = CString::new(path_vec[vec_len - 1].to_str().unwrap()).unwrap();
+
+        fs.atomic_open(ctx, inode, &name, mode, flags, umask)
+    }
+
+    fn symlink(fs: &PassthroughFs, linkname: &Path, name: &Path) -> io::Result<Entry> {
+        let inode = 1;
+        let ctx = get_context();
+        let name = CString::new(name.to_str().unwrap()).unwrap();
+        let linkname = CString::new(linkname.to_str().unwrap()).unwrap();
+        fs.symlink(ctx, &linkname, inode, &name)
     }
 
     #[test]
@@ -3293,5 +3442,245 @@ mod tests {
             lookup(&fs, &a_path).expect("lookup a.txt"),
             "Entry with inode=0 is expected for the removed file 'a.txt'"
         );
+    }
+    #[test]
+    fn test_atomic_open_existing_file() {
+        atomic_open_existing_file(false);
+    }
+
+    #[test]
+    fn test_atomic_open_existing_file_zero_message() {
+        atomic_open_existing_file(true);
+    }
+
+    fn atomic_open_existing_file(zero_message_open: bool) {
+        // Since PassthroughFs may executes process-wide operations such as `fchdir`, acquire
+        // `NamedLock` before starting each unit test creating a `PassthroughFs` instance.
+        let lock = NamedLock::create(UNITTEST_LOCK_NAME).expect("create named lock");
+        let _guard = lock.lock().expect("acquire named lock");
+
+        let temp_dir = TempDir::new().unwrap();
+        create_test_data(&temp_dir, &["dir"], &["a.txt", "dir/b.txt", "dir/c.txt"]);
+
+        let cache_policy = match zero_message_open {
+            true => CachePolicy::Always,
+            false => CachePolicy::Auto,
+        };
+
+        let cfg = Config {
+            cache_policy,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::new("tag", cfg).unwrap();
+
+        let capable = FsOptions::ZERO_MESSAGE_OPEN;
+        fs.init(capable).unwrap();
+
+        // atomic_open with flag O_RDWR, should return positive dentry and file handler
+        let res = atomic_open(
+            &fs,
+            &temp_dir.path().join("a.txt"),
+            0o666,
+            libc::O_RDWR as u32,
+            0,
+        );
+        assert!(res.is_ok());
+        let (entry, handler, open_options) = res.unwrap();
+        assert_ne!(entry.inode, 0);
+
+        if zero_message_open {
+            assert!(handler.is_none());
+            assert_eq!(open_options, OpenOptions::KEEP_CACHE);
+        } else {
+            assert!(handler.is_some());
+            assert_ne!(
+                open_options & OpenOptions::FILE_CREATED,
+                OpenOptions::FILE_CREATED
+            );
+        }
+
+        // atomic_open with flag O_RDWR |  O_CREATE, should return positive dentry and file handler
+        let res = atomic_open(
+            &fs,
+            &temp_dir.path().join("dir/b.txt"),
+            0o666,
+            (libc::O_RDWR | libc::O_CREAT) as u32,
+            0,
+        );
+        assert!(res.is_ok());
+        let (entry, handler, open_options) = res.unwrap();
+        assert_ne!(entry.inode, 0);
+
+        if zero_message_open {
+            assert!(handler.is_none());
+            assert_eq!(open_options, OpenOptions::KEEP_CACHE);
+        } else {
+            assert!(handler.is_some());
+            assert_ne!(
+                open_options & OpenOptions::FILE_CREATED,
+                OpenOptions::FILE_CREATED
+            );
+        }
+
+        // atomic_open with flag O_RDWR | O_CREATE | O_EXCL, should return positive dentry and file handler
+        let res = atomic_open(
+            &fs,
+            &temp_dir.path().join("dir/c.txt"),
+            0o666,
+            (libc::O_RDWR | libc::O_CREAT | libc::O_EXCL) as u32,
+            0,
+        );
+        assert!(res.is_err());
+        let err_kind = res.unwrap_err().kind();
+        assert_eq!(err_kind, io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn test_atomic_open_non_existing_file() {
+        atomic_open_non_existing_file(false);
+    }
+
+    #[test]
+    fn test_atomic_open_non_existing_file_zero_message() {
+        atomic_open_non_existing_file(true);
+    }
+
+    fn atomic_open_non_existing_file(zero_message_open: bool) {
+        // Since PassthroughFs may executes process-wide operations such as `fchdir`, acquire
+        // `NamedLock` before starting each unit test creating a `PassthroughFs` instance.
+        let lock = NamedLock::create(UNITTEST_LOCK_NAME).expect("create named lock");
+        let _guard = lock.lock().expect("acquire named lock");
+
+        let temp_dir = TempDir::new().unwrap();
+
+        let cache_policy = match zero_message_open {
+            true => CachePolicy::Always,
+            false => CachePolicy::Auto,
+        };
+
+        let cfg = Config {
+            cache_policy,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::new("tag", cfg).unwrap();
+
+        let capable = FsOptions::ZERO_MESSAGE_OPEN;
+        fs.init(capable).unwrap();
+
+        // atomic_open with flag O_RDWR, should return NO_EXIST error
+        let res = atomic_open(
+            &fs,
+            &temp_dir.path().join("a.txt"),
+            0o666,
+            libc::O_RDWR as u32,
+            0,
+        );
+        assert!(res.is_err());
+        let err_kind = res.unwrap_err().kind();
+        assert_eq!(err_kind, io::ErrorKind::NotFound);
+
+        // atomic_open with flag O_RDWR | O_CREATE, should return positive dentry and file handler
+        let res = atomic_open(
+            &fs,
+            &temp_dir.path().join("b.txt"),
+            0o666,
+            (libc::O_RDWR | libc::O_CREAT) as u32,
+            0,
+        );
+        assert!(res.is_ok());
+        let (entry, handler, open_options) = res.unwrap();
+        assert_ne!(entry.inode, 0);
+
+        if zero_message_open {
+            assert!(handler.is_none());
+            assert_eq!(
+                open_options & OpenOptions::KEEP_CACHE,
+                OpenOptions::KEEP_CACHE
+            );
+        } else {
+            assert!(handler.is_some());
+        }
+        assert_eq!(
+            open_options & OpenOptions::FILE_CREATED,
+            OpenOptions::FILE_CREATED
+        );
+    }
+
+    #[test]
+    fn atomic_open_symbol_link() {
+        // Since PassthroughFs may executes process-wide operations such as `fchdir`, acquire
+        // `NamedLock` before starting each unit test creating a `PassthroughFs` instance.
+        let lock = NamedLock::create(UNITTEST_LOCK_NAME).expect("create named lock");
+        let _guard = lock.lock().expect("acquire named lock");
+
+        let temp_dir = TempDir::new().unwrap();
+        create_test_data(&temp_dir, &["dir"], &["a.txt"]);
+
+        let cfg = Default::default();
+        let fs = PassthroughFs::new("tag", cfg).unwrap();
+
+        let capable = FsOptions::empty();
+        fs.init(capable).unwrap();
+
+        // atomic open the link destination file
+        let res_dst = atomic_open(
+            &fs,
+            &temp_dir.path().join("a.txt"),
+            0o666,
+            libc::O_RDWR as u32,
+            0,
+        );
+        assert!(res_dst.is_ok());
+        let (entry_dst, handler_dst, _) = res_dst.unwrap();
+        assert_ne!(entry_dst.inode, 0);
+        assert!(handler_dst.is_some());
+
+        // create depth 1 symbol link
+        let sym1_res = symlink(
+            &fs,
+            &temp_dir.path().join("a.txt"),
+            &temp_dir.path().join("blink"),
+        );
+        assert!(sym1_res.is_ok());
+        let sym1_entry = sym1_res.unwrap();
+        assert_ne!(sym1_entry.inode, 0);
+
+        // atomic_open symbol link, should return dentry with no handler
+        let res = atomic_open(
+            &fs,
+            &temp_dir.path().join("blink"),
+            0o666,
+            libc::O_RDWR as u32,
+            0,
+        );
+        assert!(res.is_ok());
+        let (entry, handler, open_options) = res.unwrap();
+        assert_eq!(entry.inode, sym1_entry.inode);
+        assert!(handler.is_none());
+        assert_eq!(open_options, OpenOptions::empty());
+
+        // delete link destination
+        unlink(&fs, &temp_dir.path().join("a.txt")).expect("Remove");
+        assert_eq!(
+            lookup(&fs, &temp_dir.path().join("a.txt"))
+                .expect_err("file must not exist")
+                .kind(),
+            io::ErrorKind::NotFound,
+            "a.txt must be removed"
+        );
+
+        // after link destination removed, should still return valid dentry
+        let res = atomic_open(
+            &fs,
+            &temp_dir.path().join("blink"),
+            0o666,
+            libc::O_RDWR as u32,
+            0,
+        );
+        assert!(res.is_ok());
+        let (entry, handler, open_options) = res.unwrap();
+        assert_eq!(entry.inode, sym1_entry.inode);
+        assert!(handler.is_none());
+        assert_eq!(open_options, OpenOptions::empty());
     }
 }

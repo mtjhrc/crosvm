@@ -2166,10 +2166,17 @@ pub struct RunCommand {
     /// move all vCPU threads to this CGroup (default: nothing moves)
     pub vcpu_cgroup_path: Option<PathBuf>,
 
+    #[cfg(unix)]
+    #[argh(option, arg_name = "NICE_VALUE")]
+    #[serde(skip)] // TODO(b/255223604)
+    #[merge(strategy = overwrite_option)]
+    /// adjust the nice value of the vCPU threads
+    pub vcpu_nice: Option<i32>,
+
     #[cfg(any(target_os = "android", target_os = "linux"))]
     #[argh(
         option,
-        arg_name = "PATH[,guest-address=<BUS:DEVICE.FUNCTION>][,iommu=viommu|coiommu|off][,dt-symbol=<SYMBOL>]"
+        arg_name = "PATH[,guest-address=<BUS:DEVICE.FUNCTION>][,iommu=viommu|coiommu|pkvm-iommu|off][,dt-symbol=<SYMBOL>]"
     )]
     #[serde(default)]
     #[merge(strategy = append)]
@@ -2179,7 +2186,7 @@ pub struct RunCommand {
     ///        If not specified, the device will be assigned an
     ///        address that mirrors its address in the host.
     ///        Only valid for PCI devices.
-    ///     iommu=viommu|coiommu|off - indicates which type of IOMMU
+    ///     iommu=viommu|coiommu|pkvm-iommu|off - indicates which type of IOMMU
     ///        to use for this device.
     ///     dt-symbol=<SYMBOL> - the symbol that labels the device tree
     ///        node in the device tree overlay file.
@@ -2515,6 +2522,11 @@ impl TryFrom<RunCommand> for super::config::Config {
         }
 
         cfg.vcpu_cgroup_path = cmd.vcpu_cgroup_path;
+
+        #[cfg(unix)]
+        {
+            cfg.vcpu_nice = cmd.vcpu_nice;
+        }
 
         cfg.no_smt = cmd.no_smt.unwrap_or_default();
 
