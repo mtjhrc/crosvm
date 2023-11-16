@@ -89,8 +89,8 @@ const DEFAULT_QUEUE_SIZE: u16 = 256;
 
 // The maximum number of linked commands.
 const MAX_CMD_PER_LUN: u32 = 128;
-// We set the maximum transfer size hint to 0xffff: 2^16 * 512 ~ 34mb.
-const MAX_SECTORS: u32 = 0xffff;
+// We do not set a limit on the transfer size.
+const MAX_SECTORS: u32 = u32::MAX;
 
 const fn virtio_scsi_cmd_resp_ok() -> virtio_scsi_cmd_resp {
     virtio_scsi_cmd_resp {
@@ -751,6 +751,7 @@ async fn process_one_chain(
     interrupt: &Interrupt,
     queue_type: &QueueType,
 ) {
+    let _trace = cros_tracing::trace_event!(VirtioScsi, "process_one_chain");
     let len = process_one_request(&mut avail_desc, queue_type).await;
     let mut queue = queue.borrow_mut();
     queue.add_used(avail_desc, len as u32);
