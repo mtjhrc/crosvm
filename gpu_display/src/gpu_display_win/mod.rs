@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+mod keyboard_input_manager;
 mod math_util;
 pub mod surface;
 mod window;
@@ -72,7 +73,7 @@ impl From<&DisplayParameters> for DisplayProperties {
 }
 
 pub struct DisplayWin {
-    wndproc_thread: WindowProcedureThread<Surface>,
+    wndproc_thread: WindowProcedureThread,
     display_closed_event: Event,
     win_metrics: Option<Weak<Metrics>>,
     display_properties: DisplayProperties,
@@ -84,7 +85,7 @@ pub struct DisplayWin {
 
 impl DisplayWin {
     pub fn new(
-        wndproc_thread: WindowProcedureThread<Surface>,
+        wndproc_thread: WindowProcedureThread,
         win_metrics: Option<Weak<Metrics>>,
         display_properties: DisplayProperties,
         gpu_display_wait_descriptor_ctrl: SendTube,
@@ -313,22 +314,17 @@ impl GpuDisplaySurface for SurfaceWin {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use base::Tube;
-    use window_message_processor::HandleWindowMessage;
+
+    use super::*;
 
     #[test]
     fn can_create_2_window_proc_threads() {
-        struct TestHandle;
-        impl HandleWindowMessage for TestHandle {}
-        #[cfg(feature = "kiwi")]
-        battlestar::process_invariants::init(&Default::default()).unwrap();
-
         let threads = (0..2)
             .map(|_| {
                 let (main_ime_tube, _device_ime_tube) =
                     Tube::pair().expect("failed to create IME tube");
-                let wndproc_thread_builder = WindowProcedureThread::<TestHandle>::builder();
+                let wndproc_thread_builder = WindowProcedureThread::builder();
                 #[cfg(feature = "kiwi")]
                 let wndproc_thread_builder = {
                     let mut wndproc_thread_builder = wndproc_thread_builder;
