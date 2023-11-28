@@ -46,34 +46,25 @@ pub use message::VHOST_USER_F_PROTOCOL_FEATURES;
 pub mod connection;
 
 mod sys;
+pub use connection::Endpoint;
+pub use message::MasterReq;
+pub use message::SlaveReq;
 pub use sys::SystemStream;
 pub use sys::*;
 
-cfg_if::cfg_if! {
-    if #[cfg(feature = "vmm")] {
-        pub(crate) mod master;
-        pub use self::master::Master;
-        mod master_req_handler;
-        pub use self::master_req_handler::{VhostUserMasterReqHandler,
-                                    VhostUserMasterReqHandlerMut};
-    }
-}
-cfg_if::cfg_if! {
-    if #[cfg(feature = "device")] {
-        mod slave_req_handler;
-        mod slave_proxy;
-        pub use self::slave_req_handler::{
-            SlaveReqHandler, SlaveReqHelper, VhostUserSlaveReqHandler,
-            VhostUserSlaveReqHandlerMut,
-        };
-        pub use self::slave_proxy::Slave;
-    }
-}
-cfg_if::cfg_if! {
-    if #[cfg(feature = "vmm")] {
-        pub use self::master_req_handler::MasterReqHandler;
-    }
-}
+pub(crate) mod master;
+pub use self::master::Master;
+mod master_req_handler;
+pub use self::master_req_handler::VhostUserMasterReqHandler;
+pub use self::master_req_handler::VhostUserMasterReqHandlerMut;
+mod slave_proxy;
+mod slave_req_handler;
+pub use self::master_req_handler::MasterReqHandler;
+pub use self::slave_proxy::Slave;
+pub use self::slave_req_handler::SlaveReqHandler;
+pub use self::slave_req_handler::SlaveReqHelper;
+pub use self::slave_req_handler::VhostUserSlaveReqHandler;
+pub use self::slave_req_handler::VhostUserSlaveReqHandlerMut;
 
 /// Errors for vhost-user operations
 #[sorted]
@@ -238,10 +229,10 @@ pub(crate) fn take_single_file(files: Option<Vec<File>>) -> Option<File> {
     Some(files.swap_remove(0))
 }
 
-#[cfg(all(test, feature = "device"))]
+#[cfg(test)]
 mod dummy_slave;
 
-#[cfg(all(test, feature = "vmm", feature = "device"))]
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::Barrier;
@@ -260,9 +251,7 @@ mod tests {
     use crate::VringConfigData;
 
     /// Utility function to process a header and a message together.
-    fn handle_request(
-        h: &mut SlaveReqHandler<Mutex<DummySlaveReqHandler>, MasterReqEndpoint>,
-    ) -> Result<()> {
+    fn handle_request(h: &mut SlaveReqHandler<Mutex<DummySlaveReqHandler>>) -> Result<()> {
         // We assume that a header comes together with message body in tests so we don't wait before
         // calling `process_message()`.
         let (hdr, files) = h.recv_header()?;

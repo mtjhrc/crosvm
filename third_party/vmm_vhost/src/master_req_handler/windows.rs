@@ -31,14 +31,14 @@ impl<S: VhostUserMasterReqHandler> MasterReqHandler<S> {
 impl<S: VhostUserMasterReqHandler> ReadNotifier for MasterReqHandler<S> {
     /// Used for polling.
     fn get_read_notifier(&self) -> &dyn AsRawDescriptor {
-        self.sub_sock.get_tube().get_read_notifier()
+        self.sub_sock.0.get_tube().get_read_notifier()
     }
 }
 
 impl<S: VhostUserMasterReqHandler> CloseNotifier for MasterReqHandler<S> {
     /// Used for closing.
     fn get_close_notifier(&self) -> &dyn AsRawDescriptor {
-        self.sub_sock.get_tube().get_close_notifier()
+        self.sub_sock.0.get_tube().get_close_notifier()
     }
 }
 
@@ -53,7 +53,6 @@ mod tests {
     use super::*;
     use crate::message::VhostUserFSSlaveMsg;
     use crate::HandlerResult;
-    #[cfg(feature = "device")]
     use crate::Slave;
     use crate::VhostUserMasterReqHandlerMut;
 
@@ -84,7 +83,6 @@ mod tests {
         assert!(handler.get_close_notifier().as_raw_descriptor() != INVALID_DESCRIPTOR);
     }
 
-    #[cfg(feature = "device")]
     #[test]
     fn test_master_slave_req_handler() {
         let backend = Arc::new(Mutex::new(MockMasterReqHandler {}));
@@ -115,7 +113,6 @@ mod tests {
             .unwrap();
     }
 
-    #[cfg(feature = "device")]
     #[test]
     fn test_master_slave_req_handler_with_ack() {
         let backend = Arc::new(Mutex::new(MockMasterReqHandler {}));
