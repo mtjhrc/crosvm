@@ -1,7 +1,7 @@
 // Copyright 2021 The Chromium OS Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Structs for Unix Domain Socket listener and endpoint.
+//! Structs for Unix Domain Socket listener and connection.
 
 use std::any::Any;
 use std::fs::File;
@@ -23,7 +23,7 @@ use crate::connection::Req;
 use crate::message::*;
 use crate::take_single_file;
 use crate::unix::SystemListener;
-use crate::Endpoint;
+use crate::Connection;
 use crate::Error;
 use crate::Result;
 use crate::SystemStream;
@@ -78,11 +78,11 @@ impl Listener for SocketListener {
     /// * - Some(SystemListener): new SystemListener object if new incoming connection is available.
     /// * - None: no incoming connection available.
     /// * - SocketError: errors from accept().
-    fn accept(&mut self) -> Result<Option<Endpoint<MasterReq>>> {
+    fn accept(&mut self) -> Result<Option<Connection<MasterReq>>> {
         loop {
             match self.fd.accept() {
                 Ok((stream, _addr)) => {
-                    return Ok(Some(Endpoint::from(stream)));
+                    return Ok(Some(Connection::from(stream)));
                 }
                 Err(e) => {
                     match e.kind() {
@@ -115,14 +115,14 @@ impl AsRawDescriptor for SocketListener {
     }
 }
 
-/// Unix domain socket endpoint for vhost-user connection.
-pub struct SocketEndpoint<R: Req> {
+/// Unix domain socket based vhost-user connection.
+pub struct SocketPlatformConnection<R: Req> {
     sock: ScmSocket<SystemStream>,
     _r: PhantomData<R>,
 }
 
 // TODO: Switch to TryFrom to avoid the unwrap.
-impl<R: Req> From<SystemStream> for SocketEndpoint<R> {
+impl<R: Req> From<SystemStream> for SocketPlatformConnection<R> {
     fn from(sock: SystemStream) -> Self {
         Self {
             sock: sock.try_into().unwrap(),
@@ -131,11 +131,11 @@ impl<R: Req> From<SystemStream> for SocketEndpoint<R> {
     }
 }
 
-impl<R: Req> SocketEndpoint<R> {
+impl<R: Req> SocketPlatformConnection<R> {
     /// Create a new stream by connecting to server at `str`.
     ///
     /// # Return:
-    /// * - the new SocketEndpoint object on success.
+    /// * - the new SocketPlatformConnection object on success.
     /// * - SocketConnect: failed to connect to peer.
     pub fn connect<P: AsRef<Path>>(path: P) -> Result<Self> {
         let sock = SystemStream::connect(path).map_err(Error::SocketConnect)?;
@@ -212,24 +212,24 @@ impl<R: Req> SocketEndpoint<R> {
         Ok((bytes, files))
     }
 
-    pub fn create_slave_request_endpoint(
+    pub fn create_slave_request_connection(
         &mut self,
         files: Option<Vec<File>>,
-    ) -> Result<Endpoint<SlaveReq>> {
+    ) -> Result<Connection<SlaveReq>> {
         let file = take_single_file(files).ok_or(Error::InvalidMessage)?;
         // Safe because we own the file
         let tube = unsafe { SystemStream::from_raw_descriptor(file.into_raw_descriptor()) };
-        Ok(Endpoint::<SlaveReq>::from(tube))
+        Ok(Connection::<SlaveReq>::from(tube))
     }
 }
 
-impl<T: Req> AsRawDescriptor for SocketEndpoint<T> {
+impl<T: Req> AsRawDescriptor for SocketPlatformConnection<T> {
     fn as_raw_descriptor(&self) -> RawDescriptor {
         self.sock.as_raw_descriptor()
     }
 }
 
-impl<T: Req> AsMut<SystemStream> for SocketEndpoint<T> {
+impl<T: Req> AsMut<SystemStream> for SocketPlatformConnection<T> {
     fn as_mut(&mut self) -> &mut SystemStream {
         self.sock.inner_mut()
     }
@@ -242,11 +242,11 @@ mod tests {
     use std::io::SeekFrom;
     use std::io::Write;
     use std::mem;
-    use std::slice;
 
     use tempfile::tempfile;
     use tempfile::Builder;
     use tempfile::TempDir;
+    use zerocopy::AsBytes;
 
     use super::*;
 
@@ -284,8 +284,8 @@ mod tests {
         path.push("sock");
         let mut listener = SocketListener::new(&path, true).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let master = Endpoint::<MasterReq>::connect(&path).unwrap();
-        let mut slave = listener.accept().unwrap().unwrap();
+        let master = Connection::<MasterReq>::connect(&path).unwrap();
+        let slave = listener.accept().unwrap().unwrap();
 
         let buf1 = [0x1, 0x2, 0x3, 0x4];
         let mut len = master.send_slice(IoSlice::new(&buf1[..]), None).unwrap();
@@ -311,8 +311,8 @@ mod tests {
         path.push("sock");
         let mut listener = SocketListener::new(&path, true).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let master = Endpoint::<MasterReq>::connect(&path).unwrap();
-        let mut slave = listener.accept().unwrap().unwrap();
+        let master = Connection::<MasterReq>::connect(&path).unwrap();
+        let slave = listener.accept().unwrap().unwrap();
 
         let mut fd = tempfile().unwrap();
         write!(fd, "test").unwrap();
@@ -386,8 +386,8 @@ mod tests {
             .unwrap();
         assert_eq!(len, 4);
 
-        let buf4 = slave.recv_data(2).unwrap();
-        assert_eq!(buf4.len(), 2);
+        let mut buf4 = vec![0u8; 2];
+        slave.recv_into_bufs_all(&mut [&mut buf4[..]]).unwrap();
         assert_eq!(&buf1[..2], &buf4[..]);
         let (bytes, buf2, files) = slave.recv_into_buf(0x2).unwrap();
         assert_eq!(bytes, 2);
@@ -451,8 +451,9 @@ mod tests {
             .unwrap();
         assert_eq!(len, 4);
 
-        let v = slave.recv_data(5).unwrap();
-        assert_eq!(v.len(), 5);
+        let mut v = vec![0u8; 5];
+        slave.recv_into_bufs_all(&mut [&mut v[..]]).unwrap();
+        assert_eq!(&v[..], &[1, 2, 3, 4, 1]);
 
         let (bytes, _, files) = slave.recv_into_buf(0x4).unwrap();
         assert_eq!(bytes, 3);
@@ -483,8 +484,8 @@ mod tests {
         path.push("sock");
         let mut listener = SocketListener::new(&path, true).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let master = Endpoint::<MasterReq>::connect(&path).unwrap();
-        let mut slave = listener.accept().unwrap().unwrap();
+        let master = Connection::<MasterReq>::connect(&path).unwrap();
+        let slave = listener.accept().unwrap().unwrap();
 
         let mut hdr1 =
             VhostUserMsgHeader::new(MasterReq::GET_FEATURES, 0, mem::size_of::<u64>() as u32);
@@ -492,14 +493,12 @@ mod tests {
         let features1 = 0x1u64;
         master.send_message(&hdr1, &features1, None).unwrap();
 
+        let mut hdr2 = VhostUserMsgHeader::default();
         let mut features2 = 0u64;
-        let slice = unsafe {
-            slice::from_raw_parts_mut(
-                (&mut features2 as *mut u64) as *mut u8,
-                mem::size_of::<u64>(),
-            )
-        };
-        let (hdr2, files) = slave.recv_body_into_buf(slice).unwrap();
+        let files = slave
+            .recv_into_bufs_all(&mut [hdr2.as_bytes_mut(), features2.as_bytes_mut()])
+            .unwrap();
+        assert!(hdr2.is_valid());
         assert_eq!(hdr1, hdr2);
         assert_eq!(features1, features2);
         assert!(files.is_none());
