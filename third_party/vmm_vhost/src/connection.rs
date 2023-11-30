@@ -6,10 +6,12 @@
 cfg_if::cfg_if! {
     if #[cfg(unix)] {
         pub mod socket;
+        pub use socket::to_system_stream;
         mod unix;
     } else if #[cfg(windows)] {
         mod tube;
         pub use tube::TubePlatformConnection;
+        pub use tube::to_system_stream;
         mod windows;
     }
 }
@@ -27,7 +29,6 @@ use zerocopy::FromBytes;
 
 use crate::connection::Req;
 use crate::message::MasterReq;
-use crate::message::SlaveReq;
 use crate::message::*;
 use crate::sys::PlatformConnection;
 use crate::Error;
@@ -89,7 +90,8 @@ fn advance_slices_mut(bufs: &mut &mut [&mut [u8]], mut count: usize) {
 /// Builds on top of `PlatformConnection`, which provides methods for sending and receiving raw
 /// bytes and file descriptors (a thin cross-platform abstraction for unix domain sockets).
 pub struct Connection<R: Req>(
-    pub(crate) PlatformConnection<R>,
+    pub(crate) PlatformConnection,
+    std::marker::PhantomData<R>,
     // Mark `Connection` as `!Sync` because message sends and recvs cannot safely be done
     // concurrently.
     std::marker::PhantomData<std::cell::Cell<()>>,
@@ -97,7 +99,11 @@ pub struct Connection<R: Req>(
 
 impl<R: Req> From<SystemStream> for Connection<R> {
     fn from(sock: SystemStream) -> Self {
-        Self(PlatformConnection::from(sock), std::marker::PhantomData)
+        Self(
+            PlatformConnection::from(sock),
+            std::marker::PhantomData,
+            std::marker::PhantomData,
+        )
     }
 }
 
@@ -107,18 +113,8 @@ impl<R: Req> Connection<R> {
         Ok(Self(
             PlatformConnection::connect(path)?,
             std::marker::PhantomData,
+            std::marker::PhantomData,
         ))
-    }
-
-    /// Constructs the slave request connection for self.
-    ///
-    /// # Arguments
-    /// * `files` - Files from which to create the connection
-    pub fn create_slave_request_connection(
-        &mut self,
-        files: Option<Vec<File>>,
-    ) -> Result<super::Connection<SlaveReq>> {
-        self.0.create_slave_request_connection(files)
     }
 
     /// Sends all bytes from scatter-gather vectors with optional attached file descriptors. Will

@@ -8,20 +8,17 @@ use std::fs::File;
 use std::io::ErrorKind;
 use std::io::IoSlice;
 use std::io::IoSliceMut;
-use std::marker::PhantomData;
 use std::path::Path;
 use std::path::PathBuf;
 
 use base::AsRawDescriptor;
 use base::FromRawDescriptor;
-use base::IntoRawDescriptor;
 use base::RawDescriptor;
+use base::SafeDescriptor;
 use base::ScmSocket;
 
 use crate::connection::Listener;
-use crate::connection::Req;
 use crate::message::*;
-use crate::take_single_file;
 use crate::unix::SystemListener;
 use crate::Connection;
 use crate::Error;
@@ -116,22 +113,20 @@ impl AsRawDescriptor for SocketListener {
 }
 
 /// Unix domain socket based vhost-user connection.
-pub struct SocketPlatformConnection<R: Req> {
+pub struct SocketPlatformConnection {
     sock: ScmSocket<SystemStream>,
-    _r: PhantomData<R>,
 }
 
 // TODO: Switch to TryFrom to avoid the unwrap.
-impl<R: Req> From<SystemStream> for SocketPlatformConnection<R> {
+impl From<SystemStream> for SocketPlatformConnection {
     fn from(sock: SystemStream) -> Self {
         Self {
             sock: sock.try_into().unwrap(),
-            _r: PhantomData,
         }
     }
 }
 
-impl<R: Req> SocketPlatformConnection<R> {
+impl SocketPlatformConnection {
     /// Create a new stream by connecting to server at `str`.
     ///
     /// # Return:
@@ -211,28 +206,27 @@ impl<R: Req> SocketPlatformConnection<R> {
 
         Ok((bytes, files))
     }
-
-    pub fn create_slave_request_connection(
-        &mut self,
-        files: Option<Vec<File>>,
-    ) -> Result<Connection<SlaveReq>> {
-        let file = take_single_file(files).ok_or(Error::InvalidMessage)?;
-        // Safe because we own the file
-        let tube = unsafe { SystemStream::from_raw_descriptor(file.into_raw_descriptor()) };
-        Ok(Connection::<SlaveReq>::from(tube))
-    }
 }
 
-impl<T: Req> AsRawDescriptor for SocketPlatformConnection<T> {
+impl AsRawDescriptor for SocketPlatformConnection {
     fn as_raw_descriptor(&self) -> RawDescriptor {
         self.sock.as_raw_descriptor()
     }
 }
 
-impl<T: Req> AsMut<SystemStream> for SocketPlatformConnection<T> {
+impl AsMut<SystemStream> for SocketPlatformConnection {
     fn as_mut(&mut self) -> &mut SystemStream {
         self.sock.inner_mut()
     }
+}
+
+/// Convert a `SafeDescriptor` to a `UnixStream`.
+///
+/// # Safety
+///
+/// `file` must represent a unix domain socket.
+pub unsafe fn to_system_stream(fd: SafeDescriptor) -> Result<SystemStream> {
+    Ok(fd.into())
 }
 
 #[cfg(test)]

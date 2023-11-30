@@ -8,24 +8,21 @@ use std::cmp::min;
 use std::fs::File;
 use std::io::IoSlice;
 use std::io::IoSliceMut;
-use std::marker::PhantomData;
 use std::path::Path;
 use std::ptr::copy_nonoverlapping;
 
 use base::AsRawDescriptor;
 use base::FromRawDescriptor;
 use base::RawDescriptor;
+use base::SafeDescriptor;
 use base::Tube;
 use serde::Deserialize;
 use serde::Serialize;
 use tube_transporter::packed_tube;
 
-use crate::connection::Req;
-use crate::message::SlaveReq;
-use crate::take_single_file;
-use crate::Connection;
 use crate::Error;
 use crate::Result;
+use crate::SystemStream;
 
 #[derive(Serialize, Deserialize)]
 struct RawDescriptorContainer {
@@ -40,27 +37,23 @@ struct Message {
 }
 
 /// Tube based vhost-user connection.
-pub struct TubePlatformConnection<R: Req> {
+pub struct TubePlatformConnection {
     tube: Tube,
-    _r: PhantomData<R>,
 }
 
-impl<R: Req> TubePlatformConnection<R> {
+impl TubePlatformConnection {
     pub(crate) fn get_tube(&self) -> &Tube {
         &self.tube
     }
 }
 
-impl<R: Req> From<Tube> for TubePlatformConnection<R> {
+impl From<Tube> for TubePlatformConnection {
     fn from(tube: Tube) -> Self {
-        Self {
-            tube,
-            _r: PhantomData,
-        }
+        Self { tube }
     }
 }
 
-impl<R: Req> TubePlatformConnection<R> {
+impl TubePlatformConnection {
     pub fn connect<P: AsRef<Path>>(_path: P) -> Result<Self> {
         unimplemented!("connections not supported on Tubes")
     }
@@ -155,19 +148,20 @@ impl<R: Req> TubePlatformConnection<R> {
 
         Ok((bytes_read, files))
     }
-
-    pub fn create_slave_request_connection(
-        &mut self,
-        files: Option<Vec<File>>,
-    ) -> Result<Connection<SlaveReq>> {
-        let file = take_single_file(files).ok_or(Error::InvalidMessage)?;
-        // Safe because the file represents a packed tube.
-        let tube = unsafe { packed_tube::unpack(file.into()).expect("unpacked Tube") };
-        Ok(Connection::from(tube))
-    }
 }
 
-impl<R: Req> AsRawDescriptor for TubePlatformConnection<R> {
+/// Convert a`SafeDescriptor` to a `Tube`.
+///
+/// # Safety
+///
+/// `fd` must represent a packed tube.
+pub unsafe fn to_system_stream(fd: SafeDescriptor) -> Result<SystemStream> {
+    // SAFETY: Safe because the file represents a packed tube.
+    let tube = unsafe { packed_tube::unpack(fd).expect("unpacked Tube") };
+    Ok(tube)
+}
+
+impl AsRawDescriptor for TubePlatformConnection {
     /// WARNING: this function does not return a waitable descriptor! Use base::ReadNotifier
     /// instead.
     fn as_raw_descriptor(&self) -> RawDescriptor {
