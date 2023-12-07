@@ -110,15 +110,7 @@ impl MemoryMapping {
     pub fn new_protection(size: usize, prot: Protection) -> Result<MemoryMapping> {
         // This is safe because we are creating an anonymous mapping in a place not already used by
         // any other area in this process.
-        unsafe {
-            MemoryMapping::try_mmap(
-                None,
-                size,
-                prot.into(),
-                libc::MAP_ANONYMOUS | libc::MAP_SHARED | libc::MAP_NORESERVE,
-                None,
-            )
-        }
+        unsafe { MemoryMapping::try_mmap(None, size, prot.into(), None) }
     }
 
     /// Maps the first `size` bytes of the given `fd` as read/write.
@@ -144,28 +136,6 @@ impl MemoryMapping {
     /// * `fd` - File descriptor to mmap from.
     /// * `size` - Size of memory region in bytes.
     /// * `offset` - Offset in bytes from the beginning of `fd` to start the mmap.
-    /// * `flags` - flags passed directly to mmap.
-    /// * `prot` - Protection (e.g. readable/writable) of the memory region.
-    fn from_fd_offset_flags(
-        fd: &dyn AsRawDescriptor,
-        size: usize,
-        offset: u64,
-        flags: c_int,
-        prot: Protection,
-    ) -> Result<MemoryMapping> {
-        unsafe {
-            // This is safe because we are creating an anonymous mapping in a place not already used
-            // by any other area in this process.
-            MemoryMapping::try_mmap(None, size, prot.into(), flags, Some((fd, offset)))
-        }
-    }
-
-    /// Maps the `size` bytes starting at `offset` bytes of the given `fd` as read/write.
-    ///
-    /// # Arguments
-    /// * `fd` - File descriptor to mmap from.
-    /// * `size` - Size of memory region in bytes.
-    /// * `offset` - Offset in bytes from the beginning of `fd` to start the mmap.
     /// * `prot` - Protection (e.g. readable/writable) of the memory region.
     pub fn from_fd_offset_protection(
         fd: &dyn AsRawDescriptor,
@@ -173,7 +143,7 @@ impl MemoryMapping {
         offset: u64,
         prot: Protection,
     ) -> Result<MemoryMapping> {
-        MemoryMapping::from_fd_offset_flags(fd, size, offset, libc::MAP_SHARED, prot)
+        MemoryMapping::from_fd_offset_protection_populate(fd, size, offset, prot, false)
     }
 
     /// Maps `size` bytes starting at `offset` from the given `fd` as read/write, and requests
@@ -182,6 +152,8 @@ impl MemoryMapping {
     /// * `fd` - File descriptor to mmap from.
     /// * `size` - Size of memory region in bytes.
     /// * `offset` - Offset in bytes from the beginning of `fd` to start the mmap.
+    /// * `prot` - Protection (e.g. readable/writable) of the memory region.
+    /// * `populate` - Populate (prefault) page tables for a mapping.
     pub fn from_fd_offset_protection_populate(
         fd: &dyn AsRawDescriptor,
         size: usize,
@@ -189,11 +161,11 @@ impl MemoryMapping {
         prot: Protection,
         populate: bool,
     ) -> Result<MemoryMapping> {
-        let mut flags = libc::MAP_SHARED;
-        if populate {
-            flags |= libc::MAP_POPULATE;
+        unsafe {
+            // This is safe because we are creating an anonymous mapping in a place not already used
+            // by any other area in this process.
+            MemoryMapping::try_mmap_populate(None, size, prot.into(), Some((fd, offset)), populate)
         }
-        MemoryMapping::from_fd_offset_flags(fd, size, offset, flags, prot)
     }
 
     /// Creates an anonymous shared mapping of `size` bytes with `prot` protection.
@@ -213,13 +185,7 @@ impl MemoryMapping {
         size: usize,
         prot: Protection,
     ) -> Result<MemoryMapping> {
-        MemoryMapping::try_mmap(
-            Some(addr),
-            size,
-            prot.into(),
-            libc::MAP_ANONYMOUS | libc::MAP_SHARED | libc::MAP_NORESERVE,
-            None,
-        )
+        MemoryMapping::try_mmap(Some(addr), size, prot.into(), None)
     }
 
     /// Maps the `size` bytes starting at `offset` bytes of the given `fd` with
@@ -244,37 +210,45 @@ impl MemoryMapping {
         offset: u64,
         prot: Protection,
     ) -> Result<MemoryMapping> {
-        MemoryMapping::try_mmap(
-            Some(addr),
-            size,
-            prot.into(),
-            libc::MAP_SHARED | libc::MAP_NORESERVE,
-            Some((fd, offset)),
-        )
+        MemoryMapping::try_mmap(Some(addr), size, prot.into(), Some((fd, offset)))
     }
 
-    /// Helper wrapper around libc::mmap that does some basic validation, and calls
-    /// madvise with MADV_DONTDUMP on the created mmap
+    /// Helper wrapper around try_mmap_populate when without MAP_POPULATE
     unsafe fn try_mmap(
         addr: Option<*mut u8>,
         size: usize,
         prot: c_int,
-        flags: c_int,
         fd: Option<(&dyn AsRawDescriptor, u64)>,
     ) -> Result<MemoryMapping> {
-        let mut flags = flags;
-        // If addr is provided, set the FIXED flag, and validate addr alignment
+        MemoryMapping::try_mmap_populate(addr, size, prot, fd, false)
+    }
+
+    /// Helper wrapper around libc::mmap that does some basic validation, and calls
+    /// madvise with MADV_DONTDUMP on the created mmap
+    unsafe fn try_mmap_populate(
+        addr: Option<*mut u8>,
+        size: usize,
+        prot: c_int,
+        fd: Option<(&dyn AsRawDescriptor, u64)>,
+        populate: bool,
+    ) -> Result<MemoryMapping> {
+        let mut flags = libc::MAP_SHARED;
+        if populate {
+            flags |= libc::MAP_POPULATE;
+        }
+        // If addr is provided, set the (FIXED | NORESERVE) flag, and validate addr alignment.
         let addr = match addr {
             Some(addr) => {
                 if (addr as usize) % pagesize() != 0 {
                     return Err(Error::NotPageAligned);
                 }
-                flags |= libc::MAP_FIXED;
+                flags |= libc::MAP_FIXED | libc::MAP_NORESERVE;
                 addr as *mut libc::c_void
             }
             None => null_mut(),
         };
-        // If fd is provided, validate fd offset is within bounds
+        // If fd is provided, validate fd offset is within bounds. If not, it's anonymous mapping
+        // and set the (ANONYMOUS | NORESERVE) flag.
         let (fd, offset) = match fd {
             Some((fd, offset)) => {
                 if offset > libc::off64_t::max_value() as u64 {
@@ -282,7 +256,10 @@ impl MemoryMapping {
                 }
                 (fd.as_raw_descriptor(), offset as libc::off64_t)
             }
-            None => (-1, 0),
+            None => {
+                flags |= libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
+                (-1, 0)
+            }
         };
         let addr = libc::mmap64(addr, size, prot, flags, fd, offset);
         if addr == libc::MAP_FAILED {
