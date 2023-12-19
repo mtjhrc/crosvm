@@ -757,7 +757,7 @@ impl VhostUserSlaveReqHandler for DeviceRequestHandler {
         }
     }
 
-    fn restore(&mut self, data_bytes: &[u8], queue_evts: Option<Vec<File>>) -> VhostResult<()> {
+    fn restore(&mut self, data_bytes: &[u8], queue_evts: Vec<File>) -> VhostResult<()> {
         let device_request_handler_snapshot: DeviceRequestHandlerSnapshot =
             serde_json::from_slice(data_bytes).map_err(|e| {
                 error!("Failed to deserialize DeviceRequestHandlerSnapshot: {}", e);
@@ -769,7 +769,11 @@ impl VhostUserSlaveReqHandler for DeviceRequestHandler {
         let snapshotted_vrings = device_request_handler_snapshot.vrings;
         assert_eq!(snapshotted_vrings.len(), self.vrings.len());
 
-        let mut queue_evts_iter = queue_evts.map(Vec::into_iter);
+        let mut queue_evts_iter = if queue_evts.is_empty() {
+            None
+        } else {
+            Some(queue_evts.into_iter())
+        };
 
         for (index, (vring, snapshotted_vring)) in self
             .vrings
@@ -912,8 +916,9 @@ impl SharedMemoryMapper for VhostShmemMapper {
                 } => (descriptor, offset, size),
                 VmMemorySource::SharedMemory(shmem) => {
                     let size = shmem.size();
-                    // Safe because we own shmem.
                     let descriptor =
+                        // SAFETY:
+                        // Safe because we own shmem.
                         unsafe { SafeDescriptor::from_raw_descriptor(shmem.into_raw_descriptor()) };
                     (descriptor, 0, size)
                 }
