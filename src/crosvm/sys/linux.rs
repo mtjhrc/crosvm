@@ -1545,6 +1545,8 @@ where
     }
     // hotplug_manager must be created before vm is started since it forks jail warden process.
     #[cfg(feature = "pci-hotplug")]
+    // TODO(293801301): Remove unused_mut after aarch64 support
+    #[allow(unused_mut)]
     let mut hotplug_manager = if cfg.pci_hotplug_slots.is_some() {
         Some(PciHotPlugManager::new(
             vm.get_memory().clone(),
@@ -1754,6 +1756,8 @@ where
     )?;
 
     #[cfg(feature = "pci-hotplug")]
+    // TODO(293801301): Remove unused_variables after aarch64 support
+    #[allow(unused_variables)]
     let pci_hotplug_slots = cfg.pci_hotplug_slots;
     #[cfg(not(feature = "pci-hotplug"))]
     #[allow(unused_variables)]
@@ -3201,7 +3205,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                     }
                 }
                 Token::VmControl { id } => {
-                    #[cfg(target_arch = "x86_64")]
+                    #[cfg(any(target_arch = "x86_64", feature = "pci-hotplug"))]
                     let mut add_tubes = Vec::new();
                     #[cfg(any(target_arch = "x86_64", feature = "pci-hotplug"))]
                     let mut add_irq_control_tubes = Vec::new();
