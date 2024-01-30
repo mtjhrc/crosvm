@@ -149,6 +149,7 @@ use hypervisor::CpuConfigRiscv64;
 use hypervisor::CpuConfigX86_64;
 use hypervisor::Hypervisor;
 use hypervisor::HypervisorCap;
+use hypervisor::MemCacheType;
 use hypervisor::ProtectionType;
 use hypervisor::Vm;
 use hypervisor::VmCap;
@@ -891,6 +892,7 @@ fn create_file_backed_mappings(
             Box::new(memory_mapping),
             !mapping.writable,
             /* log_dirty_pages = */ false,
+            MemCacheType::CacheCoherent,
         )
         .context("failed to configure file-backed mapping")?;
     }
@@ -2075,6 +2077,7 @@ fn start_pci_root_worker(
                     source: VmMemorySource::SharedMemory(shmem),
                     dest: VmMemoryDestination::GuestPhysicalAddress(addr.0),
                     prot: Protection::read(),
+                    cache: MemCacheType::CacheCoherent,
                 })
                 .context("failed to send request")?;
             match self.vm_control_tube.recv::<VmMemoryResponse>() {
@@ -2346,6 +2349,7 @@ fn handle_hotplug_net_add<V: VmArch, Vcpu: VcpuArch>(
         vhost_net: None,
         vq_pairs: None,
         packed_queue: false,
+        pci_address: None,
     };
     let ret = add_hotplug_net(
         linux,
