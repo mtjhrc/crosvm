@@ -131,7 +131,6 @@ pub fn enable_core_scheduling() -> Result<()> {
             0,                            // ignored by PR_SCHED_CORE_CREATE command
         )
     } {
-        #[cfg(feature = "chromeos")]
         -1 => {
             // Chrome OS has an pre-upstream version of this functionality which might work.
             const PR_SET_CORE_SCHED: i32 = 0x200;
