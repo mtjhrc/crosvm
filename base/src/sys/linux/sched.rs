@@ -134,6 +134,7 @@ pub fn enable_core_scheduling() -> Result<()> {
         -1 => {
             // Chrome OS has an pre-upstream version of this functionality which might work.
             const PR_SET_CORE_SCHED: i32 = 0x200;
+            // SAFETY: Safe because we check the return value to prctl.
             unsafe { prctl(PR_SET_CORE_SCHED, 1) }
         }
         ret => ret,
