@@ -452,7 +452,6 @@ acpi_tables = { path = "acpi_tables" }
 vm_memory = { path = "vm_memory" }
 uuid = { version = "1", features = ["v4"] }
 zerocopy = { version = "0.7", features = ["derive"] }
-libchromeos = { path = "../../platform2/libchromeos-rs" } # provided by ebuild
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 riscv64 = { path = "riscv64" }
