@@ -50,6 +50,7 @@ pub use vm_control::gpu::DisplayMode as GpuDisplayMode;
 pub use vm_control::gpu::DisplayParameters as GpuDisplayParameters;
 use vm_control::gpu::GpuControlCommand;
 use vm_control::gpu::GpuControlResult;
+pub use vm_control::gpu::MouseMode as GpuMouseMode;
 pub use vm_control::gpu::DEFAULT_DISPLAY_HEIGHT;
 pub use vm_control::gpu::DEFAULT_DISPLAY_WIDTH;
 pub use vm_control::gpu::DEFAULT_REFRESH_RATE;
@@ -1271,7 +1272,8 @@ impl Gpu {
             .set_wsi(rutabaga_wsi)
             .set_use_external_blob(gpu_parameters.external_blob)
             .set_use_system_blob(gpu_parameters.system_blob)
-            .set_use_render_server(use_render_server);
+            .set_use_render_server(use_render_server)
+            .set_renderer_features(gpu_parameters.renderer_features.clone());
 
         #[cfg(windows)]
         let (gpu_display_wait_descriptor_ctrl_wr, gpu_display_wait_descriptor_ctrl_rd) =
