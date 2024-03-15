@@ -20,10 +20,10 @@ use serde::Deserialize;
 use serde::Serialize;
 use tube_transporter::packed_tube;
 
-use crate::master_req_handler::MasterReqHandler;
 use crate::Error;
+use crate::Frontend;
+use crate::FrontendServer;
 use crate::Result;
-use crate::VhostUserMasterReqHandler;
 
 /// Alias to enable platform independent code.
 pub type SystemStream = Tube;
@@ -191,8 +191,8 @@ impl AsRawDescriptor for TubePlatformConnection {
     }
 }
 
-impl<S: VhostUserMasterReqHandler> MasterReqHandler<S> {
-    /// Create a `MasterReqHandler` that uses a Tube internally. Must specify the backend process
+impl<S: Frontend> FrontendServer<S> {
+    /// Create a `FrontendServer` that uses a Tube internally. Must specify the backend process
     /// which will receive the Tube.
     pub fn with_tube(backend: S, backend_pid: u32) -> Result<Self> {
         Self::new(
@@ -207,14 +207,14 @@ impl<S: VhostUserMasterReqHandler> MasterReqHandler<S> {
     }
 }
 
-impl<S: VhostUserMasterReqHandler> ReadNotifier for MasterReqHandler<S> {
+impl<S: Frontend> ReadNotifier for FrontendServer<S> {
     /// Used for polling.
     fn get_read_notifier(&self) -> &dyn AsRawDescriptor {
         self.sub_sock.0.get_tube().get_read_notifier()
     }
 }
 
-impl<S: VhostUserMasterReqHandler> CloseNotifier for MasterReqHandler<S> {
+impl<S: Frontend> CloseNotifier for FrontendServer<S> {
     /// Used for closing.
     fn get_close_notifier(&self) -> &dyn AsRawDescriptor {
         self.sub_sock.0.get_tube().get_close_notifier()
@@ -223,34 +223,34 @@ impl<S: VhostUserMasterReqHandler> CloseNotifier for MasterReqHandler<S> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::master::Master;
+    use crate::backend_client::BackendClient;
+    use crate::backend_server::Backend;
+    use crate::backend_server::BackendServer;
     use crate::message::MasterReq;
-    use crate::slave_req_handler::SlaveReqHandler;
-    use crate::slave_req_handler::VhostUserSlaveReqHandler;
     use crate::Connection;
     use crate::SystemStream;
 
-    pub(crate) fn create_pair() -> (Master, Connection<MasterReq>) {
-        let (master_tube, slave_tube) = SystemStream::pair().unwrap();
-        let master = Master::from_stream(master_tube);
-        (master, Connection::from(slave_tube))
+    pub(crate) fn create_pair() -> (BackendClient, Connection<MasterReq>) {
+        let (client_tube, server_tube) = SystemStream::pair().unwrap();
+        let backend_client = BackendClient::from_stream(client_tube);
+        (backend_client, Connection::from(server_tube))
     }
 
     pub(crate) fn create_connection_pair() -> (Connection<MasterReq>, Connection<MasterReq>) {
-        let (master_tube, slave_tube) = SystemStream::pair().unwrap();
-        let master = Connection::<MasterReq>::from(master_tube);
-        (master, Connection::from(slave_tube))
+        let (client_tube, server_tube) = SystemStream::pair().unwrap();
+        let backend_connection = Connection::<MasterReq>::from(client_tube);
+        (backend_connection, Connection::from(server_tube))
     }
 
-    pub(crate) fn create_master_slave_pair<S>(backend: S) -> (Master, SlaveReqHandler<S>)
+    pub(crate) fn create_master_slave_pair<S>(backend: S) -> (BackendClient, BackendServer<S>)
     where
-        S: VhostUserSlaveReqHandler,
+        S: Backend,
     {
-        let (master_tube, slave_tube) = SystemStream::pair().unwrap();
-        let master = Master::from_stream(master_tube);
+        let (client_tube, server_tube) = SystemStream::pair().unwrap();
+        let backend_client = BackendClient::from_stream(client_tube);
         (
-            master,
-            SlaveReqHandler::<S>::from_stream(slave_tube, backend),
+            backend_client,
+            BackendServer::<S>::from_stream(server_tube, backend),
         )
     }
 }

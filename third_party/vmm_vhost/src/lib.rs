@@ -52,16 +52,16 @@ pub use message::SlaveReq;
 pub use sys::SystemStream;
 pub use sys::*;
 
-pub(crate) mod master;
-pub use self::master::Master;
-mod master_req_handler;
-pub use self::master_req_handler::VhostUserMasterReqHandler;
-mod slave_proxy;
-mod slave_req_handler;
-pub use self::master_req_handler::MasterReqHandler;
-pub use self::slave_proxy::Slave;
-pub use self::slave_req_handler::SlaveReqHandler;
-pub use self::slave_req_handler::VhostUserSlaveReqHandler;
+pub(crate) mod backend_client;
+pub use backend_client::BackendClient;
+mod frontend_server;
+pub use self::frontend_server::Frontend;
+mod backend_server;
+mod frontend_client;
+pub use self::backend_server::Backend;
+pub use self::backend_server::BackendServer;
+pub use self::frontend_client::FrontendClient;
+pub use self::frontend_server::FrontendServer;
 
 /// Errors for vhost-user operations
 #[sorted]
@@ -229,7 +229,7 @@ pub(crate) fn into_single_file(mut files: Vec<File>) -> Option<File> {
 }
 
 #[cfg(test)]
-mod dummy_slave;
+mod test_backend;
 
 #[cfg(test)]
 mod tests {
@@ -241,17 +241,17 @@ mod tests {
     use tempfile::tempfile;
 
     use super::*;
-    use crate::dummy_slave::DummySlaveReqHandler;
-    use crate::dummy_slave::VIRTIO_FEATURES;
     use crate::message::*;
     pub(crate) use crate::sys::tests::create_connection_pair;
     pub(crate) use crate::sys::tests::create_master_slave_pair;
     pub(crate) use crate::sys::tests::create_pair;
+    use crate::test_backend::TestBackend;
+    use crate::test_backend::VIRTIO_FEATURES;
     use crate::VhostUserMemoryRegionInfo;
     use crate::VringConfigData;
 
     /// Utility function to process a header and a message together.
-    fn handle_request(h: &mut SlaveReqHandler<DummySlaveReqHandler>) -> Result<()> {
+    fn handle_request(h: &mut BackendServer<TestBackend>) -> Result<()> {
         // We assume that a header comes together with message body in tests so we don't wait before
         // calling `process_message()`.
         let (hdr, files) = h.recv_header()?;
@@ -259,17 +259,17 @@ mod tests {
     }
 
     #[test]
-    fn create_dummy_slave() {
-        let mut slave = DummySlaveReqHandler::new();
+    fn create_test_backend() {
+        let mut backend = TestBackend::new();
 
-        slave.set_owner().unwrap();
-        assert!(slave.set_owner().is_err());
+        backend.set_owner().unwrap();
+        assert!(backend.set_owner().is_err());
     }
 
     #[test]
     fn test_set_owner() {
-        let slave_be = DummySlaveReqHandler::new();
-        let (master, mut slave) = create_master_slave_pair(slave_be);
+        let test_backend = TestBackend::new();
+        let (master, mut slave) = create_master_slave_pair(test_backend);
 
         assert!(!slave.as_ref().owned);
         master.set_owner().unwrap();
@@ -284,8 +284,8 @@ mod tests {
     fn test_set_features() {
         let mbar = Arc::new(Barrier::new(2));
         let sbar = mbar.clone();
-        let slave_be = DummySlaveReqHandler::new();
-        let (mut master, mut slave) = create_master_slave_pair(slave_be);
+        let test_backend = TestBackend::new();
+        let (mut master, mut slave) = create_master_slave_pair(test_backend);
 
         thread::spawn(move || {
             handle_request(&mut slave).unwrap();
@@ -324,8 +324,8 @@ mod tests {
     fn test_master_slave_process() {
         let mbar = Arc::new(Barrier::new(2));
         let sbar = mbar.clone();
-        let slave_be = DummySlaveReqHandler::new();
-        let (mut master, mut slave) = create_master_slave_pair(slave_be);
+        let test_backend = TestBackend::new();
+        let (mut master, mut slave) = create_master_slave_pair(test_backend);
 
         thread::spawn(move || {
             // set_own()

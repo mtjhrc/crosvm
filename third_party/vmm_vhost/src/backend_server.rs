@@ -21,22 +21,11 @@ use crate::Result;
 use crate::SlaveReq;
 use crate::SystemStream;
 
-/// Services provided to the master by the slave.
+/// Trait for vhost-user backends.
 ///
-/// The [VhostUserSlaveReqHandler] trait defines the services provided to the master by the slave.
-/// The vhost-user specification defines a master communication channel, by which masters could
-/// request services from slaves. The [VhostUserSlaveReqHandler] trait defines services provided by
-/// slaves, and it's used both on the master side and slave side.
-///
-/// - on the master side, a stub forwarder implementing [VhostUserSlaveReqHandler] will proxy
-///   service requests to slaves.
-/// - on the slave side, the [SlaveReqHandler] will forward service requests to a handler
-///   implementing [VhostUserSlaveReqHandler].
-///
-/// [VhostUserSlaveReqHandler]: trait.VhostUserSlaveReqHandler.html
-/// [SlaveReqHandler]: struct.SlaveReqHandler.html
+/// Each method corresponds to a vhost-user protocol method. See the specification for details.
 #[allow(missing_docs)]
-pub trait VhostUserSlaveReqHandler {
+pub trait Backend {
     fn set_owner(&mut self) -> Result<()>;
     fn reset_owner(&mut self) -> Result<()>;
     fn get_features(&mut self) -> Result<u64>;
@@ -89,9 +78,9 @@ pub trait VhostUserSlaveReqHandler {
     fn restore(&mut self, data_bytes: &[u8], queue_evts: Vec<File>) -> Result<()>;
 }
 
-impl<T> VhostUserSlaveReqHandler for T
+impl<T> Backend for T
 where
-    T: AsMut<dyn VhostUserSlaveReqHandler>,
+    T: AsMut<dyn Backend>,
 {
     fn set_owner(&mut self) -> Result<()> {
         self.as_mut().set_owner()
@@ -227,18 +216,8 @@ where
     }
 }
 
-/// Server to handle service requests from masters from the master communication channel.
-///
-/// The [SlaveReqHandler] acts as a server on the slave side, to handle service requests from
-/// masters on the master communication channel. It's actually a proxy invoking the registered
-/// handler implementing [VhostUserSlaveReqHandler] to do the real work.
-///
-/// The lifetime of the SlaveReqHandler object should be the same as the underline Unix Domain
-/// Socket, so it gets simpler to recover from disconnect.
-///
-/// [VhostUserSlaveReqHandler]: trait.VhostUserSlaveReqHandler.html
-/// [SlaveReqHandler]: struct.SlaveReqHandler.html
-pub struct SlaveReqHandler<S: VhostUserSlaveReqHandler> {
+/// Handles requests from a vhost-user connection by dispatching them to [[Backend]] methods.
+pub struct BackendServer<S: Backend> {
     /// Underlying connection for communication.
     connection: Connection<MasterReq>,
     // the vhost-user backend device object
@@ -253,23 +232,22 @@ pub struct SlaveReqHandler<S: VhostUserSlaveReqHandler> {
     reply_ack_enabled: bool,
 }
 
-impl<S: VhostUserSlaveReqHandler> SlaveReqHandler<S> {
-    /// Create a vhost-user slave connection from a connected socket.
+impl<S: Backend> BackendServer<S> {
+    /// Create a backend server from a connected socket.
     pub fn from_stream(socket: SystemStream, backend: S) -> Self {
         Self::new(Connection::from(socket), backend)
     }
 }
 
-impl<S: VhostUserSlaveReqHandler> AsRef<S> for SlaveReqHandler<S> {
+impl<S: Backend> AsRef<S> for BackendServer<S> {
     fn as_ref(&self) -> &S {
         &self.backend
     }
 }
 
-impl<S: VhostUserSlaveReqHandler> SlaveReqHandler<S> {
-    /// Create a vhost-user slave connection.
+impl<S: Backend> BackendServer<S> {
     pub fn new(connection: Connection<MasterReq>, backend: S) -> Self {
-        SlaveReqHandler {
+        BackendServer {
             connection,
             backend,
             virtio_features: 0,
@@ -294,17 +272,17 @@ impl<S: VhostUserSlaveReqHandler> SlaveReqHandler<S> {
     /// 5. Receives optional payloads.
     /// 6. Processes the message.
     ///
-    /// This method [`SlaveReqHandler::recv_header()`] is in charge of the step (1) and (2),
-    /// [`SlaveReqHandler::needs_wait_for_payload()`] is (3), and
-    /// [`SlaveReqHandler::process_message()`] is (5) and (6).
-    /// We need to have the three method separately for multi-platform supports;
-    /// [`SlaveReqHandler::recv_header()`] and [`SlaveReqHandler::process_message()`] need to be
-    /// separated because the way of waiting for incoming messages differs between Unix and Windows
-    /// so it's the caller's responsibility to wait before [`SlaveReqHandler::process_message()`].
+    /// This method [`BackendServer::recv_header()`] is in charge of the step (1) and (2),
+    /// [`BackendServer::needs_wait_for_payload()`] is (3), and
+    /// [`BackendServer::process_message()`] is (5) and (6). We need to have the three method
+    /// separately for multi-platform supports; [`BackendServer::recv_header()`] and
+    /// [`BackendServer::process_message()`] need to be separated because the way of waiting for
+    /// incoming messages differs between Unix and Windows so it's the caller's responsibility to
+    /// wait before [`BackendServer::process_message()`].
     ///
     /// Note that some vhost-user protocol variant such as VVU doesn't assume stream mode. In this
     /// case, a message header and its body are sent together so the step (4) is skipped. We handle
-    /// this case in [`SlaveReqHandler::needs_wait_for_payload()`].
+    /// this case in [`BackendServer::needs_wait_for_payload()`].
     ///
     /// The following pseudo code describes how a caller should process incoming vhost-user
     /// messages:
@@ -315,16 +293,16 @@ impl<S: VhostUserSlaveReqHandler> SlaveReqHandler<S> {
     ///   connection.wait_readable().unwrap();
     ///
     ///   // (1) and (2)
-    ///   let (hdr, files) = slave_req_handler.recv_header();
+    ///   let (hdr, files) = backend_server.recv_header();
     ///
     ///   // (3)
-    ///   if slave_req_handler.needs_wait_for_payload(&hdr) {
+    ///   if backend_server.needs_wait_for_payload(&hdr) {
     ///     // (4) block until a payload comes if needed.
     ///     connection.wait_readable().unwrap();
     ///   }
     ///
     ///   // (5) and (6)
-    ///   slave_req_handler.process_message(&hdr, &files).unwrap();
+    ///   backend_server.process_message(&hdr, &files).unwrap();
     /// }
     /// ```
     pub fn recv_header(&mut self) -> Result<(VhostUserMsgHeader<MasterReq>, Vec<File>)> {
@@ -355,9 +333,9 @@ impl<S: VhostUserSlaveReqHandler> SlaveReqHandler<S> {
     }
 
     /// Returns whether the caller needs to wait for the incoming message before calling
-    /// [`SlaveReqHandler::process_message`].
+    /// [`BackendServer::process_message`].
     ///
-    /// See [`SlaveReqHandler::recv_header`]'s doc comment for the usage.
+    /// See [`BackendServer::recv_header`]'s doc comment for the usage.
     pub fn needs_wait_for_payload(&self, hdr: &VhostUserMsgHeader<MasterReq>) -> bool {
         // Since the vhost-user protocol uses stream mode, we need to wait until an additional
         // payload is available if exists.
@@ -366,12 +344,13 @@ impl<S: VhostUserSlaveReqHandler> SlaveReqHandler<S> {
 
     /// Main entrance to request from the communication channel.
     ///
-    /// Receive and handle one incoming request message from the vmm.
-    /// See [`SlaveReqHandler::recv_header`]'s doc comment for the usage.
+    /// Receive and handle one incoming request message from the frontend.
+    /// See [`BackendServer::recv_header`]'s doc comment for the usage.
     ///
     /// # Return:
     /// * - `Ok(())`: one request was successfully handled.
-    /// * - `Err(ClientExit)`: the vmm closed the connection properly. This isn't an actual failure.
+    /// * - `Err(ClientExit)`: the frontend closed the connection properly. This isn't an actual
+    ///   failure.
     /// * - `Err(Disconnect)`: the connection was closed unexpectedly.
     /// * - `Err(InvalidMessage)`: the vmm sent a illegal message.
     /// * - other errors: failed to handle a request.
@@ -754,9 +733,8 @@ impl<S: VhostUserSlaveReqHandler> SlaveReqHandler<S> {
         };
         let res = self.backend.get_config(msg.offset, msg.size, flags);
 
-        // vhost-user slave's payload size MUST match master's request
-        // on success, uses zero length of payload to indicate an error
-        // to vhost-user master.
+        // The response payload size MUST match the request payload size on success. A zero length
+        // response is used to indicate an error.
         match res {
             Ok(ref buf) if buf.len() == msg.size as usize => {
                 let reply = VhostUserConfig::new(msg.offset, buf.len() as u32, flags);
@@ -888,7 +866,7 @@ impl<S: VhostUserSlaveReqHandler> SlaveReqHandler<S> {
     }
 }
 
-impl<S: VhostUserSlaveReqHandler> AsRawDescriptor for SlaveReqHandler<S> {
+impl<S: Backend> AsRawDescriptor for BackendServer<S> {
     fn as_raw_descriptor(&self) -> RawDescriptor {
         // TODO(b/221882601): figure out if this used for polling.
         self.connection.as_raw_descriptor()
@@ -900,16 +878,16 @@ mod tests {
     use base::INVALID_DESCRIPTOR;
 
     use super::*;
-    use crate::dummy_slave::DummySlaveReqHandler;
+    use crate::test_backend::TestBackend;
     use crate::Connection;
     use crate::SystemStream;
 
     #[test]
-    fn test_slave_req_handler_new() {
+    fn test_backend_server_new() {
         let (p1, _p2) = SystemStream::pair().unwrap();
         let connection = Connection::from(p1);
-        let backend = DummySlaveReqHandler::new();
-        let handler = SlaveReqHandler::new(connection, backend);
+        let backend = TestBackend::new();
+        let handler = BackendServer::new(connection, backend);
 
         assert!(handler.as_raw_descriptor() != INVALID_DESCRIPTOR);
     }

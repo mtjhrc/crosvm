@@ -4,9 +4,9 @@
 use std::fs::File;
 
 use crate::message::*;
+use crate::Backend;
 use crate::Error;
 use crate::Result;
-use crate::VhostUserSlaveReqHandler;
 
 pub const MAX_QUEUE_NUM: usize = 2;
 pub const MAX_VRING_NUM: usize = 256;
@@ -14,7 +14,7 @@ pub const MAX_MEM_SLOTS: usize = 32;
 pub const VIRTIO_FEATURES: u64 = 0x40000003;
 
 #[derive(Default)]
-pub struct DummySlaveReqHandler {
+pub struct TestBackend {
     pub owned: bool,
     pub features_acked: bool,
     pub acked_features: u64,
@@ -30,16 +30,16 @@ pub struct DummySlaveReqHandler {
     pub inflight_file: Option<File>,
 }
 
-impl DummySlaveReqHandler {
+impl TestBackend {
     pub fn new() -> Self {
-        DummySlaveReqHandler {
+        TestBackend {
             queue_num: MAX_QUEUE_NUM,
             ..Default::default()
         }
     }
 }
 
-impl VhostUserSlaveReqHandler for DummySlaveReqHandler {
+impl Backend for TestBackend {
     fn set_owner(&mut self) -> Result<()> {
         if self.owned {
             return Err(Error::InvalidOperation);

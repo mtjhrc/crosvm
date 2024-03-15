@@ -91,11 +91,10 @@ use vmm_vhost::message::VhostUserVringAddrFlags;
 use vmm_vhost::message::VhostUserVringState;
 use vmm_vhost::Connection;
 use vmm_vhost::Error as VhostError;
+use vmm_vhost::Frontend;
+use vmm_vhost::FrontendClient;
 use vmm_vhost::Result as VhostResult;
-use vmm_vhost::Slave;
 use vmm_vhost::SlaveReq;
-use vmm_vhost::VhostUserMasterReqHandler;
-use vmm_vhost::VhostUserSlaveReqHandler;
 use vmm_vhost::VHOST_USER_F_PROTOCOL_FEATURES;
 
 use crate::virtio::Interrupt;
@@ -391,7 +390,7 @@ impl DeviceRequestHandler {
     }
 }
 
-impl VhostUserSlaveReqHandler for DeviceRequestHandler {
+impl vmm_vhost::Backend for DeviceRequestHandler {
     fn set_owner(&mut self) -> VhostResult<()> {
         if self.owned {
             return Err(VhostError::InvalidOperation);
@@ -653,7 +652,7 @@ impl VhostUserSlaveReqHandler for DeviceRequestHandler {
 
     fn set_slave_req_fd(&mut self, ep: Connection<SlaveReq>) {
         let conn = Arc::new(VhostBackendReqConnection::new(
-            Slave::new(ep),
+            FrontendClient::new(ep),
             self.backend.get_shared_memory_region().map(|r| r.id),
         ));
 
@@ -821,7 +820,7 @@ pub enum VhostBackendReqConnectionState {
 
 /// Keeps track of Vhost user backend request connection.
 pub struct VhostBackendReqConnection {
-    conn: Arc<Mutex<Slave>>,
+    conn: Arc<Mutex<FrontendClient>>,
     shmem_info: Mutex<Option<ShmemInfo>>,
 }
 
@@ -832,7 +831,7 @@ struct ShmemInfo {
 }
 
 impl VhostBackendReqConnection {
-    pub fn new(conn: Slave, shmid: Option<u8>) -> Self {
+    pub fn new(conn: FrontendClient, shmid: Option<u8>) -> Self {
         let shmem_info = Mutex::new(shmid.map(|shmid| ShmemInfo {
             shmid,
             mapped_regions: BTreeMap::new(),
@@ -868,7 +867,7 @@ impl VhostBackendReqConnection {
 }
 
 struct VhostShmemMapper {
-    conn: Arc<Mutex<Slave>>,
+    conn: Arc<Mutex<FrontendClient>>,
     shmem_info: ShmemInfo,
 }
 
@@ -988,8 +987,7 @@ mod tests {
     use anyhow::anyhow;
     use anyhow::bail;
     use base::Event;
-    use vmm_vhost::SlaveReqHandler;
-    use vmm_vhost::VhostUserSlaveReqHandler;
+    use vmm_vhost::BackendServer;
     use zerocopy::AsBytes;
     use zerocopy::FromBytes;
     use zerocopy::FromZeroes;
@@ -1198,8 +1196,8 @@ mod tests {
         }
     }
 
-    fn handle_request<S: VhostUserSlaveReqHandler>(
-        handler: &mut SlaveReqHandler<S>,
+    fn handle_request<S: vmm_vhost::Backend>(
+        handler: &mut BackendServer<S>,
     ) -> Result<(), VhostError> {
         let (hdr, files) = handler.recv_header()?;
         handler.process_message(hdr, files)
