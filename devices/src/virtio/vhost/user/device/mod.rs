@@ -15,7 +15,6 @@ pub mod snd;
 pub use block::run_block_device;
 pub use block::Options as BlockOptions;
 use cros_async::Executor;
-use cros_async::ExecutorKind;
 #[cfg(feature = "gpu")]
 pub use gpu::run_gpu_device;
 #[cfg(feature = "gpu")]
@@ -62,9 +61,6 @@ cfg_if::cfg_if! {
 /// only after jailing, which ensures that any operations by the request handler is done in the
 /// jailed process.
 pub trait VhostUserDevice {
-    /// The maximum number of queues that this device can manage.
-    fn max_queue_num(&self) -> usize;
-
     /// Turn this device into a vhost-user request handler that will run the device.
     ///
     /// `ex` is an executor the device can use to schedule its tasks.
@@ -72,10 +68,4 @@ pub trait VhostUserDevice {
         self: Box<Self>,
         ex: &Executor,
     ) -> anyhow::Result<Box<dyn vmm_vhost::Backend>>;
-
-    /// The preferred ExecutorKind of an Executor to accept by
-    /// [`VhostUserDevice::into_req_handler()`].
-    fn executor_kind(&self) -> Option<ExecutorKind> {
-        None
-    }
 }
