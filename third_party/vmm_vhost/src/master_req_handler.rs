@@ -1,14 +1,6 @@
 // Copyright (C) 2019-2021 Alibaba Cloud. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-cfg_if::cfg_if! {
-    if #[cfg(unix)] {
-        mod unix;
-    } else if #[cfg(windows)] {
-        mod windows;
-    }
-}
-
 use std::fs::File;
 use std::mem;
 
@@ -56,34 +48,6 @@ pub trait VhostUserMasterReqHandler {
         Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
-    /// Handle virtio-fs map file requests.
-    fn fs_slave_map(
-        &mut self,
-        _fs: &VhostUserFSSlaveMsg,
-        _fd: &dyn AsRawDescriptor,
-    ) -> HandlerResult<u64> {
-        Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
-    }
-
-    /// Handle virtio-fs unmap file requests.
-    fn fs_slave_unmap(&mut self, _fs: &VhostUserFSSlaveMsg) -> HandlerResult<u64> {
-        Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
-    }
-
-    /// Handle virtio-fs sync file requests.
-    fn fs_slave_sync(&mut self, _fs: &VhostUserFSSlaveMsg) -> HandlerResult<u64> {
-        Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
-    }
-
-    /// Handle virtio-fs file IO requests.
-    fn fs_slave_io(
-        &mut self,
-        _fs: &VhostUserFSSlaveMsg,
-        _fd: &dyn AsRawDescriptor,
-    ) -> HandlerResult<u64> {
-        Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
-    }
-
     // fn handle_iotlb_msg(&mut self, iotlb: VhostUserIotlb);
     // fn handle_vring_host_notifier(&mut self, area: VhostUserVringArea, fd: RawDescriptor);
 
@@ -112,7 +76,7 @@ pub trait VhostUserMasterReqHandler {
 /// Server to handle service requests from slaves from the slave communication channel.
 pub struct MasterReqHandler<S: VhostUserMasterReqHandler> {
     // underlying Unix domain socket for communication
-    sub_sock: Connection<SlaveReq>,
+    pub(crate) sub_sock: Connection<SlaveReq>,
     tx_sock: Option<SystemStream>,
     // Serializes tx_sock for passing to the backend.
     serialize_tx: Box<dyn Fn(SystemStream) -> SafeDescriptor + Send>,
@@ -212,32 +176,6 @@ impl<S: VhostUserMasterReqHandler> MasterReqHandler<S> {
                     .shmem_unmap(&msg)
                     .map_err(Error::ReqHandlerError)
             }
-            Ok(SlaveReq::FS_MAP) => {
-                let msg = self.extract_msg_body::<VhostUserFSSlaveMsg>(&hdr, size, &buf)?;
-                // check_attached_files() has validated files
-                self.backend
-                    .fs_slave_map(&msg, &files[0])
-                    .map_err(Error::ReqHandlerError)
-            }
-            Ok(SlaveReq::FS_UNMAP) => {
-                let msg = self.extract_msg_body::<VhostUserFSSlaveMsg>(&hdr, size, &buf)?;
-                self.backend
-                    .fs_slave_unmap(&msg)
-                    .map_err(Error::ReqHandlerError)
-            }
-            Ok(SlaveReq::FS_SYNC) => {
-                let msg = self.extract_msg_body::<VhostUserFSSlaveMsg>(&hdr, size, &buf)?;
-                self.backend
-                    .fs_slave_sync(&msg)
-                    .map_err(Error::ReqHandlerError)
-            }
-            Ok(SlaveReq::FS_IO) => {
-                let msg = self.extract_msg_body::<VhostUserFSSlaveMsg>(&hdr, size, &buf)?;
-                // check_attached_files() has validated files
-                self.backend
-                    .fs_slave_io(&msg, &files[0])
-                    .map_err(Error::ReqHandlerError)
-            }
             Ok(SlaveReq::GPU_MAP) => {
                 let msg = self.extract_msg_body::<VhostUserGpuMapMsg>(&hdr, size, &buf)?;
                 // check_attached_files() has validated files
@@ -282,7 +220,7 @@ impl<S: VhostUserMasterReqHandler> MasterReqHandler<S> {
     ) -> Result<()> {
         let expected_num_files = match hdr.get_code().map_err(|_| Error::InvalidMessage)? {
             // Expect a single file is passed.
-            SlaveReq::SHMEM_MAP | SlaveReq::FS_MAP | SlaveReq::FS_IO | SlaveReq::GPU_MAP => 1,
+            SlaveReq::SHMEM_MAP | SlaveReq::GPU_MAP => 1,
             _ => 0,
         };
 
