@@ -40,7 +40,7 @@ impl VhostUserListener {
 }
 
 /// Attaches to an already bound socket via `listener` and handles incoming messages from the
-/// VMM, which are dispatched to the device backend via the `VhostUserBackend` trait methods.
+/// VMM, which are dispatched to the device backend via the `VhostUserDevice` trait methods.
 async fn run_with_handler(
     mut listener: SocketListener,
     handler: Box<dyn vmm_vhost::Backend>,
@@ -83,9 +83,6 @@ impl VhostUserListenerTrait for VhostUserListener {
         Self::new_socket(path, keep_rds)
     }
 
-    /// Returns a future that runs a `VhostUserSlaveReqHandler` using this listener.
-    ///
-    /// `ex` is the executor on which the request handler can schedule its own tasks.
     fn run_req_handler<'e>(
         self,
         handler: Box<dyn vmm_vhost::Backend>,

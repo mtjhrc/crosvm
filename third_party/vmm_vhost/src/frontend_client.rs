@@ -9,17 +9,17 @@ use base::RawDescriptor;
 use zerocopy::AsBytes;
 
 use crate::message::*;
+use crate::BackendReq;
 use crate::Connection;
 use crate::Error;
 use crate::Frontend;
 use crate::HandlerResult;
 use crate::Result;
-use crate::SlaveReq;
 use crate::SystemStream;
 
 /// Client for a vhost-user frontend. Allows a backend to send requests to the frontend.
 pub struct FrontendClient {
-    sock: Connection<SlaveReq>,
+    sock: Connection<BackendReq>,
 
     // Protocol feature VHOST_USER_PROTOCOL_F_REPLY_ACK has been negotiated.
     reply_ack_negotiated: bool,
@@ -30,7 +30,7 @@ pub struct FrontendClient {
 
 impl FrontendClient {
     /// Create a new instance from the given connection.
-    pub fn new(ep: Connection<SlaveReq>) -> Self {
+    pub fn new(ep: Connection<BackendReq>) -> Self {
         FrontendClient {
             sock: ep,
             reply_ack_negotiated: false,
@@ -45,7 +45,7 @@ impl FrontendClient {
 
     fn send_message<T>(
         &mut self,
-        request: SlaveReq,
+        request: BackendReq,
         msg: &T,
         fds: Option<&[RawDescriptor]>,
     ) -> HandlerResult<u64>
@@ -65,12 +65,12 @@ impl FrontendClient {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
     }
 
-    fn wait_for_reply(&mut self, hdr: &VhostUserMsgHeader<SlaveReq>) -> Result<u64> {
+    fn wait_for_reply(&mut self, hdr: &VhostUserMsgHeader<BackendReq>) -> Result<u64> {
         let code = hdr.get_code().map_err(|_| Error::InvalidMessage)?;
-        if code != SlaveReq::SHMEM_MAP
-            && code != SlaveReq::SHMEM_UNMAP
-            && code != SlaveReq::GPU_MAP
-            && code != SlaveReq::EXTERNAL_MAP
+        if code != BackendReq::SHMEM_MAP
+            && code != BackendReq::SHMEM_UNMAP
+            && code != BackendReq::GPU_MAP
+            && code != BackendReq::EXTERNAL_MAP
             && !self.reply_ack_negotiated
         {
             return Ok(0);
@@ -81,7 +81,7 @@ impl FrontendClient {
             return Err(Error::InvalidMessage);
         }
         if body.value != 0 {
-            return Err(Error::MasterInternalError);
+            return Err(Error::FrontendInternalError);
         }
 
         Ok(body.value)
@@ -89,8 +89,8 @@ impl FrontendClient {
 
     /// Set the negotiation state of the `VHOST_USER_PROTOCOL_F_REPLY_ACK` protocol feature.
     ///
-    /// When the `VHOST_USER_PROTOCOL_F_REPLY_ACK` protocol feature has been negotiated,
-    /// the "REPLY_ACK" flag will be set in the message header for every slave to master request
+    /// When the `VHOST_USER_PROTOCOL_F_REPLY_ACK` protocol feature has been negotiated, the
+    /// "REPLY_ACK" flag will be set in the message header for every backend to frontend request
     /// message.
     pub fn set_reply_ack_flag(&mut self, enable: bool) {
         self.reply_ack_negotiated = enable;
@@ -109,17 +109,17 @@ impl Frontend for FrontendClient {
         req: &VhostUserShmemMapMsg,
         fd: &dyn AsRawDescriptor,
     ) -> HandlerResult<u64> {
-        self.send_message(SlaveReq::SHMEM_MAP, req, Some(&[fd.as_raw_descriptor()]))
+        self.send_message(BackendReq::SHMEM_MAP, req, Some(&[fd.as_raw_descriptor()]))
     }
 
     /// Handle shared memory region unmapping requests.
     fn shmem_unmap(&mut self, req: &VhostUserShmemUnmapMsg) -> HandlerResult<u64> {
-        self.send_message(SlaveReq::SHMEM_UNMAP, req, None)
+        self.send_message(BackendReq::SHMEM_UNMAP, req, None)
     }
 
     /// Handle config change requests.
     fn handle_config_change(&mut self) -> HandlerResult<u64> {
-        self.send_message(SlaveReq::CONFIG_CHANGE_MSG, &VhostUserEmptyMessage, None)
+        self.send_message(BackendReq::CONFIG_CHANGE_MSG, &VhostUserEmptyMessage, None)
     }
 
     /// Handle GPU shared memory region mapping requests.
@@ -129,7 +129,7 @@ impl Frontend for FrontendClient {
         descriptor: &dyn AsRawDescriptor,
     ) -> HandlerResult<u64> {
         self.send_message(
-            SlaveReq::GPU_MAP,
+            BackendReq::GPU_MAP,
             req,
             Some(&[descriptor.as_raw_descriptor()]),
         )
@@ -137,7 +137,7 @@ impl Frontend for FrontendClient {
 
     /// Handle external memory region mapping requests.
     fn external_map(&mut self, req: &VhostUserExternalMapMsg) -> HandlerResult<u64> {
-        self.send_message(SlaveReq::EXTERNAL_MAP, req, None)
+        self.send_message(BackendReq::EXTERNAL_MAP, req, None)
     }
 }
 
@@ -148,7 +148,7 @@ mod tests {
     use crate::SystemStream;
 
     #[test]
-    fn test_slave_req_set_failed() {
+    fn test_backend_req_set_failed() {
         let (p1, _p2) = SystemStream::pair().unwrap();
         let mut frontend_client = FrontendClient::from_stream(p1);
 
