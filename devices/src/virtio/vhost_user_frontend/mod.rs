@@ -4,6 +4,12 @@
 
 //! VirtioDevice implementation for the VMM side of a vhost-user connection.
 
+mod error;
+mod fs;
+mod handler;
+mod sys;
+mod worker;
+
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -28,12 +34,12 @@ use vmm_vhost::VHOST_USER_F_PROTOCOL_FEATURES;
 use crate::pci::MsixConfig;
 use crate::virtio::copy_config;
 use crate::virtio::device_constants::VIRTIO_DEVICE_TYPE_SPECIFIC_FEATURES_MASK;
-use crate::virtio::vhost::user::vmm::handler::sys::create_backend_req_handler;
-use crate::virtio::vhost::user::vmm::handler::worker::Worker;
-use crate::virtio::vhost::user::vmm::handler::BackendReqHandler;
-use crate::virtio::vhost::user::vmm::handler::BackendReqHandlerImpl;
-use crate::virtio::vhost::user::vmm::Error;
-use crate::virtio::vhost::user::vmm::Result;
+use crate::virtio::vhost_user_frontend::error::Error;
+use crate::virtio::vhost_user_frontend::error::Result;
+use crate::virtio::vhost_user_frontend::handler::BackendReqHandler;
+use crate::virtio::vhost_user_frontend::handler::BackendReqHandlerImpl;
+use crate::virtio::vhost_user_frontend::sys::create_backend_req_handler;
+use crate::virtio::vhost_user_frontend::worker::Worker;
 use crate::virtio::DeviceType;
 use crate::virtio::Interrupt;
 use crate::virtio::Queue;
@@ -43,7 +49,7 @@ use crate::virtio::SharedMemoryRegion;
 use crate::virtio::VirtioDevice;
 use crate::PciAddress;
 
-pub struct VhostUserVirtioDevice {
+pub struct VhostUserFrontend {
     device_type: DeviceType,
     worker_thread: Option<WorkerThread<()>>,
 
@@ -73,7 +79,7 @@ fn power_of_two_le(val: u16) -> Option<u16> {
     }
 }
 
-impl VhostUserVirtioDevice {
+impl VhostUserFrontend {
     /// Create a new VirtioDevice for a vhost-user device frontend.
     ///
     /// # Arguments
@@ -88,8 +94,8 @@ impl VhostUserVirtioDevice {
         connection: vmm_vhost::SystemStream,
         max_queue_size: Option<u16>,
         pci_address: Option<PciAddress>,
-    ) -> Result<VhostUserVirtioDevice> {
-        VhostUserVirtioDevice::new_internal(
+    ) -> Result<VhostUserFrontend> {
+        VhostUserFrontend::new_internal(
             connection,
             device_type,
             max_queue_size,
@@ -116,7 +122,7 @@ impl VhostUserVirtioDevice {
         base_features: u64,
         cfg: Option<&[u8]>,
         pci_address: Option<PciAddress>,
-    ) -> Result<VhostUserVirtioDevice> {
+    ) -> Result<VhostUserFrontend> {
         #[cfg(windows)]
         let backend_pid = connection.target_pid();
 
@@ -208,7 +214,7 @@ impl VhostUserVirtioDevice {
 
         let queue_sizes = vec![max_queue_size; num_queues];
 
-        Ok(VhostUserVirtioDevice {
+        Ok(VhostUserFrontend {
             device_type,
             worker_thread: None,
             backend_client,
@@ -326,7 +332,7 @@ impl VhostUserVirtioDevice {
     }
 }
 
-impl VirtioDevice for VhostUserVirtioDevice {
+impl VirtioDevice for VhostUserFrontend {
     fn keep_rds(&self) -> Vec<RawDescriptor> {
         Vec::new()
     }
