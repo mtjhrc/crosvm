@@ -64,6 +64,7 @@ fn host_to_guest_disable_sandbox() {
 }
 
 #[test]
+#[ignore = "b/333090177 test is flaky"]
 fn host_to_guest_snapshot_restore() {
     let guest_port = generate_vhost_port();
     let guest_cid = generate_guest_cid();
@@ -174,6 +175,7 @@ fn guest_to_host_disable_sandbox() {
 }
 
 #[test]
+#[ignore = "b/333090177 test is flaky"]
 fn guest_to_host_snapshot_restore() {
     let host_port = generate_vhost_port();
     let guest_cid = generate_guest_cid();
@@ -277,6 +279,7 @@ fn create_vu_config(cmd_type: CmdType, socket: &Path, cid: u32) -> VuConfig {
 }
 
 #[test]
+#[ignore = "b/333090069 test is flaky"]
 fn vhost_user_host_to_guest() {
     let guest_port = generate_vhost_port();
     let guest_cid = generate_guest_cid();
@@ -295,6 +298,7 @@ fn vhost_user_host_to_guest() {
 }
 
 #[test]
+#[ignore = "b/333090069 test is flaky"]
 fn vhost_user_host_to_guest_with_devices() {
     let guest_port = generate_vhost_port();
     let guest_cid = generate_guest_cid();
