@@ -11,6 +11,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use base::linux::getpid;
@@ -41,13 +42,20 @@ pub struct ProcessesGuard {
 ///
 /// This must be called from the main process.
 pub fn freeze_child_processes(monitor_pid: Pid) -> Result<ProcessesGuard> {
-    let guard = ProcessesGuard {
+    let mut guard = ProcessesGuard {
         pids: load_descendants(getpid(), monitor_pid)?,
     };
 
-    guard.stop_the_world().context("stop the world")?;
+    for _ in 0..3 {
+        guard.stop_the_world().context("stop the world")?;
+        let pids_after = load_descendants(getpid(), monitor_pid)?;
+        if pids_after == guard.pids {
+            return Ok(guard);
+        }
+        guard.pids = pids_after;
+    }
 
-    Ok(guard)
+    bail!("new processes forked while freezing");
 }
 
 impl ProcessesGuard {
@@ -140,15 +148,18 @@ fn parse_process_state(text: &str) -> Option<char> {
 }
 
 fn wait_process_stopped(pid: Pid) -> Result<()> {
-    let process_stat_path = format!("/proc/{}/stat", pid);
-    for _ in 0..10 {
-        let stat = read_to_string(&process_stat_path).context("read process status")?;
-        if let Some(state) = parse_process_state(&stat) {
-            if state == 'T' {
-                return Ok(());
+    let all_tasks = std::fs::read_dir(format!("/proc/{}/task", pid)).context("read tasks")?;
+    for task in all_tasks {
+        let task = task.context("read task entry")?;
+        for _ in 0..10 {
+            let stat = read_to_string(task.path().join("stat")).context("read process status")?;
+            if let Some(state) = parse_process_state(&stat) {
+                if state == 'T' {
+                    return Ok(());
+                }
             }
+            sleep(Duration::from_millis(50));
         }
-        sleep(Duration::from_millis(50));
     }
     Err(anyhow!("time out"))
 }

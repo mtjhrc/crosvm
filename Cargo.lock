@@ -82,6 +82,7 @@ dependencies = [
  "jail",
  "kernel_cmdline",
  "libc",
+ "metrics",
  "minijail",
  "power_monitor",
  "remain",
@@ -1801,10 +1802,29 @@ dependencies = [
  "base",
  "cfg-if",
  "chrono",
+ "metrics_events",
  "metrics_generic",
  "serde",
  "sync",
  "winapi",
+]
+
+[[package]]
+name = "metrics_events"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cfg-if",
+ "metrics_events_generic",
+ "serde",
+ "win_util",
+]
+
+[[package]]
+name = "metrics_events_generic"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -1813,11 +1833,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base",
- "cfg-if",
- "proto_build_tools",
- "protobuf",
- "serde",
- "win_util",
+ "metrics_events",
 ]
 
 [[package]]
@@ -2597,6 +2613,7 @@ dependencies = [
  "jail",
  "libc",
  "libtest-mimic",
+ "metrics",
  "num_cpus",
  "once_cell",
  "remain",
