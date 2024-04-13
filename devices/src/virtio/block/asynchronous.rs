@@ -640,7 +640,7 @@ impl BlockAsync {
             base::warn!("multiple workers requested, but not supported by disk image type");
             worker_per_queue = false;
         }
-        let executor_kind = disk_option.async_executor;
+        let executor_kind = disk_option.async_executor.unwrap_or_default();
         let boot_index = disk_option.bootindex;
         #[cfg(windows)]
         let io_concurrency = disk_option.io_concurrency.get();
@@ -677,7 +677,6 @@ impl BlockAsync {
             Self::build_avail_features(base_features, read_only, sparse, multi_queue, packed_queue);
 
         let seg_max = get_seg_max(q_size);
-        let executor_kind = executor_kind.unwrap_or_default();
 
         let disk_size = Arc::new(AtomicU64::new(disk_size));
         let shared_state = Arc::new(AsyncRwLock::new(WorkerSharedState {
@@ -1571,21 +1570,16 @@ mod tests {
         assert_eq!(returned_id, *id);
     }
 
-    // TODO(b/270225199): enable this test on Windows once IoSource::into_source is implemented
-    #[cfg(any(target_os = "android", target_os = "linux"))]
     #[test]
     fn reset_and_reactivate_single_worker() {
         reset_and_reactivate(false);
     }
 
-    // TODO(b/270225199): enable this test on Windows once IoSource::into_source is implemented
-    #[cfg(any(target_os = "android", target_os = "linux"))]
     #[test]
     fn reset_and_reactivate_multiple_workers() {
         reset_and_reactivate(true);
     }
 
-    #[cfg(any(target_os = "android", target_os = "linux"))]
     fn reset_and_reactivate(enables_multiple_workers: bool) {
         // Create an empty disk image
         let f = tempfile().unwrap();
@@ -1685,17 +1679,11 @@ mod tests {
         .expect("re-activate should succeed");
     }
 
-    // TODO(b/270225199): enable this test on Windows once IoSource::into_source is implemented,
-    // or after finding a good way to prevent BlockAsync::drop() from panicking due to that.
-    #[cfg(any(target_os = "android", target_os = "linux"))]
     #[test]
     fn resize_with_single_worker() {
         resize(false);
     }
 
-    // TODO(b/270225199): enable this test on Windows once IoSource::into_source is implemented,
-    // or after finding a good way to prevent BlockAsync::drop() from panicking due to that.
-    #[cfg(any(target_os = "android", target_os = "linux"))]
     #[test]
     fn resize_with_multiple_workers() {
         // Test resize handled by one worker affect the whole state
@@ -1812,9 +1800,6 @@ mod tests {
         );
     }
 
-    // TODO(b/270225199): enable this test on Windows once IoSource::into_source is implemented,
-    // or after finding a good way to prevent BlockAsync::drop() from panicking due to that.
-    #[cfg(any(target_os = "android", target_os = "linux"))]
     #[test]
     fn run_worker_threads() {
         // Create an empty duplicable disk image
