@@ -2,9 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use metrics_events::MetricEventType;
 use std::result::Result;
 use std::time::Duration;
+
+use metrics_events::MetricEventType;
 
 use crate::MetricsRequestHandler;
 
