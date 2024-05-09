@@ -3,11 +3,11 @@
 // found in the LICENSE file.
 
 use std::collections::BTreeMap;
-use std::sync::mpsc;
 
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use base::Event;
 use vm_control::GpeNotify;
 use vm_control::PmeNotify;
 
@@ -88,15 +88,16 @@ impl PciePortVariant for PcieRootPort {
 }
 
 impl HotPlugBus for PcieRootPort {
-    fn hot_plug(&mut self, addr: PciAddress) -> Result<Option<mpsc::Receiver<()>>> {
+    fn hot_plug(&mut self, addr: PciAddress) -> Result<Option<Event>> {
         if self.pcie_port.is_cc_pending() {
-            bail!("Slot busy: plugging too early or guest does not support PCIe hotplug.");
+            bail!("Hot plug fail: previous slot event is pending.");
         }
         self.downstream_devices
             .get(&addr)
             .context("No downstream devices.")?;
 
-        let (cc_sender, cc_recvr) = mpsc::channel();
+        let cc_sender = Event::new()?;
+        let cc_recvr = cc_sender.try_clone()?;
         self.pcie_port.set_cc_sender(cc_sender);
         self.pcie_port
             .set_slot_status(PCIE_SLTSTA_PDS | PCIE_SLTSTA_ABP);
@@ -104,7 +105,10 @@ impl HotPlugBus for PcieRootPort {
         Ok(Some(cc_recvr))
     }
 
-    fn hot_unplug(&mut self, addr: PciAddress) -> Result<Option<mpsc::Receiver<()>>> {
+    fn hot_unplug(&mut self, addr: PciAddress) -> Result<Option<Event>> {
+        if self.pcie_port.is_cc_pending() {
+            bail!("Hot unplug fail: previous slot event is pending.");
+        }
         self.downstream_devices
             .remove(&addr)
             .context("No downstream devices.")?;
@@ -120,10 +124,9 @@ impl HotPlugBus for PcieRootPort {
             self.removed_downstream.push(*guest_pci_addr);
         }
 
-        let (cc_sender, cc_recvr) = mpsc::channel();
-        if self.pcie_port.set_cc_sender(cc_sender).is_some() {
-            bail!("Slot busy: unplugging too early or guest does not support PCIe hotplug.");
-        }
+        let cc_sender = Event::new()?;
+        let cc_recvr = cc_sender.try_clone()?;
+        self.pcie_port.set_cc_sender(cc_sender);
         self.pcie_port.set_slot_status(PCIE_SLTSTA_ABP);
         self.pcie_port.trigger_hp_or_pme_interrupt();
 
