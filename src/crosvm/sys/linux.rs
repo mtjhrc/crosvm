@@ -2948,6 +2948,7 @@ fn process_vm_request<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         }
         _ => {
             let response = request.execute(
+                &state.linux.vm,
                 &mut run_mode_opt,
                 state.disk_host_tubes,
                 &mut state.linux.pm,
@@ -2967,13 +2968,6 @@ fn process_vm_request<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                         msg,
                     )
                 },
-                |msg, index| {
-                    vcpu::kick_vcpu(
-                        &state.vcpu_handles.get(index),
-                        state.linux.irq_chip.as_irq_chip(),
-                        msg,
-                    )
-                },
                 state.cfg.force_s2idle,
                 #[cfg(feature = "swap")]
                 state.swap_controller.as_ref(),
@@ -2981,13 +2975,6 @@ fn process_vm_request<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                 state.vcpu_handles.len(),
                 state.irq_handler_control,
                 || state.linux.irq_chip.snapshot(state.linux.vcpu_count),
-                |image| {
-                    state
-                        .linux
-                        .irq_chip
-                        .try_box_clone()?
-                        .restore(image, state.linux.vcpu_count)
-                },
             );
             if state.cfg.force_s2idle {
                 if let VmRequest::SuspendVcpus = request {
@@ -3580,6 +3567,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     if let Some(path) = &cfg.restore_path {
         vm_control::do_restore(
             path,
+            &linux.vm,
             |msg| vcpu::kick_all_vcpus(&vcpu_handles, linux.irq_chip.as_irq_chip(), msg),
             |msg, index| {
                 vcpu::kick_vcpu(&vcpu_handles.get(index), linux.irq_chip.as_irq_chip(), msg)
