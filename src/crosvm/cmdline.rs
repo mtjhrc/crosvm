@@ -1809,6 +1809,14 @@ pub struct RunCommand {
     ///         without the key as the first argument.
     ///     ro=BOOL - Whether the pmem device should be read-only.
     ///         (default: false)
+    ///     vma-size=BYTES - (Experimental) Size in bytes
+    ///        of an anonymous virtual memory area that is
+    ///        created to back this device. When this
+    ///        option is specified, the disk image path
+    ///        is used to name the memory area
+    ///     swap-interval-ms=NUM - (Experimental) Interval
+    ///        in milliseconds for periodic swap out of
+    ///        memory mapping created by this device
     pub pmem: Vec<PmemOption>,
 
     #[argh(option, arg_name = "PATH")]
@@ -2794,38 +2802,7 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         // Sort all our disks by index.
         disks.sort_by_key(|d| d.index);
-
-        // Check that we don't have more than one root disk.
-        if disks.iter().filter(|d| d.disk_option.root).count() > 1
-            || cmd.scsi_block.iter().filter(|s| s.root).count() > 1
-            || disks.iter().any(|d| d.disk_option.root) && cmd.scsi_block.iter().any(|s| s.root)
-        {
-            return Err("only one root disk can be specified".to_string());
-        }
-
-        // If we have a root disk, add the corresponding command-line parameters.
-        if let Some(d) = disks.iter().find(|d| d.disk_option.root) {
-            if d.index >= 26 {
-                return Err("ran out of letters for to assign to root disk".to_string());
-            }
-            cfg.params.push(format!(
-                "root=/dev/vd{} {}",
-                char::from(b'a' + d.index as u8),
-                if d.disk_option.read_only { "ro" } else { "rw" }
-            ));
-        }
-
-        // Pass the sorted disks to the VM config.
         cfg.disks = disks.into_iter().map(|d| d.disk_option).collect();
-
-        // If we have a root scsi disk, add the corresponding command-line parameters.
-        if let Some((i, s)) = cmd.scsi_block.iter().enumerate().find(|(_, s)| s.root) {
-            cfg.params.push(format!(
-                "root=/dev/sd{} {}",
-                char::from(b'a' + i as u8),
-                if s.read_only { "ro" } else { "rw" }
-            ));
-        }
 
         cfg.scsis = cmd.scsi_block;
 
@@ -2842,13 +2819,54 @@ impl TryFrom<RunCommand> for super::config::Config {
             cfg.pmems.push(PmemOption {
                 path: disk_option.path,
                 ro: true, // read-only
+                ..PmemOption::default()
             });
         }
         for disk_option in cmd.rw_pmem_device.into_iter() {
             cfg.pmems.push(PmemOption {
                 path: disk_option.path,
                 ro: false, // writable
+                ..PmemOption::default()
             });
+        }
+
+        // Find the device to use as the kernel `root=` parameter. There can only be one.
+        let virtio_blk_root_devs = cfg
+            .disks
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.root)
+            .map(|(i, d)| (format_disk_letter("/dev/vd", i), d.read_only));
+
+        let virtio_scsi_root_devs = cfg
+            .scsis
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.root)
+            .map(|(i, s)| (format_disk_letter("/dev/sd", i), s.read_only));
+
+        let virtio_pmem_root_devs = cfg
+            .pmems
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.root)
+            .map(|(i, p)| (format!("/dev/pmem{}", i), p.ro));
+
+        let mut root_devs = virtio_blk_root_devs
+            .chain(virtio_scsi_root_devs)
+            .chain(virtio_pmem_root_devs);
+        if let Some((root_dev, read_only)) = root_devs.next() {
+            cfg.params.push(format!(
+                "root={} {}",
+                root_dev,
+                if read_only { "ro" } else { "rw" }
+            ));
+
+            // If the iterator is not exhausted, the user specified `root=true` on more than one
+            // device, which is an error.
+            if root_devs.next().is_some() {
+                return Err("only one root disk can be specified".to_string());
+            }
         }
 
         #[cfg(feature = "pvclock")]
@@ -3528,9 +3546,27 @@ impl TryFrom<RunCommand> for super::config::Config {
     }
 }
 
+// Produce a block device path as used by Linux block devices.
+//
+// Examples for "/dev/vdX":
+// /dev/vda, /dev/vdb, ..., /dev/vdz, /dev/vdaa, /dev/vdab, ...
+fn format_disk_letter(dev_prefix: &str, mut i: usize) -> String {
+    const ALPHABET_LEN: usize = 26; // a to z
+    let mut s = dev_prefix.to_string();
+    let insert_idx = dev_prefix.len();
+    loop {
+        s.insert(insert_idx, char::from(b'a' + (i % ALPHABET_LEN) as u8));
+        i /= ALPHABET_LEN;
+        if i == 0 {
+            break;
+        }
+        i -= 1;
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "config-file")]
     use super::*;
 
     #[test]
@@ -3569,5 +3605,21 @@ mod tests {
                 String::from("fourthparam"),
             ]
         );
+    }
+
+    #[test]
+    fn disk_letter() {
+        assert_eq!(format_disk_letter("/dev/sd", 0), "/dev/sda");
+        assert_eq!(format_disk_letter("/dev/sd", 1), "/dev/sdb");
+        assert_eq!(format_disk_letter("/dev/sd", 25), "/dev/sdz");
+        assert_eq!(format_disk_letter("/dev/sd", 26), "/dev/sdaa");
+        assert_eq!(format_disk_letter("/dev/sd", 27), "/dev/sdab");
+        assert_eq!(format_disk_letter("/dev/sd", 51), "/dev/sdaz");
+        assert_eq!(format_disk_letter("/dev/sd", 52), "/dev/sdba");
+        assert_eq!(format_disk_letter("/dev/sd", 53), "/dev/sdbb");
+        assert_eq!(format_disk_letter("/dev/sd", 78), "/dev/sdca");
+        assert_eq!(format_disk_letter("/dev/sd", 701), "/dev/sdzz");
+        assert_eq!(format_disk_letter("/dev/sd", 702), "/dev/sdaaa");
+        assert_eq!(format_disk_letter("/dev/sd", 703), "/dev/sdaab");
     }
 }
