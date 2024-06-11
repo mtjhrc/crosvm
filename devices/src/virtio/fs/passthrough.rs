@@ -354,7 +354,7 @@ fn set_creds(
     ScopedGid::new(gid, oldgid).and_then(|gid| Ok((ScopedUid::new(uid, olduid)?, gid)))
 }
 
-thread_local!(static THREAD_FSCREATE: RefCell<Option<File>> = RefCell::new(None));
+thread_local!(static THREAD_FSCREATE: RefCell<Option<File>> = const { RefCell::new(None) });
 
 // Opens and returns a write-only handle to /proc/thread-self/attr/fscreate. Panics if it fails to
 // open the file.
@@ -820,11 +820,7 @@ impl PassthroughFs {
     }
 
     fn find_inode(&self, inode: Inode) -> io::Result<Arc<InodeData>> {
-        self.inodes
-            .lock()
-            .get(&inode)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)
+        self.inodes.lock().get(&inode).cloned().ok_or_else(ebadf)
     }
 
     fn find_handle(&self, handle: Handle, inode: Inode) -> io::Result<Arc<HandleData>> {
@@ -832,7 +828,7 @@ impl PassthroughFs {
             .lock()
             .get(&handle)
             .filter(|hd| hd.inode == inode)
-            .map(Arc::clone)
+            .cloned()
             .ok_or_else(ebadf)
     }
 
