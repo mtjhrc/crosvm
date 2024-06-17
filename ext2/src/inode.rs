@@ -4,6 +4,8 @@
 
 //! Defines the inode structure.
 
+use std::os::linux::fs::MetadataExt;
+
 use anyhow::bail;
 use anyhow::Result;
 use enumn::N;
@@ -12,6 +14,7 @@ use zerocopy_derive::FromBytes;
 use zerocopy_derive::FromZeroes;
 
 use crate::arena::Arena;
+use crate::arena::BlockId;
 use crate::blockgroup::GroupMetaData;
 
 /// Types of inodes.
@@ -45,7 +48,7 @@ impl InodeType {
 // Represents an inode number.
 // This is 1-indexed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct InodeNum(u32);
+pub(crate) struct InodeNum(pub u32);
 
 impl InodeNum {
     pub fn new(inode: u32) -> Result<Self> {
@@ -74,6 +77,8 @@ impl From<InodeNum> for usize {
     }
 }
 
+/// Size of the `block` field in Inode.
+const INODE_BLOCK_LEN: usize = 60;
 /// Represents 60-byte region for block in Inode.
 /// This region is used for various ways depending on the file type.
 /// For regular files and directories, it's used for storing 32-bit indices of blocks.
@@ -81,18 +86,74 @@ impl From<InodeNum> for usize {
 /// This is a wrapper of `[u8; 60]` to implement `Default` manually.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, FromZeroes, FromBytes, AsBytes)]
-pub(crate) struct InodeBlock(pub [u8; 60]);
+pub(crate) struct InodeBlock(pub [u8; INODE_BLOCK_LEN]);
 
 impl Default for InodeBlock {
     fn default() -> Self {
-        Self([0; 60])
+        Self([0; INODE_BLOCK_LEN])
     }
 }
 
 impl InodeBlock {
+    // Each inode contains 12 direct pointers (0-11), one singly indirect pointer (12), one
+    // doubly indirect block pointer (13), and one triply indirect pointer (14).
+    pub const NUM_DIRECT_BLOCKS: usize = 12;
+    const INDIRECT_BLOCK_TABLE_ID: usize = Self::NUM_DIRECT_BLOCKS;
+    const DOUBLE_INDIRECT_BLOCK_TABLE_ID: usize = 13;
+
     /// Set a block id at the given index.
-    pub fn set_block_id(&mut self, index: usize, block_id: u32) {
-        self.0[index * 4..(index + 1) * 4].copy_from_slice(block_id.as_bytes())
+    fn set_block_id(&mut self, index: usize, block_id: &BlockId) -> Result<()> {
+        let offset = index * std::mem::size_of::<BlockId>();
+        let bytes = block_id.as_bytes();
+        if self.0.len() < offset + bytes.len() {
+            bail!("index out of bounds when setting block_id to InodeBlock: index={index}, block_id: {:?}", block_id);
+        }
+        self.0[offset..offset + bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Set an array of direct block IDs.
+    pub fn set_direct_blocks(&mut self, block_ids: &[BlockId]) -> Result<()> {
+        let bytes = block_ids.as_bytes();
+        if bytes.len() > self.0.len() {
+            bail!(
+                "length of direct blocks is {} bytes, but it must not exceed {}",
+                bytes.len(),
+                self.0.len()
+            );
+        }
+        self.0[..bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Set a block id to be used as the indirect block table.
+    pub fn set_indirect_block_table(&mut self, block_id: &BlockId) -> Result<()> {
+        self.set_block_id(Self::INDIRECT_BLOCK_TABLE_ID, block_id)
+    }
+
+    /// Set a block id to be used as the double indirect block table.
+    pub fn set_double_indirect_block_table(&mut self, block_id: &BlockId) -> Result<()> {
+        self.set_block_id(Self::DOUBLE_INDIRECT_BLOCK_TABLE_ID, block_id)
+    }
+
+    /// Returns the max length of symbolic links that can be stored in the inode data.
+    /// This length contains the trailing `\0`.
+    pub const fn max_inline_symlink_len() -> usize {
+        INODE_BLOCK_LEN
+    }
+
+    /// Stores a given string as an inlined symbolic link data.
+    pub fn set_inline_symlink(&mut self, symlink: &str) -> Result<()> {
+        let bytes = symlink.as_bytes();
+        if bytes.len() >= Self::max_inline_symlink_len() {
+            bail!(
+                "symlink '{symlink}' exceeds or equals tomax length: {} >= {}",
+                bytes.len(),
+                Self::max_inline_symlink_len()
+            );
+        }
+        self.0[..bytes.len()].copy_from_slice(bytes);
+        Ok(())
     }
 }
 
@@ -111,7 +172,7 @@ pub(crate) struct Inode {
     _dtime: u32,
     _gid: u16,
     pub links_count: u16,
-    pub blocks: u32,
+    pub blocks: InodeBlocksCount,
     _flags: u32,
     _osd1: u32,
     pub block: InodeBlock,
@@ -125,6 +186,20 @@ pub(crate) struct Inode {
     _uid_high: u16,
     _gid_high: u16,
     _reserved2: u32,
+}
+
+/// Used in `Inode` to represent how many 512-byte blocks are used by a file.
+///
+/// The block size '512' byte is fixed and not related to the actual block size of the file system.
+/// For more details, see notes for `i_blocks_lo` in the specification.
+#[repr(C)]
+#[derive(Default, Debug, Copy, Clone, FromZeroes, FromBytes, AsBytes)]
+pub struct InodeBlocksCount(u32);
+
+impl InodeBlocksCount {
+    pub fn from_bytes_len(len: u32) -> Self {
+        Self(len / 512)
+    }
 }
 
 impl Inode {
@@ -156,7 +231,8 @@ impl Inode {
         const EXT2_S_IXOTH: u16 = 0x0001; // others execute
 
         let inode_offset = inode_num.to_table_index() * Inode::inode_record_size() as usize;
-        let inode = arena.allocate::<Inode>(group.group_desc.inode_table as usize, inode_offset)?;
+        let inode =
+            arena.allocate::<Inode>(BlockId::from(group.group_desc.inode_table), inode_offset)?;
 
         // Give read and execute permissions
         let mode = ((typ as u16) << 12)
@@ -180,6 +256,7 @@ impl Inode {
         let gid_high = (gid >> 16) as u16;
         let gid_low = gid as u16;
 
+        // TODO(b/333988434): Support extended attributes.
         *inode = Self {
             mode,
             size,
@@ -190,6 +267,54 @@ impl Inode {
             _gid: gid_low,
             _uid_high: uid_high,
             _gid_high: gid_high,
+            ..Default::default()
+        };
+        Ok(inode)
+    }
+
+    pub fn from_metadata<'a>(
+        arena: &'a Arena<'a>,
+        group: &mut GroupMetaData,
+        inode_num: InodeNum,
+        m: &std::fs::Metadata,
+        size: u32,
+        links_count: u16,
+        blocks: InodeBlocksCount,
+        block: InodeBlock,
+    ) -> Result<&'a mut Self> {
+        // (inode_num - 1) because inode is 1-indexed.
+        let inode_offset = (usize::from(inode_num) - 1) * Inode::inode_record_size() as usize;
+        let inode =
+            arena.allocate::<Inode>(BlockId::from(group.group_desc.inode_table), inode_offset)?;
+
+        let mode = m.st_mode() as u16;
+
+        let uid = m.st_uid();
+        let uid_high = (uid >> 16) as u16;
+        let uid_low: u16 = uid as u16;
+        let gid = m.st_gid();
+        let gid_high = (gid >> 16) as u16;
+        let gid_low: u16 = gid as u16;
+
+        let atime = m.st_atime() as u32;
+        let ctime = m.st_ctime() as u32;
+        let mtime = m.st_mtime() as u32;
+
+        *inode = Inode {
+            mode,
+            _uid: uid_low,
+            _gid: gid_low,
+            size,
+            atime,
+            ctime,
+            mtime,
+            links_count,
+            blocks,
+            block,
+
+            _uid_high: uid_high,
+            _gid_high: gid_high,
+
             ..Default::default()
         };
         Ok(inode)
