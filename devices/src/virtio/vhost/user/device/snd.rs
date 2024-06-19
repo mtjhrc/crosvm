@@ -64,8 +64,6 @@ struct SndBackend {
     ex: Executor,
     cfg: virtio_snd_config,
     avail_features: u64,
-    acked_features: u64,
-    acked_protocol_features: VhostUserProtocolFeatures,
     workers: [Option<WorkerState<Rc<AsyncRwLock<Queue>>, Result<(), Error>>>; MAX_QUEUE_NUM],
     // tx and rx
     response_workers: [Option<WorkerState<Rc<AsyncRwLock<Queue>>, Result<(), Error>>>; 2],
@@ -82,8 +80,6 @@ struct SndBackend {
 #[derive(Serialize, Deserialize)]
 struct SndBackendSnapshot {
     avail_features: u64,
-    acked_features: u64,
-    acked_protocol_features: u64,
     stream_infos: Option<Vec<StreamInfoSnapshot>>,
     snd_data: SndData,
 }
@@ -131,8 +127,6 @@ impl SndBackend {
             ex: ex.clone(),
             cfg,
             avail_features,
-            acked_features: 0,
-            acked_protocol_features: VhostUserProtocolFeatures::empty(),
             workers: Default::default(),
             response_workers: Default::default(),
             snd_data: Rc::new(snd_data),
@@ -162,44 +156,8 @@ impl VhostUserDevice for SndBackend {
         self.avail_features
     }
 
-    fn ack_features(&mut self, value: u64) -> anyhow::Result<()> {
-        let unrequested_features = value & !self.avail_features;
-        if unrequested_features != 0 {
-            bail!(
-                "[Card {}] invalid features are given: {:#x}",
-                self.card_index,
-                unrequested_features
-            );
-        }
-
-        self.acked_features |= value;
-
-        Ok(())
-    }
-
-    fn acked_features(&self) -> u64 {
-        self.acked_features
-    }
-
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
         VhostUserProtocolFeatures::CONFIG | VhostUserProtocolFeatures::MQ
-    }
-
-    fn ack_protocol_features(&mut self, features: u64) -> anyhow::Result<()> {
-        let features = VhostUserProtocolFeatures::from_bits(features).ok_or_else(|| {
-            anyhow!(
-                "[Card {}] invalid protocol features are given: {:#x}",
-                self.card_index,
-                features
-            )
-        })?;
-        let supported = self.protocol_features();
-        self.acked_protocol_features = features & supported;
-        Ok(())
-    }
-
-    fn acked_protocol_features(&self) -> u64 {
-        self.acked_protocol_features.bits()
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
@@ -371,8 +329,6 @@ impl VhostUserDevice for SndBackend {
         let snd_data_ref: &SndData = self.snd_data.borrow();
         serde_json::to_vec(&SndBackendSnapshot {
             avail_features: self.avail_features,
-            acked_protocol_features: self.acked_protocol_features.bits(),
-            acked_features: self.acked_features,
             stream_infos: stream_info_snaps,
             snd_data: snd_data_ref.clone(),
         })
@@ -395,14 +351,6 @@ impl VhostUserDevice for SndBackend {
             deser.avail_features,
             self.avail_features
         );
-        anyhow::ensure!(
-            self.acked_protocol_features.bits() == deser.acked_protocol_features,
-            "[Card {}] Vhost user snd restored acked_protocol_features do not match. Live: {:?}, \
-            snapshot: {:?}",
-            self.card_index,
-            self.acked_protocol_features,
-            deser.acked_protocol_features,
-        );
         let snd_data = self.snd_data.borrow();
         anyhow::ensure!(
             &deser.snd_data == snd_data,
@@ -411,7 +359,6 @@ impl VhostUserDevice for SndBackend {
             deser.snd_data,
             snd_data,
         );
-        self.acked_features = deser.acked_features;
 
         let ex_clone = self.ex.clone();
         let streams_rc = self.streams.clone();
