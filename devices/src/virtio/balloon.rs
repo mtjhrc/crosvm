@@ -108,6 +108,16 @@ const QUEUE_SIZES: &[u16] = &[
     QUEUE_SIZE, QUEUE_SIZE, QUEUE_SIZE, QUEUE_SIZE, QUEUE_SIZE, QUEUE_SIZE,
 ];
 
+// Virtqueue indexes
+const INFLATEQ: usize = 0;
+const DEFLATEQ: usize = 1;
+const STATSQ: usize = 2;
+const _FREE_PAGE_VQ: usize = 3;
+const REPORTING_VQ: usize = 4;
+const EVENT_VQ: usize = 5;
+const WS_DATA_VQ: usize = 6;
+const WS_OP_VQ: usize = 7;
+
 const VIRTIO_BALLOON_PFN_SHIFT: u32 = 12;
 const VIRTIO_BALLOON_PF_SIZE: u64 = 1 << VIRTIO_BALLOON_PFN_SHIFT;
 
@@ -131,7 +141,6 @@ pub enum BalloonFeatures {
 
 // These feature bits are part of the proposal:
 //  https://lists.oasis-open.org/archives/virtio-comment/202201/msg00139.html
-const VIRTIO_BALLOON_F_RESPONSIVE_DEVICE: u32 = 6; // Device actively watching guest memory
 const VIRTIO_BALLOON_F_EVENTS_VQ: u32 = 7; // Event vq is enabled
 
 // virtio_balloon_config is the balloon device configuration space defined by the virtio spec.
@@ -857,7 +866,8 @@ struct BalloonQueues {
     stats: Option<Queue>,
     reporting: Option<Queue>,
     events: Option<Queue>,
-    ws: (Option<Queue>, Option<Queue>),
+    ws_data: Option<Queue>,
+    ws_op: Option<Queue>,
 }
 
 impl BalloonQueues {
@@ -868,7 +878,8 @@ impl BalloonQueues {
             stats: None,
             reporting: None,
             events: None,
-            ws: (None, None),
+            ws_data: None,
+            ws_op: None,
         }
     }
 }
@@ -880,7 +891,8 @@ struct PausedQueues {
     stats: Option<Queue>,
     reporting: Option<Queue>,
     events: Option<Queue>,
-    ws: (Option<Queue>, Option<Queue>),
+    ws_data: Option<Queue>,
+    ws_op: Option<Queue>,
 }
 
 impl PausedQueues {
@@ -891,7 +903,8 @@ impl PausedQueues {
             stats: None,
             reporting: None,
             events: None,
-            ws: (None, None),
+            ws_data: None,
+            ws_op: None,
         }
     }
 }
@@ -913,8 +926,8 @@ impl From<Box<PausedQueues>> for BTreeMap<usize, Queue> {
         apply_if_some(queues.stats, |stats| ret.push(stats));
         apply_if_some(queues.reporting, |reporting| ret.push(reporting));
         apply_if_some(queues.events, |events| ret.push(events));
-        apply_if_some(queues.ws.0, |ws_data| ret.push(ws_data));
-        apply_if_some(queues.ws.1, |ws_op| ret.push(ws_op));
+        apply_if_some(queues.ws_data, |ws_data| ret.push(ws_data));
+        apply_if_some(queues.ws_op, |ws_op| ret.push(ws_op));
         // WARNING: We don't use the indices from the virito spec on purpose, see comment in
         // get_queues_from_map for the rationale.
         ret.into_iter().enumerate().collect()
@@ -941,7 +954,8 @@ fn run_worker(
     stats_queue: Option<Queue>,
     reporting_queue: Option<Queue>,
     events_queue: Option<Queue>,
-    ws_queues: (Option<Queue>, Option<Queue>),
+    ws_data_queue: Option<Queue>,
+    ws_op_queue: Option<Queue>,
     command_tube: Tube,
     #[cfg(windows)] vm_memory_client: VmMemoryClient,
     release_memory_tube: Option<Tube>,
@@ -1075,8 +1089,8 @@ fn run_worker(
 
         // If VIRTIO_BALLOON_F_WS_REPORTING is set 2 queues must handled - one for WS data and one
         // for WS notifications.
-        let has_ws_data_queue = ws_queues.0.is_some();
-        let ws_data = if let Some(ws_data_queue) = ws_queues.0 {
+        let has_ws_data_queue = ws_data_queue.is_some();
+        let ws_data = if let Some(ws_data_queue) = ws_data_queue {
             let stop_rx = create_stop_oneshot(&mut stop_queue_oneshots);
             let ws_data_queue_evt = ws_data_queue
                 .event()
@@ -1100,8 +1114,8 @@ fn run_worker(
         pin_mut!(ws_data);
 
         let (ws_op_tx, ws_op_rx) = mpsc::channel::<WSOp>(1);
-        let has_ws_op_queue = ws_queues.1.is_some();
-        let ws_op = if let Some(ws_op_queue) = ws_queues.1 {
+        let has_ws_op_queue = ws_op_queue.is_some();
+        let ws_op = if let Some(ws_op_queue) = ws_op_queue {
             let stop_rx = create_stop_oneshot(&mut stop_queue_oneshots);
             let ws_op_queue_evt = ws_op_queue
                 .event()
@@ -1221,11 +1235,11 @@ fn run_worker(
             if has_stats_queue {
                 paused_queues.stats = Some(stats.await);
             }
-            if has_ws_op_queue {
-                paused_queues.ws.0 = Some(ws_op.await.context("failed to stop ws_op queue")?);
-            }
             if has_ws_data_queue {
-                paused_queues.ws.1 = Some(ws_data.await.context("failed to stop ws_data queue")?);
+                paused_queues.ws_data = Some(ws_data.await.context("failed to stop ws_data queue")?);
+            }
+            if has_ws_op_queue {
+                paused_queues.ws_op = Some(ws_op.await.context("failed to stop ws_op queue")?);
             }
             Ok(paused_queues)
         });
@@ -1307,15 +1321,6 @@ struct BalloonSnapshot {
     ws_num_bins: u8,
 }
 
-/// Operation mode of the balloon.
-#[derive(PartialEq, Eq)]
-pub enum BalloonMode {
-    /// The driver can access pages in the balloon (i.e. F_DEFLATE_ON_OOM)
-    Relaxed,
-    /// The driver cannot access pages in the balloon. Implies F_RESPONSIVE_DEVICE.
-    Strict,
-}
-
 impl Balloon {
     /// Creates a new virtio balloon device.
     /// To let Balloon able to successfully release the memory which are pinned
@@ -1328,7 +1333,6 @@ impl Balloon {
         #[cfg(windows)] vm_memory_client: VmMemoryClient,
         release_memory_tube: Option<Tube>,
         init_balloon_size: u64,
-        mode: BalloonMode,
         enabled_features: u64,
         #[cfg(feature = "registered_events")] registered_evt_q: Option<SendTube>,
         ws_num_bins: u8,
@@ -1337,12 +1341,8 @@ impl Balloon {
             | 1 << VIRTIO_BALLOON_F_MUST_TELL_HOST
             | 1 << VIRTIO_BALLOON_F_STATS_VQ
             | 1 << VIRTIO_BALLOON_F_EVENTS_VQ
-            | enabled_features
-            | if mode == BalloonMode::Strict {
-                1 << VIRTIO_BALLOON_F_RESPONSIVE_DEVICE
-            } else {
-                1 << VIRTIO_BALLOON_F_DEFLATE_ON_OOM
-            };
+            | 1 << VIRTIO_BALLOON_F_DEFLATE_ON_OOM
+            | enabled_features;
 
         Ok(Balloon {
             command_tube: Some(command_tube),
@@ -1383,29 +1383,6 @@ impl Balloon {
         }
     }
 
-    fn num_expected_queues(acked_features: u64) -> usize {
-        // at minimum we have inflate and deflate vqueues.
-        let mut num_queues = 2;
-        // stats vqueue
-        if acked_features & (1 << VIRTIO_BALLOON_F_STATS_VQ) != 0 {
-            num_queues += 1;
-        }
-        // events vqueue
-        if acked_features & (1 << VIRTIO_BALLOON_F_EVENTS_VQ) != 0 {
-            num_queues += 1;
-        }
-        // page reporting vqueue
-        if acked_features & (1 << VIRTIO_BALLOON_F_PAGE_REPORTING) != 0 {
-            num_queues += 1;
-        }
-        // working set vqueues
-        if acked_features & (1 << VIRTIO_BALLOON_F_WS_REPORTING) != 0 {
-            num_queues += 2;
-        }
-
-        num_queues
-    }
-
     fn stop_worker(&mut self) -> StoppedWorker<PausedQueues> {
         if let Some(worker_thread) = self.worker_thread.take() {
             let worker_ret = worker_thread.stop();
@@ -1437,36 +1414,49 @@ impl Balloon {
         &self,
         mut queues: BTreeMap<usize, Queue>,
     ) -> anyhow::Result<BalloonQueues> {
-        let expected_queues = Balloon::num_expected_queues(self.acked_features);
-        if queues.len() != expected_queues {
-            return Err(anyhow!(
-                "expected {} queues, got {}",
-                expected_queues,
-                queues.len()
-            ));
+        fn pop_queue(
+            queues: &mut BTreeMap<usize, Queue>,
+            expected_index: usize,
+            name: &str,
+        ) -> anyhow::Result<Queue> {
+            let (queue_index, queue) = queues
+                .pop_first()
+                .with_context(|| format!("missing {}", name))?;
+
+            if queue_index == expected_index {
+                debug!("{name} index {queue_index}");
+            } else {
+                warn!("expected {name} index {expected_index}, got {queue_index}");
+            }
+
+            Ok(queue)
         }
 
         // WARNING: We use `pop_first` instead of explicitly using the indices from the virtio spec
-        // because the Linux virtio drivers only "allocates" queue indices that are used.
-        let inflate_queue = queues.pop_first().unwrap().1;
-        let deflate_queue = queues.pop_first().unwrap().1;
+        // because the Linux virtio drivers only "allocates" queue indices that are used, so queues
+        // need to be removed in order of ascending virtqueue index.
+        let inflate_queue = pop_queue(&mut queues, INFLATEQ, "inflateq")?;
+        let deflate_queue = pop_queue(&mut queues, DEFLATEQ, "deflateq")?;
         let mut queue_struct = BalloonQueues::new(inflate_queue, deflate_queue);
 
         if self.acked_features & (1 << VIRTIO_BALLOON_F_STATS_VQ) != 0 {
-            queue_struct.stats = Some(queues.pop_first().unwrap().1);
+            queue_struct.stats = Some(pop_queue(&mut queues, STATSQ, "statsq")?);
         }
         if self.acked_features & (1 << VIRTIO_BALLOON_F_PAGE_REPORTING) != 0 {
-            queue_struct.reporting = Some(queues.pop_first().unwrap().1);
+            queue_struct.reporting = Some(pop_queue(&mut queues, REPORTING_VQ, "reporting_vq")?);
         }
         if self.acked_features & (1 << VIRTIO_BALLOON_F_EVENTS_VQ) != 0 {
-            queue_struct.events = Some(queues.pop_first().unwrap().1);
+            queue_struct.events = Some(pop_queue(&mut queues, EVENT_VQ, "event_vq")?);
         }
         if self.acked_features & (1 << VIRTIO_BALLOON_F_WS_REPORTING) != 0 {
-            queue_struct.ws = (
-                Some(queues.pop_first().unwrap().1),
-                Some(queues.pop_first().unwrap().1),
-            );
+            queue_struct.ws_data = Some(pop_queue(&mut queues, WS_DATA_VQ, "ws_data_vq")?);
+            queue_struct.ws_op = Some(pop_queue(&mut queues, WS_OP_VQ, "ws_op_vq")?);
         }
+
+        if !queues.is_empty() {
+            return Err(anyhow!("unexpected queues {:?}", queues.into_keys()));
+        }
+
         Ok(queue_struct)
     }
 
@@ -1502,7 +1492,8 @@ impl Balloon {
                 queues.stats,
                 queues.reporting,
                 queues.events,
-                queues.ws,
+                queues.ws_data,
+                queues.ws_op,
                 command_tube,
                 #[cfg(windows)]
                 vm_memory_client,
@@ -1710,39 +1701,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn num_expected_queues() {
-        let to_feature_bits =
-            |features: &[u32]| -> u64 { features.iter().fold(0, |acc, f| acc | (1_u64 << f)) };
-
-        assert_eq!(2, Balloon::num_expected_queues(0));
-        assert_eq!(
-            2,
-            Balloon::num_expected_queues(to_feature_bits(&[VIRTIO_BALLOON_F_MUST_TELL_HOST]))
-        );
-        assert_eq!(
-            3,
-            Balloon::num_expected_queues(to_feature_bits(&[VIRTIO_BALLOON_F_STATS_VQ]))
-        );
-        assert_eq!(
-            5,
-            Balloon::num_expected_queues(to_feature_bits(&[
-                VIRTIO_BALLOON_F_STATS_VQ,
-                VIRTIO_BALLOON_F_EVENTS_VQ,
-                VIRTIO_BALLOON_F_PAGE_REPORTING
-            ]))
-        );
-        assert_eq!(
-            7,
-            Balloon::num_expected_queues(to_feature_bits(&[
-                VIRTIO_BALLOON_F_STATS_VQ,
-                VIRTIO_BALLOON_F_EVENTS_VQ,
-                VIRTIO_BALLOON_F_PAGE_REPORTING,
-                VIRTIO_BALLOON_F_WS_REPORTING
-            ]))
-        );
-    }
-
     struct BalloonContext {
         _ctrl_tube: Tube,
         #[cfg(windows)]
@@ -1770,7 +1728,6 @@ mod tests {
                 VmMemoryClient::new(mem_client_tube_device),
                 None,
                 1024,
-                BalloonMode::Relaxed,
                 0,
                 #[cfg(feature = "registered_events")]
                 None,
