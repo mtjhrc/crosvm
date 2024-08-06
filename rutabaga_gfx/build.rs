@@ -157,6 +157,7 @@ fn build_and_probe_virglrenderer(out_dir: &Path) -> Result<()> {
     let install_prefix = out_dir.join("installed");
 
     println!("cargo:rerun-if-changed={}", SOURCE_DIR);
+    println!("cargo:rustc-check-cfg=cfg(virgl_renderer_unstable)");
 
     if !Path::new(SOURCE_DIR).join(".git").exists() {
         bail!(
@@ -250,6 +251,7 @@ fn gfxstream() -> Result<()> {
     } else {
         let gfxstream_lib = pkg_config::Config::new().probe("gfxstream_backend")?;
 
+        println!("cargo:rustc-check-cfg=cfg(gfxstream_unstable)");
         if gfxstream_lib.defines.contains_key("GFXSTREAM_UNSTABLE") {
             println!("cargo:rustc-cfg=gfxstream_unstable");
         }
