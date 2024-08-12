@@ -210,16 +210,18 @@ pub trait VhostUserDevice {
     }
 
     /// Snapshot device and return serialized bytes.
-    fn snapshot(&self) -> anyhow::Result<serde_json::Value> {
-        error!("snapshot not implemented for vhost user device");
-        // TODO(rizhang): Return error once basic devices support this.
-        Ok(serde_json::Value::Null)
+    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!(
+            "snapshot not implemented for vhost user device {}",
+            std::any::type_name::<Self>()
+        );
     }
 
     fn restore(&mut self, _data: serde_json::Value) -> anyhow::Result<()> {
-        error!("restore not implemented for vhost user device");
-        // TODO(rizhang): Return error once basic devices support this.
-        Ok(())
+        anyhow::bail!(
+            "snapshot not implemented for vhost user device {}",
+            std::any::type_name::<Self>()
+        );
     }
 }
 
@@ -1148,7 +1150,7 @@ mod tests {
             Ok(true)
         }
 
-        fn snapshot(&self) -> anyhow::Result<serde_json::Value> {
+        fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
             serde_json::to_value(FakeBackendSnapshot {
                 data: vec![1, 2, 3],
             })
