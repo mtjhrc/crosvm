@@ -59,6 +59,11 @@ impl WorkerPort {
         }
     }
 
+    /// Restore the state retrieved from `ConsolePort` by `WorkerPort::from_console_port()`.
+    pub fn into_console_port(self, console_port: &mut ConsolePort) {
+        console_port.restore_output(self.output);
+    }
+
     pub fn is_console(&self) -> bool {
         self.info
             .as_ref()
@@ -294,7 +299,7 @@ impl Worker {
 }
 
 pub struct WorkerHandle {
-    worker_thread: WorkerThread<()>,
+    worker_thread: WorkerThread<Vec<WorkerPort>>,
     worker_sender: mpsc::Sender<WorkerRequest>,
     worker_event: Event,
 }
@@ -310,6 +315,7 @@ impl WorkerHandle {
             if let Err(e) = worker.run(&kill_evt) {
                 error!("console worker failed: {:#}", e);
             }
+            worker.ports
         });
         Ok(WorkerHandle {
             worker_thread,
@@ -342,11 +348,9 @@ impl WorkerHandle {
         self.worker_event.signal().context("Event::signal")?;
         response_receiver.recv().context("mpsc::Receiver::recv")
     }
-}
 
-impl Drop for WorkerHandle {
-    fn drop(&mut self) {
-        let _ = self.worker_thread.signal();
+    pub fn stop(self) -> Vec<WorkerPort> {
+        self.worker_thread.stop()
     }
 }
 
