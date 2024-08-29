@@ -19,18 +19,16 @@ fn is_native_build() -> bool {
     env::var("HOST").unwrap() == env::var("TARGET").unwrap()
 }
 
-fn use_system_minigbm() -> bool {
+fn use_submodule_minigbm() -> bool {
     println!("cargo:rerun-if-env-changed=CROSVM_BUILD_VARIANT");
-    println!("cargo:rerun-if-env-changed=CROSVM_USE_SYSTEM_MINIGBM");
-    env::var("CROSVM_BUILD_VARIANT").unwrap_or_default() == "chromeos"
-        || env::var("CROSVM_USE_SYSTEM_MINIGBM").unwrap_or_else(|_| "0".to_string()) != "0"
+    println!("cargo:rerun-if-env-changed=CROSVM_USE_SUBMODULE_MINIGBM");
+    env::var("CROSVM_USE_SUBMODULE_MINIGBM").unwrap_or_else(|_| "0".to_string()) != "0"
 }
 
-fn use_system_virglrenderer() -> bool {
+fn use_submodule_virglrenderer() -> bool {
     println!("cargo:rerun-if-env-changed=CROSVM_BUILD_VARIANT");
-    println!("cargo:rerun-if-env-changed=CROSVM_USE_SYSTEM_VIRGLRENDERER");
-    env::var("CROSVM_BUILD_VARIANT").unwrap_or_default() == "chromeos"
-        || env::var("CROSVM_USE_SYSTEM_VIRGLRENDERER").unwrap_or_else(|_| "0".to_string()) != "0"
+    println!("cargo:rerun-if-env-changed=CROSVM_USE_SUBMODULE_VIRGLRENDERER");
+    env::var("CROSVM_USE_SUBMODULE_VIRGLRENDERER").unwrap_or_else(|_| "0".to_string()) != "0"
 }
 
 /// Returns the target triplet prefix for gcc commands. No prefix is required
@@ -140,12 +138,12 @@ Requires.private: libdrm >= 2.4.50
 }
 
 fn minigbm() -> Result<()> {
-    if use_system_minigbm() {
-        pkg_config::probe_library("gbm").context("pkgconfig failed to find gbm")?;
-    } else {
-        // Otherwise build from source and emit cargo build metadata
+    if use_submodule_minigbm() {
+        // Build from source and emit cargo build metadata
         let out_dir = PathBuf::from(env::var("OUT_DIR")?).join("minigbm");
         build_and_probe_minigbm(&out_dir).context("failed building minigbm")?;
+    } else {
+        pkg_config::probe_library("gbm").context("pkgconfig failed to find gbm")?;
     };
     Ok(())
 }
@@ -221,12 +219,16 @@ fn build_and_probe_virglrenderer(out_dir: &Path) -> Result<()> {
 }
 
 fn virglrenderer() -> Result<()> {
-    if use_system_virglrenderer() && !use_system_minigbm() {
-        bail!("Must use system minigbm if using system virglrenderer (try setting CROSVM_USE_SYSTEM_MINIGBM=1)");
+    if use_submodule_virglrenderer() && !use_submodule_minigbm() {
+        bail!("Must use submodule minigbm if using submodule virglrenderer (try setting CROSVM_USE_SUBMODULE_MINIGBM=1)");
     }
 
-    // Use virglrenderer package from pkgconfig on ChromeOS builds
-    if use_system_virglrenderer() {
+    // Use virglrenderer from gitsubmodule source
+    if use_submodule_virglrenderer() {
+        let out_dir = PathBuf::from(env::var("OUT_DIR")?).join("virglrenderer");
+        build_and_probe_virglrenderer(&out_dir)?;
+    } else {
+        //Otherwise use virglrenderer package from pkgconfig
         let lib = pkg_config::Config::new()
             .atleast_version("1.0.0")
             .probe("virglrenderer")
@@ -234,10 +236,6 @@ fn virglrenderer() -> Result<()> {
         if lib.defines.contains_key("VIRGL_RENDERER_UNSTABLE_APIS") {
             println!("cargo:rustc-cfg=virgl_renderer_unstable");
         }
-    } else {
-        // Otherwise build from source.
-        let out_dir = PathBuf::from(env::var("OUT_DIR")?).join("virglrenderer");
-        build_and_probe_virglrenderer(&out_dir)?;
     }
     Ok(())
 }
